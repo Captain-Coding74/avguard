@@ -1,0 +1,12 @@
+# Normalise line endings so a Windows checkout does not show every file as
+# modified. Detection fixtures are byte-exact by definition and must never be
+# rewritten -- changing a line ending would change whether a rule matches.
+* text=auto
+
+*.yara          text eol=lf
+*.py            text eol=lf
+*.md            text eol=lf
+
+tests/rules/**  -text
+*.bin           binary
+*.quar          binary

@@ -1,0 +1,288 @@
+"""Settings, history and health windows.
+
+Kept out of gui.py so that file stays about the main window and the thread
+bridge. Everything here runs on the GUI thread; nothing in this module starts a
+thread or touches the filesystem outside config and the event store.
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from tkinter import filedialog
+
+import tkinter as tk
+import ttkbootstrap as tb
+from ttkbootstrap.constants import BOTH, END, LEFT, RIGHT, VERTICAL, X, Y
+from ttkbootstrap.dialogs import Messagebox
+
+from . import config, scheduling
+
+log = logging.getLogger("avguard.dialogs")
+
+CHR_NL = chr(10)
+
+
+class SettingsDialog(tb.Toplevel):
+    """Edit the settings worth editing.
+
+    Not every field in `Config` is here. Things a wrong value would break
+    quietly -- `quarantine_threshold`, `cloud_extensions` -- stay in the JSON
+    file, where changing them is a deliberate act.
+    """
+
+    def __init__(self, parent, cfg: config.Config, on_saved) -> None:
+        super().__init__(title="Settings", transient=parent, resizable=(False, False))
+        self.cfg = cfg
+        self._on_saved = on_saved
+
+        body = tb.Frame(self, padding=18)
+        body.pack(fill=BOTH, expand=True)
+
+        tb.Label(body, text="Settings", font=("Segoe UI", 14, "bold")).pack(anchor="w")
+
+        # --- protection ---------------------------------------------------
+        block = tb.Labelframe(body, text="Protection", padding=12)
+        block.pack(fill=X, pady=(12, 8))
+
+        self.auto_var = tk.BooleanVar(value=cfg.auto_quarantine)
+        tb.Checkbutton(block, text="Move detected files into quarantine automatically",
+                       variable=self.auto_var, bootstyle="round-toggle").pack(anchor="w", pady=2)
+        tb.Label(block, bootstyle="secondary", wraplength=520, justify="left",
+                 text=("When this is off, detections are reported and nothing is "
+                       "moved. Only strong evidence can trigger a move either "
+                       "way; guesses never do.")).pack(anchor="w", pady=(0, 8))
+
+        self.archives_var = tk.BooleanVar(value=cfg.archive_scanning_enabled)
+        tb.Checkbutton(block, text="Look inside .zip files",
+                       variable=self.archives_var, bootstyle="round-toggle").pack(anchor="w", pady=2)
+
+        self.pe_var = tk.BooleanVar(value=cfg.pe_analysis_enabled)
+        tb.Checkbutton(block, text="Check the structure of executables",
+                       variable=self.pe_var, bootstyle="round-toggle").pack(anchor="w", pady=2)
+
+        # --- watched folders ----------------------------------------------
+        watch = tb.Labelframe(body, text="Folders watched in real time", padding=12)
+        watch.pack(fill=X, pady=8)
+
+        self.watch_list = tk.Listbox(watch, height=4, bg="#12161c", fg="#cfd8dc",
+                                     relief="flat", highlightthickness=0)
+        self.watch_list.pack(fill=X)
+        for entry in cfg.watch_paths or [str(Path.home() / "Downloads")]:
+            self.watch_list.insert(END, entry)
+
+        row = tb.Frame(watch, padding=(0, 6, 0, 0))
+        row.pack(fill=X)
+        tb.Button(row, text="Add folder", bootstyle="secondary-outline",
+                  command=self._add_watch).pack(side=LEFT, padx=(0, 4))
+        tb.Button(row, text="Remove", bootstyle="secondary-outline",
+                  command=lambda: self._remove(self.watch_list)).pack(side=LEFT)
+        tb.Label(watch, bootstyle="secondary", wraplength=520, justify="left",
+                 text="Empty means Downloads only.").pack(anchor="w", pady=(6, 0))
+
+        # --- exclusions ----------------------------------------------------
+        excl = tb.Labelframe(body, text="Never scanned", padding=12)
+        excl.pack(fill=X, pady=8)
+
+        self.excl_list = tk.Listbox(excl, height=5, bg="#12161c", fg="#cfd8dc",
+                                    relief="flat", highlightthickness=0)
+        self.excl_list.pack(fill=X)
+        for pattern in cfg.excluded_globs:
+            self.excl_list.insert(END, pattern)
+
+        row = tb.Frame(excl, padding=(0, 6, 0, 0))
+        row.pack(fill=X)
+        tb.Button(row, text="Exclude a folder", bootstyle="secondary-outline",
+                  command=self._add_exclusion).pack(side=LEFT, padx=(0, 4))
+        tb.Button(row, text="Remove", bootstyle="secondary-outline",
+                  command=lambda: self._remove(self.excl_list)).pack(side=LEFT)
+
+        # --- startup and schedule -------------------------------------------
+        auto = tb.Labelframe(body, text="Running by itself", padding=12)
+        auto.pack(fill=X, pady=8)
+
+        state = scheduling.status()
+        self.startup_var = tk.BooleanVar(value=state.starts_with_windows)
+        tb.Checkbutton(auto, text="Start AVGuard when Windows starts",
+                       variable=self.startup_var,
+                       bootstyle="round-toggle").pack(anchor="w", pady=2)
+
+        self.daily_var = tk.BooleanVar(value=state.scheduled_scan)
+        tb.Checkbutton(auto, text="Scan the watched folders once a day",
+                       variable=self.daily_var,
+                       bootstyle="round-toggle").pack(anchor="w", pady=2)
+        tb.Label(auto, bootstyle="secondary", wraplength=520, justify="left",
+                 text=("Neither needs administrator rights. The daily scan only "
+                       "reports -- an unattended scan with nobody reading the "
+                       "result is the last thing that should be moving files. "
+                       "You can remove both from Task Manager's Startup tab and "
+                       "Task Scheduler without opening AVGuard.")
+                 ).pack(anchor="w", pady=(6, 0))
+
+        # --- buttons -------------------------------------------------------
+        actions = tb.Frame(body, padding=(0, 14, 0, 0))
+        actions.pack(fill=X)
+        tb.Button(actions, text="Save", bootstyle="success",
+                  command=self._save).pack(side=RIGHT, padx=(6, 0))
+        tb.Button(actions, text="Cancel", bootstyle="secondary-outline",
+                  command=self.destroy).pack(side=RIGHT)
+
+    def _add_watch(self) -> None:
+        chosen = filedialog.askdirectory(title="Watch this folder", parent=self)
+        if chosen:
+            self.watch_list.insert(END, chosen)
+
+    def _add_exclusion(self) -> None:
+        chosen = filedialog.askdirectory(title="Never scan this folder", parent=self)
+        if chosen:
+            self.excl_list.insert(END, glob_for(chosen))
+
+    @staticmethod
+    def _remove(listbox: tk.Listbox) -> None:
+        for index in reversed(listbox.curselection()):
+            listbox.delete(index)
+
+    def _apply_scheduling(self) -> list[str]:
+        """Only touch the system when the toggle actually changed."""
+        problems: list[str] = []
+        state = scheduling.status()
+
+        if self.startup_var.get() != state.starts_with_windows:
+            if self.startup_var.get():
+                ok, detail = scheduling.enable_start_with_windows()
+            else:
+                ok, detail = scheduling.disable_start_with_windows()
+            if not ok:
+                problems.append(f"start with Windows: {detail}")
+
+        if self.daily_var.get() != state.scheduled_scan:
+            if self.daily_var.get():
+                targets = self.cfg.watch_paths or [str(Path.home() / "Downloads")]
+                ok, detail = scheduling.enable_scheduled_scan(Path(targets[0]))
+            else:
+                ok, detail = scheduling.disable_scheduled_scan()
+            if not ok:
+                problems.append(f"daily scan: {detail}")
+        return problems
+
+    def _save(self) -> None:
+        self.cfg.auto_quarantine = self.auto_var.get()
+        self.cfg.archive_scanning_enabled = self.archives_var.get()
+        self.cfg.pe_analysis_enabled = self.pe_var.get()
+        self.cfg.watch_paths = list(self.watch_list.get(0, END))
+        self.cfg.excluded_globs = list(self.excl_list.get(0, END))
+        try:
+            self.cfg.save()
+        except OSError as exc:
+            Messagebox.show_error(f"Could not save settings: {exc}", "AVGuard", parent=self)
+            return
+
+        problems = self._apply_scheduling()
+        if problems:
+            Messagebox.show_warning(
+                "Settings were saved, but some of it could not be applied:" + CHR_NL + CHR_NL
+                + CHR_NL.join(problems),
+                "Partly applied", parent=self)
+        self.destroy()
+        self._on_saved()
+
+
+def glob_for(folder: str | Path) -> str:
+    """The exclusion pattern for a folder, in the form the matcher expects."""
+    return str(folder).replace("\\", "/").rstrip("/") + "/**"
+
+
+class HistoryDialog(tb.Toplevel):
+    """What the scanner has done, beyond what the log widget still holds."""
+
+    def __init__(self, parent, store, on_cleared) -> None:
+        super().__init__(title="History", transient=parent)
+        self.store = store
+        self._on_cleared = on_cleared
+        self.geometry("900x520")
+
+        body = tb.Frame(self, padding=14)
+        body.pack(fill=BOTH, expand=True)
+
+        summary = store.summary()
+        tb.Label(body, text="History", font=("Segoe UI", 14, "bold")).pack(anchor="w")
+        tb.Label(body, bootstyle="secondary", text=(
+            f"{summary['events']} events kept  |  {summary['detections']} detections  |  "
+            f"{summary['quarantined']} quarantined  |  last scan: {summary['last_scan']}"
+        )).pack(anchor="w", pady=(2, 10))
+
+        self.tree = tb.Treeview(body, columns=("when", "kind", "level", "detail"),
+                                show="headings", selectmode="browse")
+        for column, heading, width in (
+            ("when", "When", 150), ("kind", "Event", 110),
+            ("level", "Verdict", 100), ("detail", "File", 460),
+        ):
+            self.tree.heading(column, text=heading)
+            self.tree.column(column, width=width, anchor="w")
+        scroll = tb.Scrollbar(body, orient=VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        scroll.pack(side=RIGHT, fill=Y)
+        self.tree.pack(fill=BOTH, expand=True)
+
+        for event in store.read(limit=1000):
+            self.tree.insert("", END, values=(
+                event.when, event.kind, event.level or "-",
+                event.path or "; ".join(event.reasons)[:120]))
+
+        actions = tb.Frame(body, padding=(0, 12, 0, 0))
+        actions.pack(fill=X)
+        tb.Label(actions, bootstyle="secondary", wraplength=560, justify="left",
+                 text=("This history and the scan cache both record file paths "
+                       "from this machine. Clearing removes them.")
+                 ).pack(side=LEFT, fill=X, expand=True)
+        tb.Button(actions, text="Clear history", bootstyle="danger-outline",
+                  command=self._clear).pack(side=RIGHT)
+
+    def _clear(self) -> None:
+        if Messagebox.yesno("Delete the recorded history from this machine?",
+                            "Clear history", parent=self) != "Yes":
+            return
+        self.store.clear()
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self._on_cleared()
+
+
+class HealthDialog(tb.Toplevel):
+    """Answers "is it actually working?".
+
+    v1 ran for weeks with YARA switched off after a compile failure, reporting
+    nothing wrong. Every row here is a thing that can silently stop working.
+    """
+
+    def __init__(self, parent, checks: list[tuple[str, bool, str]],
+                 on_reload_rules=None) -> None:
+        super().__init__(title="Health", transient=parent, resizable=(False, False))
+
+        body = tb.Frame(self, padding=18)
+        body.pack(fill=BOTH, expand=True)
+        tb.Label(body, text="Health", font=("Segoe UI", 14, "bold")).pack(anchor="w")
+        tb.Label(body, bootstyle="secondary", wraplength=540, justify="left",
+                 text="Everything below can fail quietly. This is where it stops being quiet."
+                 ).pack(anchor="w", pady=(2, 12))
+
+        for label, ok, detail in checks:
+            row = tb.Frame(body)
+            row.pack(fill=X, pady=3)
+            tb.Label(row, text="OK" if ok else "FAILED", width=8,
+                     bootstyle="success" if ok else "danger").pack(side=LEFT)
+            tb.Label(row, text=label, width=26, anchor="w").pack(side=LEFT)
+            tb.Label(row, text=detail, bootstyle="secondary", anchor="w",
+                     wraplength=340, justify="left").pack(side=LEFT, fill=X, expand=True)
+
+        actions = tb.Frame(body, padding=(0, 14, 0, 0))
+        actions.pack(fill=X)
+        if on_reload_rules is not None:
+            # Lives here because this is where you come when detection looks
+            # wrong. Editing a rule file and pressing this beats restarting.
+            tb.Button(actions, text="Reload rules from disk",
+                      bootstyle="info-outline",
+                      command=lambda: (on_reload_rules(), self.destroy())
+                      ).pack(side=LEFT)
+        tb.Button(actions, text="Close", bootstyle="secondary",
+                  command=self.destroy).pack(side=RIGHT)

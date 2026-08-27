@@ -1,0 +1,4 @@
+All your files have been encrypted!
+To decrypt your data you must send bitcoin to the address below.
+We hold the only private key.
+Affected: quarterly-report.docx.locky

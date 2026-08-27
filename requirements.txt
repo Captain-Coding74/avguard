@@ -1,0 +1,10 @@
+# AVGuard dependencies. Install with:  pip install -r requirements.txt
+#
+# tkinter ships with Python on Windows, so it is not listed here.
+
+yara-python>=4.5.0      # rule-based detection
+watchdog>=6.0.0         # filesystem events for real-time mode
+requests>=2.32.0        # VirusTotal lookups (optional feature, still imported)
+ttkbootstrap>=1.14.0    # themed Tkinter widgets
+pystray>=0.19.0         # system tray icon
+Pillow>=10.0.0          # tray icon image, required by pystray

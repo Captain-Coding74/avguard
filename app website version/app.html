@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Antivirus Web App</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Font -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-gray-100 flex flex-col items-center justify-center p-4 min-h-screen">
+
+    <div class="w-full max-w-4xl p-8 bg-gray-800 rounded-xl shadow-lg border border-gray-700">
+        <!-- Header -->
+        <h1 class="text-3xl sm:text-4xl font-bold text-center text-teal-400 mb-2">Antivirus Web App</h1>
+        <p class="text-center text-gray-400 mb-8">Manual Scan & Quarantine Manager</p>
+
+        <!-- Log Display Area -->
+        <div class="mb-6">
+            <h2 class="text-xl font-semibold mb-2 text-gray-200">Antivirus Log</h2>
+            <div id="log" class="h-64 overflow-y-auto bg-gray-900 rounded-lg p-4 text-sm font-mono leading-relaxed resize-y">
+                <!-- Log messages will be appended here -->
+            </div>
+        </div>
+
+        <!-- Action Buttons -->
+        <div class="flex flex-col sm:flex-row gap-4 mb-8">
+            <button id="scanButton" class="w-full sm:w-1/2 bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-6 rounded-lg transition-colors duration-200 shadow-md transform hover:scale-105">
+                Select & Scan File
+            </button>
+            <button id="fullScanButton" class="w-full sm:w-1/2 bg-teal-600 hover:bg-teal-700 text-white font-bold py-3 px-6 rounded-lg transition-colors duration-200 shadow-md transform hover:scale-105">
+                Start Full Scan (Mock)
+            </button>
+        </div>
+
+        <!-- Quarantined Files Section -->
+        <div>
+            <h2 class="text-xl font-semibold mb-2 text-gray-200">Quarantined Files</h2>
+            <div class="bg-gray-900 rounded-lg overflow-hidden border border-gray-700">
+                <ul id="quarantineList" class="divide-y divide-gray-700 max-h-48 overflow-y-auto">
+                    <!-- Quarantined files will be listed here -->
+                </ul>
+                <div class="p-2 text-sm text-gray-500 text-center" id="quarantineEmptyText">
+                    No files in quarantine.
+                </div>
+            </div>
+            <div class="flex flex-col sm:flex-row gap-4 mt-4">
+                <button id="restoreButton" class="w-full sm:w-1/2 bg-yellow-600 hover:bg-yellow-700 text-white font-bold py-3 px-6 rounded-lg transition-colors duration-200 shadow-md transform hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed">
+                    Restore Selected
+                </button>
+                <button id="deleteButton" class="w-full sm:w-1/2 bg-red-600 hover:bg-red-700 text-white font-bold py-3 px-6 rounded-lg transition-colors duration-200 shadow-md transform hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed">
+                    Delete Permanently
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Hidden file input for file selection -->
+    <input type="file" id="fileInput" class="hidden">
+
+    <script>
+        const logElement = document.getElementById('log');
+        const fileInput = document.getElementById('fileInput');
+        const scanButton = document.getElementById('scanButton');
+        const fullScanButton = document.getElementById('fullScanButton');
+        const quarantineList = document.getElementById('quarantineList');
+        const restoreButton = document.getElementById('restoreButton');
+        const deleteButton = document.getElementById('deleteButton');
+        const quarantineEmptyText = document.getElementById('quarantineEmptyText');
+
+        // A mock signature for demonstration
+        const mockVirusSignature = "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
+        let quarantinedFiles = {}; // A mock dictionary to store quarantined files
+
+        function logMessage(message, type = 'info') {
+            const span = document.createElement('span');
+            let color = 'text-gray-400';
+            if (type === 'warn') {
+                color = 'text-yellow-400';
+            } else if (type === 'error') {
+                color = 'text-red-400';
+            } else if (type === 'success') {
+                color = 'text-green-400';
+            }
+            span.className = `${color}`;
+            span.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+            logElement.appendChild(span);
+            logElement.appendChild(document.createElement('br'));
+            logElement.scrollTop = logElement.scrollHeight;
+        }
+
+        function updateQuarantineList() {
+            quarantineList.innerHTML = '';
+            const filenames = Object.keys(quarantinedFiles);
+            if (filenames.length === 0) {
+                quarantineEmptyText.classList.remove('hidden');
+                restoreButton.disabled = true;
+                deleteButton.disabled = true;
+            } else {
+                quarantineEmptyText.classList.add('hidden');
+                restoreButton.disabled = false;
+                deleteButton.disabled = false;
+                filenames.forEach(filename => {
+                    const li = document.createElement('li');
+                    li.textContent = filename;
+                    li.className = 'px-4 py-2 hover:bg-gray-700 cursor-pointer';
+                    quarantineList.appendChild(li);
+                });
+            }
+        }
+
+        async function scanFile(file) {
+            logMessage(`Scanning file: ${file.name}`);
+            const reader = new FileReader();
+
+            reader.onload = function(event) {
+                const content = event.target.result;
+                // Check for the mock virus signature
+                if (content.includes(mockVirusSignature)) {
+                    logMessage(`THREAT DETECTED: Found signature in ${file.name}.`, 'error');
+                    quarantinedFiles[file.name] = file; // Mock quarantine
+                    updateQuarantineList();
+                } else {
+                    logMessage(`No threats detected in ${file.name}.`, 'success');
+                }
+            };
+
+            reader.onerror = function() {
+                logMessage(`ERROR: Could not read file ${file.name}.`, 'error');
+            };
+
+            reader.readAsText(file);
+        }
+
+        scanButton.addEventListener('click', () => {
+            fileInput.click();
+        });
+
+        fullScanButton.addEventListener('click', () => {
+            logMessage("Full scan initiated. (Mock function)", 'warn');
+            logMessage("This is a mock scan. To simulate a threat, try scanning a file containing 'X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*' anywhere in its contents.", 'info');
+        });
+
+        fileInput.addEventListener('change', (event) => {
+            const file = event.target.files[0];
+            if (file) {
+                scanFile(file);
+            }
+        });
+
+        restoreButton.addEventListener('click', () => {
+            const selectedItem = quarantineList.querySelector('.bg-gray-600');
+            if (selectedItem) {
+                const filename = selectedItem.textContent;
+                delete quarantinedFiles[filename];
+                logMessage(`Restored file: ${filename}. (Mock)`, 'success');
+                updateQuarantineList();
+            }
+        });
+
+        deleteButton.addEventListener('click', () => {
+            const selectedItem = quarantineList.querySelector('.bg-gray-600');
+            if (selectedItem) {
+                const filename = selectedItem.textContent;
+                delete quarantinedFiles[filename];
+                logMessage(`Permanently deleted file: ${filename}. (Mock)`, 'success');
+                updateQuarantineList();
+            }
+        });
+        
+        // Handle selection in the listbox
+        quarantineList.addEventListener('click', (event) => {
+            const items = quarantineList.querySelectorAll('li');
+            items.forEach(item => item.classList.remove('bg-gray-600'));
+            event.target.classList.add('bg-gray-600');
+        });
+
+        // Initial log message
+        logMessage("Antivirus Web App Initialized. Ready for a manual scan.");
+        updateQuarantineList();
+    </script>
+</body>
+</html>

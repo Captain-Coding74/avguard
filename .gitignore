@@ -1,0 +1,17 @@
+# Build output. AVGuard.exe is 28 MB; rebuild it with `python build.py`.
+build/
+dist/
+*.spec
+
+__pycache__/
+*.pyc
+
+# Runtime data now lives in %LOCALAPPDATA%/AVGuard, but an old install may
+# still have this folder before the first-run migration moves it.
+data/
+
+# Version 1 debris, kept as evidence for docs/postmortem.md. It contains the
+# EICAR string 381 times, so committing it would trip GitHub's malware scan
+# and your own Defender.
+antivirus_log.txt
+quarantine/
