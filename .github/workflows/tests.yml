@@ -26,28 +26,97 @@ jobs:
         # and Program Files. That is the point: it is a different set of clean
         # software from the developer's machine, so CI is a second opinion on
         # whether any rule is over-broad, not a repeat of the same measurement.
+        env:
+          AVGUARD_DATA: ${{ runner.temp }}/avguard-data
         run: python -m unittest discover -s tests -v
 
       - name: Check the scanner runs end to end
         shell: pwsh
+        env:
+          AVGUARD_DATA: ${{ runner.temp }}/avguard-data
         run: |
-          python -c "from avguard.scanner import SELFTEST_MARKER; open('selftest.bin','wb').write(SELFTEST_MARKER)"
-          python -m avguard --scan selftest.bin
-          if ($LASTEXITCODE -ne 1) {
-            Write-Error "expected exit 1 (threat found), got $LASTEXITCODE"
+          # Deliberately OUTSIDE the checkout. The checkout directory IS
+          # config.PROJECT_ROOT, and self-protection skips the whole project
+          # tree before a file is even opened, so a fixture written here came
+          # back SKIPPED with exit 0 and this step failed on every push.
+          $work = Join-Path $env:RUNNER_TEMP "scan-check"
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          $bad = Join-Path $work "selftest.bin"
+          python -c "import sys; from avguard.scanner import SELFTEST_MARKER; open(sys.argv[1],'wb').write(SELFTEST_MARKER)" $bad
+
+          $out = (python -m avguard --scan $bad 2>&1 | Out-String)
+          $code = $LASTEXITCODE
+          Write-Host $out
+          # Assert on the OUTPUT, not only the exit code: an exit code alone
+          # would still pass with detection removed entirely.
+          if (-not $out.Contains("MALICIOUS")) {
+            Write-Error "the self-test marker was not detected"
             exit 1
           }
-          Write-Host "self-test detected correctly"
+          if ($code -ne 1) {
+            Write-Error "expected exit 1 for a detection, got $code"
+            exit 1
+          }
+          Write-Host "detected correctly"
 
       - name: Check a clean file stays clean
         shell: pwsh
+        env:
+          AVGUARD_DATA: ${{ runner.temp }}/avguard-data
         run: |
-          "nothing to see here" | Out-File -Encoding utf8 clean.txt
-          python -m avguard --scan clean.txt
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "a clean file should exit 0, got $LASTEXITCODE"
+          $work = Join-Path $env:RUNNER_TEMP "scan-check"
+          $good = Join-Path $work "clean.txt"
+          "nothing to see here" | Out-File -Encoding utf8 $good
+          $out = (python -m avguard --scan $good 2>&1 | Out-String)
+          $code = $LASTEXITCODE
+          Write-Host $out
+          if ($out.Contains("MALICIOUS")) {
+            Write-Error "a clean file was flagged"
             exit 1
           }
+          if (-not $out.Contains("Clean    : 1")) {
+            Write-Error "the clean file was skipped rather than examined"
+            exit 1
+          }
+          if ($code -ne 0) {
+            Write-Error "expected exit 0 for a clean file, got $code"
+            exit 1
+          }
+
+      - name: Check the quarantine round trip
+        shell: pwsh
+        env:
+          AVGUARD_DATA: ${{ runner.temp }}/avguard-roundtrip
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP "roundtrip"
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          $bad = Join-Path $work "threat.bin"
+          python -c "import sys; from avguard.scanner import SELFTEST_MARKER; open(sys.argv[1],'wb').write(SELFTEST_MARKER)" $bad
+
+          python -m avguard --scan $work --quarantine | Out-Null
+          if (Test-Path $bad) {
+            Write-Error "the detected file was not moved into quarantine"
+            exit 1
+          }
+
+          $listed = (python -m avguard --list-quarantine | Out-String)
+          Write-Host $listed
+          if (-not $listed.Contains("threat.bin")) {
+            Write-Error "the quarantined file is not listed"
+            exit 1
+          }
+
+          $id = $listed.Trim().Split([Environment]::NewLine)[0].Split(" ")[0]
+          python -m avguard --restore $id
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "restore failed"
+            exit 1
+          }
+          if (-not (Test-Path $bad)) {
+            Write-Error "restore reported success but the file is not back"
+            exit 1
+          }
+          Write-Host "quarantine round trip works"
 
   linux:
     name: imports cleanly (linux)
@@ -67,7 +136,7 @@ jobs:
 
       - name: Import every module
         # AVGuard only does anything useful on Windows, but it must still
-        # import elsewhere -- `from ctypes import wintypes` at module scope
+        # import elsewhere. `from ctypes import wintypes` at module scope
         # raises ValueError on Linux and took the whole package down with it,
         # so nobody could read the code on a Mac without the import failing.
         run: |

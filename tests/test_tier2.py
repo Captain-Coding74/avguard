@@ -267,7 +267,11 @@ class TestEventStore(TempCase):
 
     def test_rotation_bounds_the_file(self):
         store = self.store()
-        import avguard.events as events_module
+        # Patch the module the store's class actually came from. Reaching for
+        # `import avguard.events` instead meant that if anything else in the
+        # suite had reimported the package, this patched an object nothing was
+        # using and the test failed depending on the order tests ran in.
+        events_module = sys.modules[type(store).__module__]
         original = events_module.MAX_BYTES
         events_module.MAX_BYTES = 2048
         try:

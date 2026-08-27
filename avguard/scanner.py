@@ -199,6 +199,23 @@ def decide(findings: Sequence[Finding], malicious_at: int = MALICIOUS_AT) -> Lev
     return Level.CLEAN
 
 
+def _is_junction(path: Path) -> bool:
+    """os.path.isjunction, but tolerant of interpreters that lack it.
+
+    Added in Python 3.12. Calling it unguarded on 3.11 raises AttributeError
+    once per file, which would fail every scan rather than degrade -- and a
+    junction is a Windows reparse point, so on any other platform the honest
+    answer is simply False.
+    """
+    checker = getattr(os.path, "isjunction", None)
+    if checker is None:
+        return False
+    try:
+        return bool(checker(path))
+    except OSError:
+        return False
+
+
 def shannon_entropy(histogram: Sequence[int], total: int) -> float:
     """Bits of entropy per byte, 0.0 to 8.0.
 
@@ -527,7 +544,7 @@ class Scanner:
         # False for a Windows junction and os.walk(followlinks=False) descends
         # straight through one, so a junction named "logs" pointing at
         # Documents would pull the whole folder into the scan.
-        if path.is_symlink() or os.path.isjunction(path):
+        if path.is_symlink() or _is_junction(path):
             return Verdict(path, Level.SKIPPED, ["reparse point, not followed"])
 
         if not os.path.isfile(path):
@@ -827,7 +844,7 @@ class Scanner:
                 if not self.protection.is_protected(current / d)
                 and not matches_excluded_glob(current / d, self.cfg.excluded_globs)
                 and not (current / d).is_symlink()
-                and not os.path.isjunction(current / d)
+                and not _is_junction(current / d)
             ]
             for name in filenames:
                 yield current / name

@@ -131,7 +131,7 @@ def main(argv: list[str] | None = None) -> int:
         for path in written:
             print(f"  {path.name}")
         if written:
-            print(f"{NL}These are the original, unmodified files. Handle them carefully.")
+            print("\nThese are the original, unmodified files. Handle them carefully.")
         return 0
 
     if args.restore:
@@ -172,7 +172,7 @@ def main(argv: list[str] | None = None) -> int:
             ok_b, detail_b = scheduling.enable_scheduled_scan(target)
             print(f"Start with Windows : {'yes' if ok_a else 'FAILED - ' + detail_a}")
             print(f"Daily scan of {target}: {detail_b if ok_b else 'FAILED - ' + detail_b}")
-            print(f"{NL}The scheduled scan only reports. It never moves files.")
+            print("\nThe scheduled scan only reports. It never moves files.")
             return 0 if (ok_a and ok_b) else 1
         ok_a, _ = scheduling.disable_start_with_windows()
         ok_b, _ = scheduling.disable_scheduled_scan()

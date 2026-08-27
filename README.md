@@ -12,6 +12,11 @@ design decisions here are direct answers to something that went wrong there.
 
 ## Running it
 
+Needs **Python 3.12 or newer** — junction detection uses `os.path.isjunction`,
+added in 3.12. On an older interpreter it degrades rather than failing, but
+Windows junctions then look like ordinary folders and a scan can follow one out
+of the tree it was told to look at.
+
 ```bash
 pip install -r requirements.txt
 ```
@@ -109,7 +114,7 @@ machine see one another's quarantined filenames, and uploaded quarantined
 samples to OneDrive when the project sat in Documents. An existing `data/`
 folder is migrated on first run.
 
-Set `AVGUARD_DATA` to put it somewhere else — a USB stick, for instance.
+Set `AVGUARD_DATA` to put it somewhere else — a USB stick, for instance. That is also how the tests keep out of your real store.
 
 ### The things that matter
 
@@ -253,7 +258,7 @@ version 1's `if malicious_count > 0` would have quarantined them.
 
 ## Settings
 
-`data/config.json` is written on first run. Useful keys:
+`%LOCALAPPDATA%/AVGuard/config.json` is written on first run. Most of it has a Settings window; the rest is here because a wrong value would fail quietly. Useful keys:
 
 | Key | Default | Meaning |
 |---|---|---|
