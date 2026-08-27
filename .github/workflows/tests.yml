@@ -34,93 +34,15 @@ jobs:
         # emits each failure as an annotation, which is public.
         run: python tools/ci_tests.py
 
-      - name: Check the scanner runs end to end
-        shell: pwsh
-        env:
-          AVGUARD_DATA: ${{ runner.temp }}/avguard-data
-        run: |
-          # Deliberately OUTSIDE the checkout. The checkout directory IS
-          # config.PROJECT_ROOT, and self-protection skips the whole project
-          # tree before a file is even opened, so a fixture written here came
-          # back SKIPPED with exit 0 and this step failed on every push.
-          $work = Join-Path $env:RUNNER_TEMP "scan-check"
-          New-Item -ItemType Directory -Force -Path $work | Out-Null
-          $bad = Join-Path $work "selftest.bin"
-          python -c "import sys; from avguard.scanner import SELFTEST_MARKER; open(sys.argv[1],'wb').write(SELFTEST_MARKER)" $bad
-
-          $out = (python -m avguard --scan $bad 2>&1 | Out-String)
-          $code = $LASTEXITCODE
-          Write-Host $out
-          # Assert on the OUTPUT, not only the exit code: an exit code alone
-          # would still pass with detection removed entirely.
-          if (-not $out.Contains("MALICIOUS")) {
-            Write-Error "the self-test marker was not detected"
-            exit 1
-          }
-          if ($code -ne 1) {
-            Write-Error "expected exit 1 for a detection, got $code"
-            exit 1
-          }
-          Write-Host "detected correctly"
-
-      - name: Check a clean file stays clean
-        shell: pwsh
-        env:
-          AVGUARD_DATA: ${{ runner.temp }}/avguard-data
-        run: |
-          $work = Join-Path $env:RUNNER_TEMP "scan-check"
-          $good = Join-Path $work "clean.txt"
-          "nothing to see here" | Out-File -Encoding utf8 $good
-          $out = (python -m avguard --scan $good 2>&1 | Out-String)
-          $code = $LASTEXITCODE
-          Write-Host $out
-          if ($out.Contains("MALICIOUS")) {
-            Write-Error "a clean file was flagged"
-            exit 1
-          }
-          if (-not $out.Contains("Clean    : 1")) {
-            Write-Error "the clean file was skipped rather than examined"
-            exit 1
-          }
-          if ($code -ne 0) {
-            Write-Error "expected exit 0 for a clean file, got $code"
-            exit 1
-          }
-
-      - name: Check the quarantine round trip
-        shell: pwsh
-        env:
-          AVGUARD_DATA: ${{ runner.temp }}/avguard-roundtrip
-        run: |
-          $work = Join-Path $env:RUNNER_TEMP "roundtrip"
-          New-Item -ItemType Directory -Force -Path $work | Out-Null
-          $bad = Join-Path $work "threat.bin"
-          python -c "import sys; from avguard.scanner import SELFTEST_MARKER; open(sys.argv[1],'wb').write(SELFTEST_MARKER)" $bad
-
-          python -m avguard --scan $work --quarantine | Out-Null
-          if (Test-Path $bad) {
-            Write-Error "the detected file was not moved into quarantine"
-            exit 1
-          }
-
-          $listed = (python -m avguard --list-quarantine | Out-String)
-          Write-Host $listed
-          if (-not $listed.Contains("threat.bin")) {
-            Write-Error "the quarantined file is not listed"
-            exit 1
-          }
-
-          $id = $listed.Trim().Split([Environment]::NewLine)[0].Split(" ")[0]
-          python -m avguard --restore $id
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "restore failed"
-            exit 1
-          }
-          if (-not (Test-Path $bad)) {
-            Write-Error "restore reported success but the file is not back"
-            exit 1
-          }
-          Write-Host "quarantine round trip works"
+      - name: End-to-end checks
+        # Python, not PowerShell. The PowerShell version failed for a reason
+        # that had nothing to do with AVGuard: pwsh 7.4 turns a native
+        # command's non-zero exit into a terminating error when
+        # ErrorActionPreference is Stop, which Actions sets -- and `--scan`
+        # exits 1 when it finds something, which is the entire point of the
+        # check. Python also means these run identically on a laptop, so a
+        # CI-only failure in the checks themselves cannot happen again.
+        run: python tools/ci_smoke.py
 
   linux:
     name: imports cleanly (linux)
