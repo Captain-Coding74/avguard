@@ -33,7 +33,6 @@ import ctypes
 import logging
 import sys
 import threading
-from ctypes import wintypes
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -41,6 +40,14 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 IS_WINDOWS = sys.platform == "win32"
+
+# `ctypes.wintypes` raises ValueError on anything that is not Windows, and it
+# is imported at module scope, so an unguarded import here would take down the
+# whole package: scanner.py imports this module, so nobody could even read the
+# code on a Mac without the import failing. AVGuard only does anything useful
+# on Windows, but it should still import anywhere.
+if IS_WINDOWS:
+    from ctypes import wintypes
 
 
 class Trust(str, Enum):

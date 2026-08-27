@@ -1,5 +1,7 @@
 # AVGuard
 
+[![tests](https://github.com/Captain-Coding74/avguard/actions/workflows/tests.yml/badge.svg)](https://github.com/Captain-Coding74/avguard/actions/workflows/tests.yml)
+
 A small file scanner for Windows: local signatures, YARA rules, an optional
 VirusTotal lookup, real-time folder monitoring, and a quarantine you can
 actually undo.
@@ -70,6 +72,13 @@ python -m unittest discover -s tests
 No test dependencies beyond the stdlib. Most tests name the specific bug they
 exist to prevent, and the run prints the rule corpus size and the measured
 false-positive rate rather than asserting a number that can go stale.
+
+CI runs the same suite on a clean `windows-latest` runner. That matters more
+than it sounds: the rule corpus samples real binaries from whatever machine it
+runs on, so CI is sampling a *different* set of clean software than this
+developer's laptop. It is a second opinion on whether a rule is over-broad, not
+a repeat of the same measurement. A separate Linux job checks the package still
+imports where it cannot actually run.
 
 ## How it is put together
 

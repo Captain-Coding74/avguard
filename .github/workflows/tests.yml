@@ -1,0 +1,90 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    name: full suite (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run the tests
+        # The rule corpus samples real binaries from the runner's own System32
+        # and Program Files. That is the point: it is a different set of clean
+        # software from the developer's machine, so CI is a second opinion on
+        # whether any rule is over-broad, not a repeat of the same measurement.
+        run: python -m unittest discover -s tests -v
+
+      - name: Check the scanner runs end to end
+        shell: pwsh
+        run: |
+          python -c "from avguard.scanner import SELFTEST_MARKER; open('selftest.bin','wb').write(SELFTEST_MARKER)"
+          python -m avguard --scan selftest.bin
+          if ($LASTEXITCODE -ne 1) {
+            Write-Error "expected exit 1 (threat found), got $LASTEXITCODE"
+            exit 1
+          }
+          Write-Host "self-test detected correctly"
+
+      - name: Check a clean file stays clean
+        shell: pwsh
+        run: |
+          "nothing to see here" | Out-File -Encoding utf8 clean.txt
+          python -m avguard --scan clean.txt
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "a clean file should exit 0, got $LASTEXITCODE"
+            exit 1
+          }
+
+  linux:
+    name: imports cleanly (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        # No pystray or Pillow: the tray icon is Windows-only here and pulls in
+        # GTK on Linux for no benefit.
+        run: pip install yara-python watchdog requests pefile
+
+      - name: Import every module
+        # AVGuard only does anything useful on Windows, but it must still
+        # import elsewhere -- `from ctypes import wintypes` at module scope
+        # raises ValueError on Linux and took the whole package down with it,
+        # so nobody could read the code on a Mac without the import failing.
+        run: |
+          python - <<'PY'
+          import importlib
+          modules = ["config", "protection", "scanner", "quarantine", "cloud",
+                     "watcher", "logsetup", "instance", "archives", "peinfo",
+                     "events", "signing", "scheduling"]
+          for name in modules:
+              importlib.import_module(f"avguard.{name}")
+              print(f"  ok  avguard.{name}")
+          from avguard.signing import SignatureChecker
+          assert not SignatureChecker().available, "signing must report unavailable off Windows"
+          print("signature checking correctly reports unavailable")
+          PY
+
+      - name: Run the platform-independent tests
+        env:
+          AVGUARD_DATA: /tmp/avguard-ci
+        run: python -m unittest discover -s tests -v
