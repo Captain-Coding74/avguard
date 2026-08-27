@@ -233,14 +233,60 @@ class RealtimeMonitor:
 
     @property
     def running(self) -> bool:
-        """Both halves must be alive.
+        """True only if the whole chain can actually deliver a scan.
 
-        An observer thread with no live workers still reported "on" while
-        nothing was being scanned. Saying protection is running has to mean
-        something can actually scan.
+        Checking the observer thread was not enough. watchdog delivers events
+        through a per-directory *emitter*, and deleting and recreating a
+        watched folder -- a removable drive reconnecting, a sync client
+        rebuilding it, the user clearing out Downloads -- kills that emitter
+        permanently while the observer thread, the debouncer and the worker
+        pool all stay alive and healthy.
+
+        Reproduced: four files scoring a hard 100 sat in the watched folder
+        undetected while `running` returned True and the Health view printed
+        "Real-time protection  OK". That is v1's defining failure, in this
+        rewrite, through a different mechanism. So this now proves every link:
+        observer, at least one live emitter, the debouncer, and the pool.
         """
-        observing = self._observer is not None and self._observer.is_alive()
-        return observing and self.pool.running
+        return not self.broken_links()
+
+    def broken_links(self) -> list[str]:
+        """Everything in the chain that is not working, in plain words."""
+        broken: list[str] = []
+
+        if self._observer is None or not self._observer.is_alive():
+            broken.append("the folder watcher is not running")
+            return broken
+
+        emitters = list(getattr(self._observer, "emitters", []) or [])
+        if not emitters:
+            broken.append("no folders are actually being watched")
+        elif not any(e.is_alive() for e in emitters):
+            broken.append("the folder watcher stopped receiving events "
+                          "(a watched folder was probably deleted and recreated)")
+
+        thread = self.debouncer._thread
+        if thread is None or not thread.is_alive():
+            broken.append("the event collector has stopped")
+
+        if not self.pool.running:
+            broken.append("no scan workers are alive")
+
+        return broken
+
+    def recover(self) -> bool:
+        """Re-establish the watch after the chain has broken.
+
+        Restarting is the honest response to a dead emitter: the folder may
+        exist again, and the alternative is telling the user their protection
+        is off and leaving it off.
+        """
+        paths = list(self._watched)
+        if not paths:
+            return False
+        log.warning("real-time monitoring stopped working; restarting it")
+        self.stop()
+        return bool(self.start(paths))
 
     @property
     def watched(self) -> list[Path]:

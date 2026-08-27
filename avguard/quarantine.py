@@ -71,6 +71,12 @@ class QuarantineRecord:
     nonce: str
     reasons: list[str] = field(default_factory=list)
 
+    # True between "payload written" and "original removed". The nonce that
+    # decodes the payload lives only in this record, so it has to reach disk
+    # before the original is destroyed -- otherwise an index write that fails
+    # at the wrong moment takes the user's file with it.
+    pending: bool = False
+
     @property
     def display(self) -> str:
         when = self.quarantined_at[:19].replace("T", " ")
@@ -110,6 +116,47 @@ class QuarantineStore:
             except TypeError:
                 log.warning("dropping malformed quarantine record %s", entry_id)
         self._records = records
+        self._reconcile()
+
+    def _reconcile(self) -> None:
+        """Finish or undo any move that was interrupted last time.
+
+        A pending record means the payload was written but we cannot be sure
+        the original was removed. If the original is still there, the move
+        never completed: drop our copy and leave the user's file alone. If it
+        is gone, the move did complete and only the flag was never cleared.
+        """
+        for entry_id, record in list(self._records.items()):
+            if not record.pending:
+                continue
+            try:
+                original_still_there = Path(record.original_path).exists()
+            except OSError:
+                original_still_there = False
+
+            if original_still_there:
+                log.warning("undoing an interrupted quarantine of %s; your file was "
+                            "never removed", record.original_path)
+                self._payload_path(entry_id).unlink(missing_ok=True)
+                del self._records[entry_id]
+            else:
+                log.info("completing an interrupted quarantine of %s", record.original_name)
+                record.pending = False
+        try:
+            self._save()
+        except QuarantineError as exc:
+            log.error("could not write the reconciled index: %s", exc)
+
+    def orphaned_payloads(self) -> list[Path]:
+        """Stored payloads with no record, which nothing can decode.
+
+        Reported rather than deleted. They are unreadable without their nonce,
+        but they are also the last trace that something was taken, and a
+        program that silently removes evidence of its own failure is worse
+        than one that leaves a puzzle.
+        """
+        known = {f"{entry_id}.quar" for entry_id in self._records}
+        return [p for p in self.directory.glob("*.quar") if p.name not in known]
 
     def _reload_and_merge(self) -> None:
         """Re-read the index from disk, keeping anything we do not know about.
@@ -141,8 +188,18 @@ class QuarantineStore:
             self._records.pop(entry_id, None)
 
     def _save(self) -> None:
+        """Persist the index, turning any I/O failure into a QuarantineError.
+
+        This used to raise a bare OSError. Every caller catches only
+        QuarantineError, so a full disk escaped gui._handle_threat entirely and
+        was swallowed by the UI pump's generic handler -- no banner, no event,
+        no notification, and the user's file already gone.
+        """
         payload = {k: asdict(v) for k, v in self._records.items()}
-        config.atomic_write_text(self.index_path, json.dumps(payload, indent=2))
+        try:
+            config.atomic_write_text(self.index_path, json.dumps(payload, indent=2))
+        except OSError as exc:
+            raise QuarantineError(f"could not write the quarantine index: {exc}") from exc
 
     def _payload_path(self, entry_id: str) -> Path:
         # The id is a UUID4 hex string, so this name can never contain a path
@@ -194,12 +251,6 @@ class QuarantineStore:
                 tmp.unlink(missing_ok=True)
                 raise QuarantineError(f"could not write quarantine payload: {exc}") from exc
 
-            try:
-                source.unlink()
-            except OSError as exc:
-                payload.unlink(missing_ok=True)
-                raise QuarantineError(f"could not remove original {source}: {exc}") from exc
-
             record = QuarantineRecord(
                 entry_id=entry_id,
                 original_path=str(source),
@@ -209,9 +260,41 @@ class QuarantineStore:
                 sha256=digest,
                 nonce=nonce.hex(),
                 reasons=list(reasons or []),
+                pending=True,
             )
             self._records[entry_id] = record
-            self._save()
+
+            # The record reaches disk BEFORE the original is destroyed. The
+            # nonce that decodes the payload exists nowhere else, so unlinking
+            # first meant a failed index write -- a full disk, a locked file, a
+            # process kill -- destroyed the user's file and left a payload
+            # nothing could ever decode. Reproduced, then fixed by reordering.
+            try:
+                self._save()
+            except QuarantineError:
+                del self._records[entry_id]
+                payload.unlink(missing_ok=True)
+                raise
+
+            try:
+                source.unlink()
+            except OSError as exc:
+                del self._records[entry_id]
+                payload.unlink(missing_ok=True)
+                try:
+                    self._save()
+                except QuarantineError:
+                    pass
+                raise QuarantineError(f"could not remove original {source}: {exc}") from exc
+
+            # The move is complete. If clearing the flag fails, the next start
+            # reconciles it: the original is gone, so the record is honoured.
+            record.pending = False
+            try:
+                self._save()
+            except QuarantineError as exc:
+                log.warning("quarantine of %s completed but the index was not updated: %s",
+                            source.name, exc)
 
         log.warning("quarantined %s (%s)", source, "; ".join(record.reasons) or "no reason given")
         return record

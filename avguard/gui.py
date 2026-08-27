@@ -40,6 +40,11 @@ MAX_LOG_LINES = 2000
 UI_TICK_MS = 100
 MAX_DRAIN_PER_TICK = 200
 
+# How often to prove real-time protection is still working. A watched folder
+# being deleted and recreated kills watchdog's emitter silently, and the old
+# status check could not see it.
+HEALTH_TICK_MS = 30_000
+
 LEVEL_TAGS = {
     logging.ERROR: ("error", "#ff6b6b"),
     logging.WARNING: ("threat", "#ffd166"),
@@ -100,6 +105,7 @@ class AVGuardApp(tb.Window):
         self.protocol("WM_DELETE_WINDOW", self._hide)
 
         self.after(UI_TICK_MS, self._pump)
+        self.after(HEALTH_TICK_MS, self._check_realtime_health)
         self._refresh_quarantine()
 
         if not self.scanner.rules:
@@ -692,6 +698,33 @@ class AVGuardApp(tb.Window):
         else:
             self._banner("Rules failed to load - the previous ones are still in use. "
                          "See the log.", "inverse-danger")
+    def _check_realtime_health(self) -> None:
+        """Notice the watcher dying, and put it back.
+
+        Reproduced before this existed: deleting and recreating the watched
+        folder left four files scoring a hard 100 sitting undetected while the
+        header said "Real-time protection on". Reporting the truth is the
+        minimum; restoring the protection is the point.
+        """
+        try:
+            if self.realtime_var.get() and self._watch_targets():
+                broken = self.monitor.broken_links()
+                if broken and not self._shutting_down:
+                    log.warning("real-time protection stopped working: %s",
+                                "; ".join(broken))
+                    self.events.record(Event(kind="health",
+                                             detail={"broken": broken}))
+                    if self.monitor.recover():
+                        self._banner("Real-time protection stopped and was restarted.",
+                                     "inverse-warning")
+                    else:
+                        self._banner("Real-time protection has stopped: "
+                                     + "; ".join(broken), "inverse-danger")
+        except Exception:
+            log.exception("the real-time health check failed")
+        finally:
+            if not self._shutting_down:
+                self.after(HEALTH_TICK_MS, self._check_realtime_health)
     # ------------------------------------------------------------- windows
 
     def _show_settings(self) -> None:
@@ -716,17 +749,18 @@ class AVGuardApp(tb.Window):
     def _show_health(self) -> None:
         """Every row is something that has failed silently before."""
         rules_ok = self.scanner.rules is not None
-        watching = self.monitor.running
-        workers = self.monitor.pool.alive_workers if watching else 0
+        broken = self.monitor.broken_links()
+        watching = not broken and bool(self.monitor.watched)
+        workers = self.monitor.pool.alive_workers
         checks = [
             ("Detection rules", rules_ok,
              f"compiled from {self.scanner.rules_path.name}" if rules_ok
              else "FAILED TO COMPILE - most detection is off. See the log."),
             ("Real-time protection", watching,
              f"watching {len(self.monitor.watched)} folder(s)" if watching
-             else "not running"),
-            ("Scan workers", (not watching) or workers > 0,
-             f"{workers} alive" if watching else "idle, nothing to do"),
+             else ("; ".join(broken) if broken else "not running")),
+            ("Scan workers", (not self.monitor.watched) or workers > 0,
+             f"{workers} alive" if workers else "idle, nothing to do"),
             ("Quarantine store", self.has_lock,
              f"{len(self.quarantine)} item(s) held" if self.has_lock
              else "another AVGuard holds the lock; this window cannot move files"),
@@ -736,6 +770,11 @@ class AVGuardApp(tb.Window):
              f"on, {self.cloud.spent_today} lookup(s) today" if self.cfg.cloud_enabled
              else "off - no hashes leave this machine"),
             ("Scan cache", True, f"{len(self.cache)} remembered verdict(s)"),
+            ("Quarantine integrity", not self.quarantine.orphaned_payloads(),
+             "every stored file has a record"
+             if not self.quarantine.orphaned_payloads()
+             else f"{len(self.quarantine.orphaned_payloads())} stored file(s) have no "
+                  "record and cannot be decoded; see the log"),
             ("Publisher trust", self.scanner.signatures.available,
              "Authenticode checking is available" if self.scanner.signatures.available
              else "unavailable on this system"),

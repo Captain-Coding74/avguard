@@ -168,6 +168,14 @@ a protected directory, and verifies the SHA-256 before putting anything back.
 If you want the original bytes for analysis, that is a separate `Export`
 action.
 
+**"Protection is on" has to mean something can actually scan.** Deleting and
+recreating a watched folder kills watchdog's per-directory emitter permanently,
+while the observer thread, the debouncer and the worker pool all stay alive and
+healthy-looking. Measured: four files scoring a hard 100 sat in the watched
+folder undetected while the header said protection was on. `running` now proves
+every link in the chain, the Health window names whichever one is broken in
+plain words, and a check every thirty seconds puts it back.
+
 **Failures are loud.** The UI pump reschedules itself from a `finally`, so a
 formatting error in one log line cannot silently stop the program draining its
 queues while the window still looks alive. `sys.excepthook` and
@@ -175,6 +183,16 @@ queues while the window still looks alive. `sys.excepthook` and
 there is no stderr for a traceback to reach. A YARA ruleset that fails to
 compile puts a banner on the window instead of a single line in a log nobody
 reads.
+
+**The record reaches disk before your file is destroyed.** Quarantine used to
+write the masked payload, delete your original, and *then* save the record. The
+nonce that decodes the payload existed nowhere but memory in between, so a full
+disk or a process kill in that window deleted your file and left something
+nothing could ever decode — not restore, not `--export-all`, not by hand. The
+order is now: write payload, save the record marked pending, delete the
+original, clear the flag. An interrupted move is reconciled on the next start:
+if your file is still there the move is undone, if it is gone the move is
+honoured.
 
 **One writer at a time.** Both entry points take an exclusive lock on
 `data/avguard.lock`. Two AVGuard processes sharing the quarantine store used to
