@@ -21,6 +21,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Sequence
 
+from . import allowlist as allowlist_module
 from . import archives, config, peinfo, signing
 from .protection import SelfProtection, matches_excluded_glob
 
@@ -91,7 +92,7 @@ SUSPICIOUS_AT = 50
 # Learned by shipping it: the archive inspector stopped calling large resource
 # packs "hostile", and the machine kept reporting the old verdict because the
 # generation hash only covered the rule file.
-DETECTION_VERSION = 4
+DETECTION_VERSION = 6
 
 # Heuristics never add up to a condemnation, however many of them agree.
 #
@@ -374,6 +375,7 @@ class Scanner:
         self.rules = None
         self.rule_sources: list[Path] = []
         self.signatures = signing.SignatureChecker()
+        self.allowlist = allowlist_module.Allowlist()
         self._max_signature = max((len(s) for s in SIGNATURES.values()), default=0)
         self.load_rules()
         if cache is None:
@@ -765,6 +767,21 @@ class Scanner:
             facts = self._read_facts(path, size, mtime_ns)
         except (OSError, MemoryError) as exc:
             return Verdict(path, Level.ERROR, [f"cannot read: {exc}"])
+
+        # A file the user restored by hand is a decision about these exact
+        # bytes, and it outranks anything found below. Before this, restoring
+        # something taught the scanner nothing and it was taken again about a
+        # second later -- an argument the user could not win.
+        allowed = self.allowlist.allows(facts.sha256)
+        if allowed is not None:
+            reason = (f"you chose to keep this file on {allowed.when}"
+                      + (f" (it was flagged for {'; '.join(allowed.was_flagged_for)})"
+                         if allowed.was_flagged_for else ""))
+            verdict = Verdict(path, Level.CLEAN, [reason], facts,
+                              [Finding("allowlist", "user-decision", 0, reason)])
+            if use_cache:
+                self.cache.put(path, size, mtime_ns, Level.CLEAN, [reason], facts.sha256)
+            return verdict
 
         findings: list[Finding] = []
 

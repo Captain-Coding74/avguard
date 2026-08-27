@@ -29,6 +29,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import config
+from .allowlist import Allowlist
 from .protection import SelfProtection
 
 log = logging.getLogger(__name__)
@@ -91,7 +92,9 @@ class QuarantineStore:
         directory: Path = config.QUARANTINE_DIR,
         index_path: Path = config.QUARANTINE_INDEX,
         protection: SelfProtection | None = None,
+        allowlist: Allowlist | None = None,
     ) -> None:
+        self.allowlist = allowlist if allowlist is not None else Allowlist()
         self.directory = Path(directory)
         self.index_path = Path(index_path)
         self.protection = protection
@@ -373,6 +376,9 @@ class QuarantineStore:
             del self._records[entry_id]
             self._deleted.add(entry_id)
             self._save()
+
+        # Remember the decision, or the next scan takes it straight back.
+        self.allowlist.add(record.sha256, record.original_name, record.reasons)
 
         log.info("restored %s to %s", record.original_name, target)
         return target

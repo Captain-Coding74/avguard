@@ -272,3 +272,104 @@ class TestRealtimeHonesty(TempCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ------------------------------------------------- a restore is a decision
+
+class TestAllowlist(TempCase):
+    """Restoring taught the scanner nothing, so it took the file straight back.
+
+    With automatic quarantine on, a restored file was detected again and
+    removed within about a second, and the only escape was excluding its whole
+    folder. That is not an argument the user can win.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        from avguard.allowlist import Allowlist
+        self.allowlist = Allowlist(path=self.tmp / "allow.json")
+        self.protection = SelfProtection([self.tmp / "prot"])
+        self.scanner = Scanner(config.Config(cloud_enabled=False), self.protection,
+                               rules_path=RULES,
+                               cache=ScanCache(path=self.tmp / "c.json"))
+        self.scanner.allowlist = self.allowlist
+        self.store = QuarantineStore(directory=self.tmp / "store",
+                                     index_path=self.tmp / "store" / "index.json",
+                                     protection=self.protection,
+                                     allowlist=self.allowlist)
+
+    def marker(self, name: str = "kept.bin") -> Path:
+        from avguard.scanner import SELFTEST_MARKER
+        return self.write(name, SELFTEST_MARKER)
+
+    def test_a_restored_file_is_not_taken_again(self):
+        from avguard.scanner import Level
+        target = self.marker()
+        verdict = self.scanner.scan(target, use_cache=False)
+        self.assertIs(verdict.level, Level.MALICIOUS)
+
+        record = self.store.quarantine(target, verdict.reasons)
+        restored = self.store.restore(record.entry_id)
+
+        again = self.scanner.scan(restored, use_cache=False)
+        self.assertIs(again.level, Level.CLEAN)
+        self.assertFalse(again.is_threat)
+
+    def test_the_verdict_says_why_it_is_clean(self):
+        """An allowed file must never simply look clean."""
+        target = self.marker()
+        verdict = self.scanner.scan(target, use_cache=False)
+        record = self.store.quarantine(target, verdict.reasons)
+        restored = self.store.restore(record.entry_id)
+        again = self.scanner.scan(restored, use_cache=False)
+        self.assertIn("you chose to keep", again.reasons[0])
+
+    def test_the_decision_expires_when_the_file_changes(self):
+        from avguard.scanner import Level, SELFTEST_MARKER
+        target = self.marker()
+        verdict = self.scanner.scan(target, use_cache=False)
+        record = self.store.quarantine(target, verdict.reasons)
+        restored = self.store.restore(record.entry_id)
+
+        restored.write_bytes(SELFTEST_MARKER + b"  now edited")
+        self.assertIs(self.scanner.scan(restored, use_cache=False).level,
+                      Level.MALICIOUS,
+                      "the decision must cover exact bytes, not a filename")
+
+    def test_allowing_one_file_does_not_allow_another(self):
+        from avguard.scanner import Level
+        first = self.marker("first.bin")
+        verdict = self.scanner.scan(first, use_cache=False)
+        record = self.store.quarantine(first, verdict.reasons)
+        self.store.restore(record.entry_id)
+
+        second = self.marker("second.bin")
+        second.write_bytes(second.read_bytes() + b" different")
+        self.assertIs(self.scanner.scan(second, use_cache=False).level, Level.MALICIOUS)
+
+    def test_entries_are_reviewable(self):
+        target = self.marker()
+        verdict = self.scanner.scan(target, use_cache=False)
+        record = self.store.quarantine(target, verdict.reasons)
+        self.store.restore(record.entry_id)
+
+        entries = self.allowlist.entries()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].name, "kept.bin")
+        self.assertTrue(entries[0].was_flagged_for, "a list of bare hashes is not reviewable")
+
+    def test_a_decision_can_be_taken_back(self):
+        from avguard.scanner import Level
+        target = self.marker()
+        verdict = self.scanner.scan(target, use_cache=False)
+        record = self.store.quarantine(target, verdict.reasons)
+        restored = self.store.restore(record.entry_id)
+
+        digest = self.allowlist.entries()[0].sha256
+        self.assertTrue(self.allowlist.remove(digest))
+        self.assertIs(self.scanner.scan(restored, use_cache=False).level, Level.MALICIOUS)
+
+    def test_a_corrupt_allowlist_does_not_break_scanning(self):
+        from avguard.allowlist import Allowlist
+        (self.tmp / "bad.json").write_text("{ not json at all")
+        self.assertEqual(len(Allowlist(path=self.tmp / "bad.json")), 0)

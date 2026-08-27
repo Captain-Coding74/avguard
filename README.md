@@ -199,6 +199,16 @@ original, clear the flag. An interrupted move is reconciled on the next start:
 if your file is still there the move is undone, if it is gone the move is
 honoured.
 
+**Restoring something is a decision the scanner remembers.** It used to teach
+it nothing: with automatic quarantine on, a restored file was detected again
+and taken away about a second later, and the only escape was excluding its
+whole folder. A restore now records the SHA-256 of those exact bytes in
+`allowlist.json`. Deliberately narrow — one file, not a name, not a folder, not
+a publisher — so editing the file changes its hash and the decision expires by
+itself. It overrides a detection, including a signature match, because you
+looked at that file and said keep it; the verdict always says so, and an
+allowed file never merely looks clean.
+
 **One writer at a time.** Both entry points take an exclusive lock on
 `data/avguard.lock`. Two AVGuard processes sharing the quarantine store used to
 destroy each other's records: each loaded the index once and later rewrote it
