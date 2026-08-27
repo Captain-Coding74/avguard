@@ -288,3 +288,14 @@ Still present, not touched, safe to remove when you have looked at them:
 - `app website version/app.html` — a mock UI with no backend
 
 `data/` is the new home for everything the running program writes.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Use it, change it, ship it.
+
+The "no warranty" clause is not boilerplate here. This program moves people's
+files. It is a hobby scanner with two byte signatures and five rules, not a
+replacement for the antivirus your operating system already runs, and it is
+built on the assumption that a false positive is worse than a missed
+detection. Read [docs/postmortem.md](docs/postmortem.md) before you trust it
+with anything you cannot replace.
