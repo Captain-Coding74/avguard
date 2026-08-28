@@ -395,7 +395,7 @@ class TestCacheLifecycle(TempCase):
         self.assertIn(first, cache._entries, "the newest entry was evicted")
 
     def test_clear_empties_the_path_inventory(self):
-        cache = ScanCache(path=self.tmp / "c.json")
+        cache = ScanCache(path=self.tmp / "c.json", generation="g")
         cache.put(Path("c:/users/me/private.docx"), 1, 1, Level.CLEAN, [], "h")
         cache.save()
         cache.clear()
@@ -403,7 +403,10 @@ class TestCacheLifecycle(TempCase):
         self.assertNotIn("private.docx", (self.tmp / "c.json").read_text())
 
     def test_saving_prunes(self):
-        cache = ScanCache(path=self.tmp / "c.json", max_entries=2)
+        # A generation is required now: a cache that cannot say which logic
+        # produced its verdicts neither reads nor writes, so that a
+        # misconfigured caller cannot erase a good cache with an empty one.
+        cache = ScanCache(path=self.tmp / "c.json", max_entries=2, generation="g")
         for i in range(6):
             cache.put(Path(f"c:/f{i}"), i, i, Level.CLEAN, [], "h")
         cache.save()

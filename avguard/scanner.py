@@ -277,7 +277,12 @@ class ScanCache:
             self._entries = {}
             return
 
-        if self._generation and raw.get("generation") != self._generation:
+        # Unconditional: an empty generation means the caller did not say what
+        # logic produced these verdicts, and "I do not know" must not be read
+        # as "anything is fine". The GUI built its cache without one, so it
+        # replayed verdicts from any ruleset for the full 30-day TTL and then
+        # wrote the empty generation back, destroying the CLI's cache in turn.
+        if raw.get("generation") != self._generation:
             log.info("detection rules changed since the cache was written; starting fresh")
             self._entries = {}
             return
@@ -326,6 +331,13 @@ class ScanCache:
             return len(self._entries)
 
     def save(self) -> None:
+        if not self._generation:
+            # A cache that cannot say which logic produced its verdicts has no
+            # authority to replace one that can. Reading already refuses; if
+            # writing did not, a misconfigured caller would still erase a good
+            # cache by saving an empty one over it. No generation means no
+            # cache: reads miss, writes are dropped, nothing is corrupted.
+            return
         self.prune()
         with self._lock:
             snapshot = dict(self._entries)
@@ -348,6 +360,10 @@ class ScanCache:
                 "sha256": sha256,
                 "at": time.time(),
             }
+
+    @property
+    def path(self) -> Path:
+        return self._path
 
     def invalidate(self, path: Path) -> None:
         prefix = f"{str(path).lower()}|"
@@ -385,6 +401,19 @@ class Scanner:
 
     # ---------------------------------------------------------------- rules
 
+    def rekey_cache(self) -> int:
+        """Rebuild the cache against the current settings and rules.
+
+        Ticking "look inside .zip files" changes what a clean verdict means,
+        so every verdict stored under the old setting has to go. Returns how
+        many entries were discarded, so the caller can say so.
+        """
+        before = len(self.cache)
+        self.cache.save()
+        self.cache = ScanCache(path=self.cache.path,
+                               generation=self.detection_generation())
+        return before - len(self.cache)
+
     def detection_generation(self) -> str:
         """A short hash of everything that decides a verdict.
 
@@ -404,6 +433,12 @@ class Scanner:
         digest.update(f"pe={self.cfg.pe_analysis_enabled}".encode())
         digest.update(f"zip={self.cfg.archive_scanning_enabled}".encode())
         digest.update(f"signed={self.cfg.trust_signed_publishers}".encode())
+        # The threshold is documented as "evidence needed before a file may be
+        # moved", so a change to it changes what a stored verdict means.
+        digest.update(f"threshold={self.cfg.quarantine_threshold}".encode())
+        digest.update(f"cap={HEURISTIC_CAP}|susp={SUSPICIOUS_AT}".encode())
+        digest.update(f"sig={WEIGHT_SIGNATURE}|ent={WEIGHT_ENTROPY}"
+                      f"|pe={WEIGHT_PE_STRUCTURE}|arc={WEIGHT_ARCHIVE_PROBLEM}".encode())
         for path in self.rule_files():
             try:
                 digest.update(path.name.encode())
@@ -450,9 +485,20 @@ class Scanner:
 
         namespaces = {}
         for path in sources:
-            namespaces[path.stem if path.name not in namespaces else str(path)] = str(path)
+            # Keyed on the resolved path, never the stem. The old key compared
+            # path.name against a dict keyed by path.stem, so the collision
+            # guard never fired: a user rule file named malware.yara -- the
+            # documented way to add rules, and the obvious name to choose --
+            # silently replaced the entire shipped ruleset. EICAR stopped
+            # matching while the log still said two files had compiled and the
+            # Health view still listed both.
+            namespaces[str(path.resolve())] = str(path)
 
         try:
+            if len(namespaces) != len(sources):
+                log.error("two rule files resolved to the same namespace; "
+                          "refusing to load rather than silently dropping one")
+                return False
             candidate = yara.compile(filepaths=namespaces)
         except yara.Error as exc:
             self._report_rule_failure(f"rules failed to compile: {exc}")

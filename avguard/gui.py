@@ -71,7 +71,6 @@ class AVGuardApp(tb.Window):
 
         self.cfg = config.Config.load()
         self.protection = SelfProtection()
-        self.cache = ScanCache()
         self.quarantine = QuarantineStore(protection=self.protection)
         self.events = EventStore()
 
@@ -79,9 +78,16 @@ class AVGuardApp(tb.Window):
         self.scanner = Scanner(
             self.cfg,
             self.protection,
-            cache=self.cache,
             cloud_lookup=self.cloud.reasons_for,
         )
+        # Adopt the Scanner's cache rather than handing it one. Building a
+        # ScanCache here meant it had no generation, and a cache with no
+        # generation accepted verdicts written under any ruleset for the full
+        # 30-day TTL -- then wrote the empty generation back, destroying the
+        # CLI's cache on its next run. The two entry points were erasing each
+        # other's work on every alternation.
+        self.cache = self.scanner.cache
+
         self.monitor = RealtimeMonitor(
             self.scanner,
             self.protection,
@@ -733,6 +739,12 @@ class AVGuardApp(tb.Window):
     def _settings_saved(self) -> None:
         """Apply what can be applied live, and say what cannot."""
         self.scanner.cfg = self.cfg
+        # Ticking "look inside .zip files" changes what a clean verdict means,
+        # so every verdict stored under the old setting has to go.
+        discarded = self.scanner.rekey_cache()
+        self.cache = self.scanner.cache
+        if discarded:
+            log.info("settings changed; discarded %d cached verdict(s)", discarded)
         log.info("settings saved")
         if self.monitor.running:
             self.monitor.stop()

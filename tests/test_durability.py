@@ -373,3 +373,112 @@ class TestAllowlist(TempCase):
         from avguard.allowlist import Allowlist
         (self.tmp / "bad.json").write_text("{ not json at all")
         self.assertEqual(len(Allowlist(path=self.tmp / "bad.json")), 0)
+
+
+# ------------------------------------- cached verdicts and rule namespaces
+
+class TestCacheGeneration(TempCase):
+    """A cached verdict is a conclusion drawn by a particular version.
+
+    The GUI built its ScanCache without a generation, and the check that
+    compares generations was itself guarded by `if self._generation` -- so an
+    empty one meant "accept anything". The GUI replayed verdicts written under
+    any ruleset for the full 30-day TTL, then wrote the empty generation back,
+    which made the CLI discard its whole cache on the next run. The two entry
+    points erased each other's work on every alternation.
+    """
+
+    def cache(self, generation: str = "") -> ScanCache:
+        return ScanCache(path=self.tmp / "c.json", generation=generation)
+
+    def test_a_cache_without_a_generation_refuses_foreign_entries(self):
+        from avguard.scanner import Level
+        first = self.cache("AAAA")
+        first.put(Path("c:/x"), 1, 2, Level.CLEAN, ["old logic"], "h")
+        first.save()
+        self.assertIsNone(self.cache().get(Path("c:/x"), 1, 2),
+                          "an unknown generation must not be read as 'anything goes'")
+
+    def test_reading_with_no_generation_does_not_destroy_the_cache(self):
+        from avguard.scanner import Level
+        first = self.cache("AAAA")
+        first.put(Path("c:/x"), 1, 2, Level.CLEAN, ["keep me"], "h")
+        first.save()
+        self.cache().save()          # the GUI's old behaviour
+        self.assertIsNotNone(self.cache("AAAA").get(Path("c:/x"), 1, 2),
+                             "one entry point wiped the other's cache")
+
+    def test_the_threshold_is_part_of_the_generation(self):
+        """The README calls it 'evidence needed before a file may be moved'."""
+        protection = SelfProtection([self.tmp / "prot"])
+        lenient = Scanner(config.Config(cloud_enabled=False, quarantine_threshold=50),
+                          protection, rules_path=RULES,
+                          cache=ScanCache(path=self.tmp / "a.json"))
+        strict = Scanner(config.Config(cloud_enabled=False, quarantine_threshold=100),
+                         protection, rules_path=RULES,
+                         cache=ScanCache(path=self.tmp / "b.json"))
+        self.assertNotEqual(lenient.detection_generation(),
+                            strict.detection_generation())
+
+    def test_rekeying_discards_verdicts_from_the_old_settings(self):
+        from avguard.scanner import Level
+        protection = SelfProtection([self.tmp / "prot"])
+        scanner = Scanner(config.Config(cloud_enabled=False), protection,
+                          rules_path=RULES,
+                          cache=ScanCache(path=self.tmp / "c.json",
+                                          generation="whatever"))
+        scanner.cache.put(Path("c:/x"), 1, 2, Level.CLEAN, ["stale"], "h")
+        scanner.cache.save()
+        scanner.rekey_cache()
+        self.assertIsNone(scanner.cache.get(Path("c:/x"), 1, 2))
+
+
+class TestUserRuleNamespaces(TempCase):
+    """A user rule file named malware.yara replaced the shipped ruleset.
+
+    The namespace key compared path.name against a dict keyed by path.stem, so
+    the collision guard never fired. EICAR stopped matching entirely while the
+    log still reported two files compiled and the Health view listed both.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.user_rules = self.tmp / "user_rules"
+        self.user_rules.mkdir()
+        self._original = config.USER_RULES_DIR
+        config.USER_RULES_DIR = self.user_rules
+        self.addCleanup(setattr, config, "USER_RULES_DIR", self._original)
+
+    def scanner(self) -> Scanner:
+        return Scanner(config.Config(cloud_enabled=False),
+                       SelfProtection([self.tmp / "prot"]),
+                       rules_path=RULES,
+                       cache=ScanCache(path=self.tmp / "c.json"))
+
+    def test_a_user_file_sharing_the_shipped_name_does_not_replace_it(self):
+        from avguard.scanner import EICAR
+        (self.user_rules / "malware.yara").write_text(
+            'rule Mine {\n  meta:\n    description = "mine"\n    severity = "low"\n'
+            '  strings:\n    $a = { 7A 7A 7A 51 51 }\n  condition:\n    $a\n}\n',
+            encoding="utf-8")
+        scanner = self.scanner()
+        self.assertIsNotNone(scanner.rules)
+        matched = [m.rule for m in scanner.rules.match(data=EICAR)]
+        self.assertIn("Eicar_Test_File", matched,
+                      "the shipped ruleset was silently replaced")
+
+    def test_the_user_rule_loads_alongside_it(self):
+        (self.user_rules / "malware.yara").write_text(
+            'rule Mine {\n  meta:\n    description = "mine"\n    severity = "low"\n'
+            '  strings:\n    $a = { 7A 7A 7A 51 51 }\n  condition:\n    $a\n}\n',
+            encoding="utf-8")
+        scanner = self.scanner()
+        matched = [m.rule for m in scanner.rules.match(data=b"...zzzQQ...")]
+        self.assertIn("Mine", matched)
+
+    def test_both_files_are_reported_as_sources(self):
+        (self.user_rules / "extra.yara").write_text(
+            'rule Extra {\n  meta:\n    description = "x"\n    severity = "low"\n'
+            '  strings:\n    $a = { 51 51 51 51 }\n  condition:\n    $a\n}\n',
+            encoding="utf-8")
+        self.assertEqual(len(self.scanner().rule_sources), 2)

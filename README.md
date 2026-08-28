@@ -199,6 +199,14 @@ original, clear the flag. An interrupted move is reconciled on the next start:
 if your file is still there the move is undone, if it is gone the move is
 honoured.
 
+**A cached verdict knows which logic produced it.** Every entry is stamped
+with a generation hash covering the detection version, the rule files, the
+signatures, the scoring weights and the settings that change what a verdict
+means. Change any of them and the cache is discarded rather than replayed. A
+cache that cannot name its own generation neither reads nor writes — the GUI
+used to build one, which meant it replayed verdicts from any ruleset for the
+full 30-day TTL and then erased the CLI's cache by saving an empty one over it.
+
 **Restoring something is a decision the scanner remembers.** It used to teach
 it nothing: with automatic quarantine on, a restored file was detected again
 and taken away about a second later, and the only escape was excluding its
@@ -296,6 +304,12 @@ wrote.
 ## Writing rules
 
 `rules/malware.yara`. Two habits that version 1's ruleset lacked:
+
+Your own rules go in `%LOCALAPPDATA%\AVGuardules`, and they load alongside
+the shipped ones — including a file with the same name. That last part was a
+bug worth naming: rule namespaces were keyed on the filename stem, so a user
+file called `malware.yara` silently replaced the entire shipped ruleset. EICAR
+stopped matching while the log still reported two files compiled.
 
 **Don't let the rule match itself.** Write indicators as hex or as a regex with
 a bracketed character (`/p[o]wershell/i`), so the literal you are hunting never
