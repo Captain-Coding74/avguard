@@ -440,11 +440,20 @@ class Scanner:
         digest.update(f"sig={WEIGHT_SIGNATURE}|ent={WEIGHT_ENTROPY}"
                       f"|pe={WEIGHT_PE_STRUCTURE}|arc={WEIGHT_ARCHIVE_PROBLEM}".encode())
         for path in self.rule_files():
+            # Identity, not contents. Reading every rule file on construction
+            # is measurable once a user rules directory has real packs in it,
+            # and (name, size, mtime) changes whenever the bytes do. Falls back
+            # to the contents when the stat is unavailable, because being slow
+            # is better than keying a cache on nothing.
+            digest.update(path.name.encode())
             try:
-                digest.update(path.name.encode())
-                digest.update(path.read_bytes())
+                stat = path.stat()
+                digest.update(f"{stat.st_size}|{stat.st_mtime_ns}".encode())
             except OSError:
-                digest.update(b"<unreadable>")
+                try:
+                    digest.update(path.read_bytes())
+                except OSError:
+                    digest.update(b"<unreadable>")
         return digest.hexdigest()[:16]
 
     def rule_files(self) -> list[Path]:

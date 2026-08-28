@@ -22,6 +22,7 @@ browsers and mail clients actually produce.
 
 from __future__ import annotations
 
+import io
 import logging
 import zipfile
 from dataclasses import dataclass, field
@@ -199,40 +200,96 @@ def iter_nested(
     report: ArchiveReport,
     depth: int = 0,
 ) -> Iterator[tuple[str, bytes]]:
-    """Yield (display name, bytes) for every inspectable member.
+    """Yield (display name, bytes) for every inspectable member, recursively.
 
-    Members that are themselves zip files are descended into, up to MAX_DEPTH,
-    so a sample hidden one archive deep is still seen. Beyond that the nesting
-    is reported rather than followed -- unbounded recursion is how a zip quine
-    takes a scanner down.
+    Genuinely recursive now. The previous version took a `depth` argument its
+    only caller never passed and hand-unrolled exactly one level of nesting,
+    while MAX_DEPTH said 2 and this docstring said "up to MAX_DEPTH". Measured:
+    a marker two archives deep was missed. A limit that overstates what the
+    code does is worse than a smaller limit stated honestly, because it is the
+    kind of thing you only find out when it matters.
+
+    `budget` bounds the total work regardless of shape, so a zip quine cannot
+    turn a bounded depth into unbounded effort.
     """
+    yield from _walk(report, depth, [MAX_TOTAL_BYTES])
+
+
+def _walk(
+    report: ArchiveReport,
+    depth: int,
+    budget: list[int],
+) -> Iterator[tuple[str, bytes]]:
     for member in report.members:
         if member.data is None:
             continue
+
         yield f"{report.path.name}!{member.name}", member.data
 
         if depth >= MAX_DEPTH:
             continue
         if not member.data.startswith(b"PK"):
             continue
-
-        import io
-        try:
-            with zipfile.ZipFile(io.BytesIO(member.data)) as nested:
-                infos = nested.infolist()[:MAX_MEMBERS]
-                for info in infos:
-                    if info.is_dir() or info.flag_bits & 0x1:
-                        continue
-                    ratio = info.file_size / max(info.compress_size, 1)
-                    if ratio > MAX_COMPRESSION_RATIO and info.file_size > 1024 * 1024:
-                        continue
-                    if info.file_size > MAX_MEMBER_BYTES:
-                        continue
-                    try:
-                        with nested.open(info) as handle:
-                            payload = handle.read(MAX_MEMBER_BYTES)
-                    except Exception:
-                        continue
-                    yield f"{report.path.name}!{member.name}!{info.filename}", payload
-        except (zipfile.BadZipFile, OSError, EOFError):
+        if budget[0] <= 0:
             continue
+
+        nested = _inspect_bytes(member.data,
+                                Path(f"{report.path.name}!{member.name}"),
+                                budget)
+        if nested is None:
+            continue
+        for name, payload in _walk(nested, depth + 1, budget):
+            yield name, payload
+
+
+def _inspect_bytes(data: bytes, display: Path, budget: list[int]) -> ArchiveReport | None:
+    """inspect(), but for an archive we are already holding in memory."""
+    report = ArchiveReport(path=display)
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(data))
+    except (zipfile.BadZipFile, OSError, EOFError):
+        return None
+
+    with archive:
+        try:
+            infos = archive.infolist()
+        except Exception:
+            return None
+        if len(infos) > MAX_MEMBERS:
+            report.truncated = True
+            infos = infos[:MAX_MEMBERS]
+
+        for info in infos:
+            if info.is_dir():
+                continue
+            member = ArchiveMember(name=info.filename, size=info.file_size,
+                                   compressed=info.compress_size)
+            if _entry_is_traversal(info.filename):
+                report.problems.append(
+                    f"entry name escapes the archive: {info.filename!r}")
+            if info.flag_bits & 0x1:
+                member.skipped = "encrypted, cannot be inspected"
+                report.members.append(member)
+                continue
+            ratio = info.file_size / max(info.compress_size, 1)
+            if ratio > MAX_COMPRESSION_RATIO and info.file_size > 1024 * 1024:
+                member.skipped = f"expands {ratio:.0f}x, refused as a decompression bomb"
+                report.problems.append(
+                    f"{info.filename!r} expands {ratio:.0f}x inside a nested archive")
+                report.members.append(member)
+                continue
+            if info.file_size > MAX_MEMBER_BYTES or info.file_size > budget[0]:
+                member.skipped = "beyond the inspection budget"
+                report.truncated = True
+                report.members.append(member)
+                continue
+            try:
+                with archive.open(info) as handle:
+                    payload = handle.read(min(info.file_size, MAX_MEMBER_BYTES) + 1)
+            except Exception:
+                continue
+            budget[0] -= len(payload)
+            member.data = payload
+            report.members.append(member)
+
+    return report

@@ -59,13 +59,28 @@ threshold. **No pile of guesses can move a file.**
 
 ### A. Smaller, real, not urgent
 
-- `_settings_saved` restarts the monitor but does not re-read `watch_paths`
-  from disk if another process changed them.
-- `detection_generation()` reads every rule file on construction; on a large
-  user rules directory that is measurable.
-- `EventStore.summary()` reads up to 5,000 events to count them.
-- `archives.iter_nested` takes a `depth` parameter that its only caller never
-  passes, so the documented depth limit is enforced by a constant instead.
+All four now fixed. Kept here with what they turned out to be, because one of
+them was not the tidying job it looked like.
+
+| # | What | Outcome |
+|---|---|---|
+| A1 | `_settings_saved` restarted the monitor without re-reading `watch_paths` | Reloads `Config` first, so a folder another process added is not silently reverted |
+| A2 | `detection_generation()` read every rule file on construction | Hashes `(name, size, mtime)`, falling back to contents when the stat fails |
+| A3 | `EventStore.summary()` parsed 5,000 records to count them | `counts()` scans lines without building dataclasses |
+| A4 | `archives.iter_nested` took a `depth` its caller never passed | **Was a real detection gap.** See below |
+
+**A4 was not cosmetic.** `MAX_DEPTH = 2` and the docstring both promised "an
+archive inside an archive", but the code hand-unrolled exactly one level and
+the `depth` parameter was dead. A marker two archives deep was missed.
+
+It nearly escaped notice twice over: the first test of it passed because the
+nested zips were written uncompressed, so the payload bytes sat verbatim in the
+container and a plain signature match looked like successful traversal. Only
+with deflate — what real archives use — did the gap appear. `iter_nested` is
+genuinely recursive now, bounded by a shared byte budget as well as by depth,
+and the tests assert the limit in **both** directions: two deep is found, three
+deep is not, and a separate test proves the payload is not visible without
+descending.
 
 Nothing left open loses data, lies about protection, or stops the program
 starting. That was the bar for calling the audit finished.

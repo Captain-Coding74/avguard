@@ -770,6 +770,11 @@ class AVGuardApp(tb.Window):
             log.info("settings changed; discarded %d cached verdict(s)", discarded)
         log.info("settings saved")
         if self.monitor.running:
+            # Re-read from disk before restarting. The in-memory Config was
+            # loaded at startup, so restarting from it would silently revert a
+            # watch folder another AVGuard process added in the meantime.
+            self.cfg = config.Config.load()
+            self.scanner.cfg = self.cfg
             self.monitor.stop()
             self._start_realtime()
         self._banner("Settings saved.", "inverse-success")

@@ -121,17 +121,41 @@ class EventStore:
                 break
         return events
 
+    def counts(self) -> dict[str, int]:
+        """Event totals without materialising the events.
+
+        summary() parsed up to 5,000 records into dataclasses just to count
+        them, which is most of the cost of opening the History window.
+        """
+        totals: dict[str, int] = {}
+        try:
+            with open(self.path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    marker = '"kind":'
+                    at = line.find(marker)
+                    if at < 0:
+                        continue
+                    rest = line[at + len(marker):].lstrip()
+                    if not rest.startswith('"'):
+                        continue
+                    end = rest.find('"', 1)
+                    if end > 1:
+                        kind = rest[1:end]
+                        totals[kind] = totals.get(kind, 0) + 1
+        except OSError:
+            return {}
+        return totals
+
     def summary(self, limit: int = 5000) -> dict:
         """Counts for the health view."""
-        counts: dict[str, int] = {}
-        detections = 0
+        counts = self.counts()
+        detections = counts.get("detection", 0)
+        # Only the most recent scan is needed, so read until one is found
+        # rather than parsing the whole file.
         last_scan = ""
-        for event in self.read(limit=limit):
-            counts[event.kind] = counts.get(event.kind, 0) + 1
-            if event.kind == "detection":
-                detections += 1
-            if event.kind == "scan_finished" and not last_scan:
-                last_scan = event.when
+        for event in self.read(limit=limit, kinds={"scan_finished"}):
+            last_scan = event.when
+            break
         return {
             "events": sum(counts.values()),
             "detections": detections,

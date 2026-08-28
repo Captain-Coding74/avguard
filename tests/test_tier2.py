@@ -416,3 +416,94 @@ class TestCacheLifecycle(TempCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# --------------------------------------------- nesting matches its own limit
+
+class TestArchiveNestingDepth(TempCase):
+    """MAX_DEPTH said 2; the code hand-unrolled one level.
+
+    `iter_nested` took a `depth` argument its only caller never passed, so the
+    documented limit was enforced by a constant that overstated what the code
+    did. Measured: a marker two archives deep was missed. A limit that promises
+    more than it delivers is the kind of thing you find out when it matters.
+    """
+
+    # Deflate is what real archives use, and without it the payload bytes
+    # appear verbatim in the container -- which makes a signature match look
+    # like successful nesting when nothing was descended into at all.
+    PAD = b"filler so compression actually changes the bytes " * 40
+
+    def wrap(self, payload: bytes, name: str) -> bytes:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(name, payload)
+        return buffer.getvalue()
+
+    def nest(self, levels: int, filename: str) -> Path:
+        payload = SELFTEST_MARKER + self.PAD
+        for index in range(levels):
+            payload = self.wrap(payload, f"inner{index}.zip" if index else "payload.bin")
+        target = self.tmp / filename
+        with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("member.zip" if levels else "payload.bin", payload)
+        return target
+
+    def test_the_payload_is_not_visible_without_descending(self):
+        """Proves the other tests here are not passing by accident."""
+        target = self.nest(2, "check.zip")
+        self.assertNotIn(SELFTEST_MARKER, target.read_bytes())
+
+    def test_found_directly_in_the_archive(self):
+        self.assertTrue(self.scanner().scan(self.nest(0, "d0.zip"),
+                                            use_cache=False).is_threat)
+
+    def test_found_one_archive_deep(self):
+        self.assertTrue(self.scanner().scan(self.nest(1, "d1.zip"),
+                                            use_cache=False).is_threat)
+
+    def test_found_two_archives_deep(self):
+        """This is the one that was missed."""
+        self.assertTrue(self.scanner().scan(self.nest(2, "d2.zip"),
+                                            use_cache=False).is_threat,
+                        "MAX_DEPTH is 2, so two levels must actually be reached")
+
+    def test_not_found_past_the_stated_limit(self):
+        """The limit has to be real in both directions."""
+        self.assertFalse(self.scanner().scan(self.nest(3, "d3.zip"),
+                                             use_cache=False).is_threat)
+
+    def test_deep_nesting_terminates(self):
+        """A quine-shaped archive must not turn a depth limit into forever."""
+        target = self.nest(8, "deep.zip")
+        verdict = self.scanner().scan(target, use_cache=False)
+        self.assertIn(verdict.level, (Level.CLEAN, Level.SUSPICIOUS, Level.MALICIOUS))
+
+
+class TestEventCounting(TempCase):
+    """summary() parsed up to 5,000 records into dataclasses just to count."""
+
+    def test_counts_match_a_full_read(self):
+        store = EventStore(path=self.tmp / "events.jsonl")
+        for index in range(50):
+            store.record(Event(kind="detection" if index % 2 else "scan_finished",
+                               path=f"c:/{index}"))
+        counts = store.counts()
+        self.assertEqual(counts["detection"], 25)
+        self.assertEqual(counts["scan_finished"], 25)
+        self.assertEqual(sum(counts.values()), 50)
+
+    def test_counting_survives_a_torn_line(self):
+        store = EventStore(path=self.tmp / "events.jsonl")
+        store.record(Event(kind="detection", path="c:/good"))
+        with open(store.path, "a", encoding="utf-8") as handle:
+            handle.write('{"kind": "detection", "path": "c:/tor')
+        self.assertGreaterEqual(store.counts().get("detection", 0), 1)
+
+    def test_summary_still_reports_the_last_scan(self):
+        store = EventStore(path=self.tmp / "events.jsonl")
+        store.record(Event(kind="scan_finished"))
+        store.record(Event(kind="detection", path="c:/x"))
+        summary = store.summary()
+        self.assertEqual(summary["detections"], 1)
+        self.assertNotEqual(summary["last_scan"], "never")
