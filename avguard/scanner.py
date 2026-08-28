@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Iterator, Sequence
 
 from . import allowlist as allowlist_module
-from . import archives, config, peinfo, signing
+from . import archives, config, peinfo, rulepacks, signing
 from .protection import SelfProtection, matches_excluded_glob
 
 log = logging.getLogger(__name__)
@@ -92,7 +92,7 @@ SUSPICIOUS_AT = 50
 # Learned by shipping it: the archive inspector stopped calling large resource
 # packs "hostile", and the machine kept reporting the old verdict because the
 # generation hash only covered the rule file.
-DETECTION_VERSION = 6
+DETECTION_VERSION = 7
 
 # Heuristics never add up to a condemnation, however many of them agree.
 #
@@ -382,6 +382,7 @@ class Scanner:
         rules_path: Path = config.RULES_PATH,
         cache: ScanCache | None = None,
         cloud_lookup: Callable[[str, Path], list[str]] | None = None,
+        packs: "rulepacks.PackStore | None" = None,
     ) -> None:
         self.cfg = cfg
         self.protection = protection
@@ -392,6 +393,11 @@ class Scanner:
         self.rule_sources: list[Path] = []
         self.signatures = signing.SignatureChecker()
         self.allowlist = allowlist_module.Allowlist()
+        # Injectable, so a caller can scan without whatever packs happen to be
+        # installed on this machine. Reaching into global state by default made
+        # three tests fail the moment a real pack was added.
+        self.packs = packs if packs is not None else rulepacks.PackStore()
+        self._untrusted_namespaces: set[str] = set()
         self._max_signature = max((len(s) for s in SIGNATURES.values()), default=0)
         self.load_rules()
         if cache is None:
@@ -437,6 +443,8 @@ class Scanner:
         # moved", so a change to it changes what a stored verdict means.
         digest.update(f"threshold={self.cfg.quarantine_threshold}".encode())
         digest.update(f"cap={HEURISTIC_CAP}|susp={SUSPICIOUS_AT}".encode())
+        for pack in self.packs.packs():
+            digest.update(f"pack={pack.name}|{pack.sha256}|{pack.trusted}".encode())
         digest.update(f"sig={WEIGHT_SIGNATURE}|ent={WEIGHT_ENTROPY}"
                       f"|pe={WEIGHT_PE_STRUCTURE}|arc={WEIGHT_ARCHIVE_PROBLEM}".encode())
         for path in self.rule_files():
@@ -468,7 +476,14 @@ class Scanner:
                 continue
             found.extend(sorted(directory.glob("*.yara")))
             found.extend(sorted(directory.glob("*.yar")))
-        return found
+        found.extend(self.packs.rule_files())
+
+        # Resolved-path dedupe: a pack directory nested under one of the above
+        # would otherwise be compiled twice under two namespaces.
+        unique: dict[str, Path] = {}
+        for path in found:
+            unique.setdefault(str(path.resolve()), path)
+        return list(unique.values())
 
     def load_rules(self) -> bool:
         """Compile every ruleset, validate it, and only then adopt it.
@@ -513,6 +528,8 @@ class Scanner:
             self._report_rule_failure(f"rules failed to compile: {exc}")
             return False
 
+        self._untrusted_namespaces = self.packs.untrusted_namespaces()
+
         problem = self._validate_rules(candidate)
         if problem:
             self._report_rule_failure(problem)
@@ -520,8 +537,14 @@ class Scanner:
 
         self.rules = candidate
         self.rule_sources = sources
-        log.info("compiled %d rule file(s): %s", len(sources),
-                 ", ".join(p.name for p in sources))
+        shipped = [p.name for p in sources if str(p.resolve()) not in self._untrusted_namespaces]
+        imported = len(sources) - len(shipped)
+        # Summarised, not listed. Installing a real pack made this line
+        # print 311 filenames on every single run.
+        log.info("compiled %d rule file(s): %s%s",
+                 len(sources), ", ".join(shipped[:4])
+                 + ("..." if len(shipped) > 4 else ""),
+                 f" plus {imported} from rule packs" if imported else "")
         return True
 
     def _validate_rules(self, candidate) -> str:
@@ -676,15 +699,27 @@ class Scanner:
             meta = dict(getattr(match, "meta", {}) or {})
             severity = str(meta.get("severity", "")).strip().lower()
             weight = SEVERITY_WEIGHTS.get(severity, WEIGHT_UNLABELLED)
+
+            # A rule from a pack nobody has promoted cannot move a file,
+            # whatever its own metadata claims. Third-party severities follow
+            # conventions this program knows nothing about, and importing
+            # somebody else's "critical" as decisive would hand a stranger the
+            # power to delete things here.
+            namespace = str(getattr(match, "namespace", "") or "")
+            imported = namespace in self._untrusted_namespaces
+            if imported:
+                weight = min(weight, SEVERITY_WEIGHTS["medium"])
             if severity and severity not in SEVERITY_WEIGHTS:
                 log.warning("rule %s declares an unknown severity %r; scoring it as %d",
                             match.rule, severity, weight)
             description = str(meta.get("description", "")).strip()
             detail = description or f"matched rule {match.rule}"
+            origin = self.packs.owner_of(namespace) if namespace else ""
+            attribution = f", from the {origin} pack" if origin else ""
             findings.append(Finding(
                 "yara", match.rule, weight,
-                f"{detail} (rule {match.rule}, {severity or 'unrated'})",
-                hard=weight >= MALICIOUS_AT))
+                f"{detail} (rule {match.rule}, {severity or 'unrated'}{attribution})",
+                hard=weight >= MALICIOUS_AT and not imported))
         return findings
 
     def _match_large_file(self, facts: FileFacts):

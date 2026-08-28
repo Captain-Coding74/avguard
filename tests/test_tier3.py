@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from avguard import config, scheduling, signing
 from avguard.protection import SelfProtection
+from avguard.rulepacks import PackStore
 from avguard.quarantine import QuarantineStore
 from avguard.scanner import (
     Finding, Level, ScanCache, Scanner, SELFTEST_MARKER, decide,
@@ -29,6 +30,17 @@ logging.getLogger("avguard").propagate = False
 
 RULES = Path(__file__).resolve().parent.parent / "rules" / "malware.yara"
 IS_WINDOWS = sys.platform == "win32"
+
+
+def _empty_packs(tmp: Path) -> PackStore:
+    """An isolated pack store.
+
+    Scanner used to build a real PackStore pointing at the user's data
+    directory, so installing one real pack made three of these tests fail:
+    they were measuring whatever happened to be on the machine. The store is
+    injectable now, and tests inject an empty one.
+    """
+    return PackStore(directory=tmp / "packs", index_path=tmp / "packs" / "packs.json")
 
 
 class TempCase(unittest.TestCase):
@@ -46,7 +58,8 @@ class TempCase(unittest.TestCase):
         cfg = config.Config(cloud_enabled=False, **overrides)
         return Scanner(cfg, SelfProtection([self.tmp / "nothing"]),
                        rules_path=rules_path or RULES,
-                       cache=ScanCache(path=self.tmp / "cache.json"))
+                       cache=ScanCache(path=self.tmp / "cache.json"),
+                           packs=_empty_packs(self.tmp))
 
 
 # ------------------------------------------------------------ publisher trust
@@ -142,7 +155,8 @@ class TestRuleLoading(TempCase):
         return Scanner(config.Config(cloud_enabled=False),
                        SelfProtection([self.tmp / "nothing"]),
                        rules_path=self.rules_path,
-                       cache=ScanCache(path=self.tmp / "cache.json"))
+                       cache=ScanCache(path=self.tmp / "cache.json"),
+                           packs=_empty_packs(self.tmp))
 
     def test_rules_load(self):
         scanner = self.build()

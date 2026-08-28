@@ -38,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from avguard import config
 from avguard.protection import SelfProtection
+from avguard.rulepacks import PackStore
 from avguard.quarantine import (
     QuarantineError, QuarantineRecord, QuarantineStore, _mask,
 )
@@ -48,6 +49,17 @@ logging.getLogger("avguard").addHandler(logging.NullHandler())
 logging.getLogger("avguard").propagate = False
 
 RULES = Path(__file__).resolve().parent.parent / "rules" / "malware.yara"
+
+
+def _empty_packs(tmp: Path) -> PackStore:
+    """An isolated pack store.
+
+    Scanner used to build a real PackStore pointing at the user's data
+    directory, so installing one real pack made three of these tests fail:
+    they were measuring whatever happened to be on the machine. The store is
+    injectable now, and tests inject an empty one.
+    """
+    return PackStore(directory=tmp / "packs", index_path=tmp / "packs" / "packs.json")
 
 
 class TempCase(unittest.TestCase):
@@ -186,7 +198,8 @@ class TestRealtimeHonesty(TempCase):
     def monitor(self, on_verdict=None) -> RealtimeMonitor:
         protection = SelfProtection([self.tmp / "prot"])
         scanner = Scanner(config.Config(cloud_enabled=False), protection,
-                          rules_path=RULES, cache=ScanCache(path=self.tmp / "c.json"))
+                          rules_path=RULES, cache=ScanCache(path=self.tmp / "c.json"),
+                              packs=_empty_packs(self.tmp))
         instance = RealtimeMonitor(scanner, protection,
                                    on_verdict=on_verdict or (lambda v: None),
                                    workers=2, debounce_seconds=0.3)
@@ -291,7 +304,8 @@ class TestAllowlist(TempCase):
         self.protection = SelfProtection([self.tmp / "prot"])
         self.scanner = Scanner(config.Config(cloud_enabled=False), self.protection,
                                rules_path=RULES,
-                               cache=ScanCache(path=self.tmp / "c.json"))
+                               cache=ScanCache(path=self.tmp / "c.json"),
+                                   packs=_empty_packs(self.tmp))
         self.scanner.allowlist = self.allowlist
         self.store = QuarantineStore(directory=self.tmp / "store",
                                      index_path=self.tmp / "store" / "index.json",
@@ -413,10 +427,12 @@ class TestCacheGeneration(TempCase):
         protection = SelfProtection([self.tmp / "prot"])
         lenient = Scanner(config.Config(cloud_enabled=False, quarantine_threshold=50),
                           protection, rules_path=RULES,
-                          cache=ScanCache(path=self.tmp / "a.json"))
+                          cache=ScanCache(path=self.tmp / "a.json"),
+                              packs=_empty_packs(self.tmp))
         strict = Scanner(config.Config(cloud_enabled=False, quarantine_threshold=100),
                          protection, rules_path=RULES,
-                         cache=ScanCache(path=self.tmp / "b.json"))
+                         cache=ScanCache(path=self.tmp / "b.json"),
+                             packs=_empty_packs(self.tmp))
         self.assertNotEqual(lenient.detection_generation(),
                             strict.detection_generation())
 
@@ -426,7 +442,8 @@ class TestCacheGeneration(TempCase):
         scanner = Scanner(config.Config(cloud_enabled=False), protection,
                           rules_path=RULES,
                           cache=ScanCache(path=self.tmp / "c.json",
-                                          generation="whatever"))
+                                          generation="whatever"),
+                                              packs=_empty_packs(self.tmp))
         scanner.cache.put(Path("c:/x"), 1, 2, Level.CLEAN, ["stale"], "h")
         scanner.cache.save()
         scanner.rekey_cache()
@@ -453,7 +470,8 @@ class TestUserRuleNamespaces(TempCase):
         return Scanner(config.Config(cloud_enabled=False),
                        SelfProtection([self.tmp / "prot"]),
                        rules_path=RULES,
-                       cache=ScanCache(path=self.tmp / "c.json"))
+                       cache=ScanCache(path=self.tmp / "c.json"),
+                           packs=_empty_packs(self.tmp))
 
     def test_a_user_file_sharing_the_shipped_name_does_not_replace_it(self):
         from avguard.scanner import EICAR
@@ -500,7 +518,8 @@ class TestStartupSurvival(TempCase):
         scanner = Scanner(config.Config(cloud_enabled=False),
                           SelfProtection([self.tmp / "prot"]),
                           rules_path=RULES,
-                          cache=ScanCache(path=self.tmp / "c.json"))
+                          cache=ScanCache(path=self.tmp / "c.json"),
+                              packs=_empty_packs(self.tmp))
         return RealtimeMonitor(scanner, SelfProtection([self.tmp / "prot"]),
                                on_verdict=lambda verdict: None)
 
@@ -536,7 +555,8 @@ class TestStartupSurvival(TempCase):
         # The real default protection, which covers the whole project. The
         # temp-dir protection the other tests use would not cover it.
         scanner = Scanner(config.Config(cloud_enabled=False), SelfProtection(),
-                          rules_path=RULES, cache=ScanCache(path=self.tmp / "p.json"))
+                          rules_path=RULES, cache=ScanCache(path=self.tmp / "p.json"),
+                              packs=_empty_packs(self.tmp))
         monitor = RealtimeMonitor(scanner, SelfProtection(),
                                   on_verdict=lambda verdict: None)
         self.addCleanup(monitor.stop)

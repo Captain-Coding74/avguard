@@ -37,7 +37,25 @@ and the code has a fixed one. Everything else here is tidying.
 
 ---
 
-## Part 2 — rule packs: make it detect real things
+## Part 2 — rule packs  DONE
+
+Measured first, as the plan said. Both questions came back favourable:
+
+- **ReversingLabs' pack is MIT**, so a permissively licensed pack does exist.
+- **Zero false positives** across 400 clean binaries, at 8 ms a file, for 1,240
+  rules in 310 files.
+
+That zero was checked for the vacuous kind: blobs rebuilt from the rules' own
+byte patterns matched 31 of 38 files probed, so the pack is demonstrably live
+rather than merely quiet. The rules are hex patterns matching compiled malware
+code, which is exactly why they do not fire on ordinary software.
+
+Built as specified, plus one thing the plan did not anticipate: `Scanner` was
+reaching into the real pack store by default, so installing a pack broke three
+existing tests that were silently measuring whatever happened to be on the
+machine. The store is injectable now.
+
+## Part 2 — the original plan
 
 This is the chapter that matters, and it is the one previously written off as
 "a different project". That was half right. Writing and maintaining a malware

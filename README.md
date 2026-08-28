@@ -123,6 +123,7 @@ imports where it cannot actually run.
 | `avguard/peinfo.py` | Structural signals from an executable |
 | `avguard/events.py` | The durable history behind the History window |
 | `avguard/dialogs.py` | Settings, History and Health windows |
+| `avguard/rulepacks.py` | Importing detection rules somebody else maintains |
 | `avguard/signing.py` | Authenticode checks, to lower suspicion on signed software |
 | `avguard/scheduling.py` | Start with Windows, and the daily scan |
 | `rules/malware.yara` | Detection rules |
@@ -272,6 +273,43 @@ python build.py
 
 Produces one `dist/AVGuard.exe` (about 28 MB) with the rules inside it. Needs
 no Python on the target machine and no administrator rights.
+
+## Rule packs
+
+The shipped ruleset is five hand-written rules. That is honest for five rules
+and poor for an antivirus, so AVGuard can import a ruleset somebody else
+maintains:
+
+```bash
+python -m avguard --packs add path/to/rules --licence MIT
+python -m avguard --packs list
+```
+
+A pack is not trusted because of where it came from. It is admitted only if it
+compiles, declares descriptions, matches none of AVGuard's own files, and —
+the check that matters — stays under a 1% false-positive rate when measured
+against 400 real binaries **from your machine**. Fail any of those and the pack
+is refused with the measurement printed, and nothing on disk changes. That is
+the same bar the shipped rules face in `tests/test_rules.py`; a stranger's
+rules do not get an easier one.
+
+An imported rule **cannot move a file**, whatever severity it claims. Somebody
+else's `critical` follows conventions this program knows nothing about, so it
+is capped to medium — reported, never acted on — until you promote the pack by
+name:
+
+```bash
+python -m avguard --packs trust <name>
+```
+
+Nothing is ever fetched on its own. No auto-update, no check on startup. A
+scanner that changes its own detection logic overnight is one that can start
+eating your files overnight.
+
+Measured against ReversingLabs' MIT-licensed pack: 1,240 rules across 310
+files, **zero** false positives on 400 clean binaries at 8 ms a file, and zero
+across a real 5,369-file Downloads folder. They are hex patterns matching
+compiled malware code, which is why they do not fire on ordinary software.
 
 ## VirusTotal
 
