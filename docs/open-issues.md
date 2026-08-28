@@ -31,6 +31,9 @@ Ranked by the same rule as everything else in this project:
 | 7 | The package could not be imported off Windows | CI, `imports cleanly (linux)` |
 | 8 | `os.path.isjunction` called unguarded on Python 3.11 | `tests/test_tier3.py` |
 | 9 | Two CLI commands crashed after doing their work | `tests/test_tier3.py` |
+| 10 | The app failed to start if a watched folder had been deleted | `tests/test_durability.py` |
+| 11 | A crash left no trace at all under the windowless build | `tests/test_durability.py` |
+| 12 | Watching a folder inside the project protected nothing, silently | `tests/test_durability.py` |
 
 ### Notes worth keeping
 
@@ -54,60 +57,7 @@ threshold. **No pile of guesses can move a file.**
 
 ## Open
 
-### A. `RealtimeMonitor.start()` crashes, and nothing records it
-
-**Verified.** Starting on a folder that no longer exists raises
-`RuntimeError: cannot join thread before it is started` — `start()` builds an
-`Observer()`, never starts it, then calls `stop()`, which joins it. `stop()`
-raises the same way on its own.
-
-Two things make this worse than an ugly traceback:
-
-- `realtime_enabled` defaults to `true`, and `gui._start_realtime` does not
-  guard the call. A watch folder that has been deleted since it was configured
-  — a removable drive, a cleared Downloads — makes `AVGuardApp.__init__` raise
-  and **the window never appears at all.**
-- `logsetup.install_excepthooks()` is defined, is referred to approvingly in
-  two comments, and **is called from nowhere.** `build.py` produces a
-  `--noconsole` executable, so under `pythonw` there is no stderr: the user
-  double-clicks and nothing happens, forever, with no log line.
-
-**Fix.** Guard the join in `stop()` with `is_alive()` and wrap the teardown.
-Wrap `monitor.start(...)` in `gui._start_realtime` and treat a failure exactly
-like an empty result — log it, untick the toggle, banner it. Call
-`logsetup.install_excepthooks()` at the top of both `main()` functions.
-
-**Test.** `mon.start([missing])` returns `[]` without raising; `stop()` on a
-never-started monitor does not raise; a GUI whose watch path does not exist
-still constructs.
-
-### B. Watching a folder inside the project scans nothing, silently
-
-**Verified earlier, in CI.** `SelfProtection` covers the whole project, and it
-is checked before a file is opened. So "clone the repo into Downloads, watch
-Downloads" watches a tree it will always refuse. `start()` accepts the path
-without comment.
-
-This is the same shape as the CI failure that scanned inside the checkout and
-reported success for a scanner that had not looked at anything.
-
-**Fix.** `start()` returns protected paths separately so the caller can say so.
-
-### C. The detection ceiling is not stated anywhere
-
-With the cloud lookup off, the only things that can reach MALICIOUS are EICAR,
-the self-test marker, and — since the ransomware rule was correctly demoted —
-nothing else. Every heuristic reports and none condemns. That is the right
-design for a hobby scanner and it is why 8,843 clean binaries produce zero
-false positives.
-
-It is also not written down anywhere, and a scanner that quietly implies more
-than it does is the thing this project exists to not be.
-
-**Fix.** State it plainly in the README, next to the self-test instructions.
-One honest paragraph is a better look than an implication.
-
-### D. Smaller, real, not urgent
+### A. Smaller, real, not urgent
 
 - `_settings_saved` restarts the monitor but does not re-read `watch_paths`
   from disk if another process changed them.
@@ -116,6 +66,9 @@ One honest paragraph is a better look than an implication.
 - `EventStore.summary()` reads up to 5,000 events to count them.
 - `archives.iter_nested` takes a `depth` parameter that its only caller never
   passes, so the documented depth limit is enforced by a constant instead.
+
+Nothing left open loses data, lies about protection, or stops the program
+starting. That was the bar for calling the audit finished.
 
 ---
 
