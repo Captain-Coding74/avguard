@@ -77,7 +77,8 @@ starting. That was the bar for calling the audit finished.
 **Chasing real-malware detection.** The rules catch test files and patterns,
 not live threats. Fixing that means building and maintaining a real corpus,
 which is a different project with a different time commitment. The honest move
-is item C: say what it does.
+was to say so plainly, which the README now does under "What it actually
+detects".
 
 **Catalogue signature verification.** `CryptCATAdmin` would close the System32
 gap, but the value of Authenticode here is trusting things the user downloaded,
