@@ -559,14 +559,26 @@ class TestCrashesReachTheLog(TempCase):
     from nowhere. Under pythonw there is no stderr, so a crash left no trace."""
 
     def test_both_entry_points_install_the_hooks(self):
-        import avguard.gui as gui_module
-        import avguard.__main__ as cli_module
-        import inspect
-        for module, name in ((gui_module, "gui"), (cli_module, "__main__")):
-            with self.subTest(entry_point=name):
-                source = inspect.getsource(module.main)
-                self.assertIn("install_excepthooks()", source,
-                              f"{name}.main() does not install the excepthooks")
+        """Parsed from source rather than imported.
+
+        The first version imported avguard.gui, which needs ttkbootstrap, and
+        failed on the Linux CI job where the GUI dependencies are deliberately
+        not installed. Whether a line exists in main() is a question about the
+        source, so ask the source.
+        """
+        import ast
+        package = Path(__file__).resolve().parent.parent / "avguard"
+        for filename in ("gui.py", "__main__.py"):
+            with self.subTest(entry_point=filename):
+                tree = ast.parse((package / filename).read_text(encoding="utf-8"))
+                main = next((node for node in tree.body
+                             if isinstance(node, ast.FunctionDef) and node.name == "main"), None)
+                self.assertIsNotNone(main, f"{filename} has no main()")
+                calls = [ast.unparse(node) for node in ast.walk(main)
+                         if isinstance(node, ast.Call)]
+                self.assertTrue(
+                    any("install_excepthooks" in call for call in calls),
+                    f"{filename}:main() does not install the excepthooks")
 
     def test_an_unhandled_exception_is_written_down(self):
         import subprocess

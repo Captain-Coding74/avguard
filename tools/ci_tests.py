@@ -11,6 +11,12 @@ the step summary. Then diagnosing a CI-only failure does not require being the
 person who owns the repository.
 
     python tools/ci_tests.py
+    python tools/ci_tests.py --no-gui-deps
+
+`--no-gui-deps` hides ttkbootstrap, pystray, Pillow and tkinter, reproducing
+the Linux CI job on a Windows laptop. That job installs only the scanning
+dependencies, so a test that reaches into the GUI passes here and fails there.
+It has happened; this is how to find out before pushing rather than after.
 """
 
 from __future__ import annotations
@@ -47,7 +53,28 @@ def _summary(lines: list[str]) -> None:
         pass
 
 
+class _HideModules:
+    """Import blocker, so the Linux job's world can be reproduced locally."""
+
+    def __init__(self, names: set[str]) -> None:
+        self.names = names
+
+    def find_module(self, name, path=None):
+        return self if name.split(".")[0] in self.names else None
+
+    def load_module(self, name):
+        raise ImportError(f"No module named {name!r} (hidden by --no-gui-deps)")
+
+
+GUI_DEPENDENCIES = {"ttkbootstrap", "pystray", "PIL", "tkinter"}
+
+
 def main() -> int:
+    if "--no-gui-deps" in sys.argv:
+        sys.meta_path.insert(0, _HideModules(GUI_DEPENDENCIES))
+        print(f"hiding {', '.join(sorted(GUI_DEPENDENCIES))} "
+              "to reproduce the Linux CI job")
+
     # No top_level_dir: tests/ has no __init__.py, and passing one makes
     # discovery refuse the directory outright. This matches how the suite is
     # run by hand: `python -m unittest discover -s tests` from the project root.
