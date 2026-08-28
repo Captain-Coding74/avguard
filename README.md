@@ -68,6 +68,27 @@ python -m avguard --scan selftest.txt
 That should report `[MALICIOUS] selftest.txt` with reason
 `signature AVGuard-Selftest-Marker`.
 
+## What it actually detects
+
+Worth being plain about, because a scanner that implies more than it does is
+the thing this project exists to not be.
+
+With VirusTotal lookups off — the default — the only things that can reach
+MALICIOUS and be moved are the EICAR test file and AVGuard's own self-test
+marker. Everything else the rules and heuristics find is reported as
+SUSPICIOUS and left alone: the process-injection rule, the encoded-PowerShell
+rule, the ransom-note rule, packed executables, odd PE structure, zip bombs,
+archive traversal names. That is deliberate. Heuristics are capped below the
+threshold so no pile of guesses can move a file, which is why 8,843 clean
+Windows binaries produce zero false positives.
+
+So: this finds test files reliably, tells you when something looks unusual and
+why, and gives you a quarantine you can undo. It is not a replacement for the
+antivirus your operating system already runs, and it is not built to catch live
+malware — that needs a maintained signature corpus, which is a different
+project. Turning on VirusTotal lookups is what gives it real detection, and
+that is your decision to make.
+
 ## Tests
 
 ```bash
@@ -305,7 +326,8 @@ wrote.
 
 `rules/malware.yara`. Two habits that version 1's ruleset lacked:
 
-Your own rules go in `%LOCALAPPDATA%\AVGuardules`, and they load alongside
+Your own rules go in `%LOCALAPPDATA%\AVGuard
+ules`, and they load alongside
 the shipped ones — including a file with the same name. That last part was a
 bug worth naming: rule namespaces were keyed on the filename stem, so a user
 file called `malware.yara` silently replaced the entire shipped ruleset. EICAR

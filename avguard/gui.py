@@ -541,12 +541,35 @@ class AVGuardApp(tb.Window):
         return [downloads] if downloads.is_dir() else []
 
     def _start_realtime(self) -> None:
-        watched = self.monitor.start(self._watch_targets())
+        """Start watching, and never let a failure here stop the window opening.
+
+        A watch folder configured once and deleted since -- a removable drive,
+        a cleared Downloads -- used to raise out of monitor.start(), out of
+        __init__, and the window simply never appeared. Under pythonw there was
+        no stderr to say why.
+        """
+        try:
+            watched = self.monitor.start(self._watch_targets())
+        except Exception:
+            log.exception("real-time protection could not start")
+            watched = []
+
+        refused = list(getattr(self.monitor, "refused", []))
         if watched:
             self.status_var.set("Real-time protection on")
+            if refused:
+                self._banner(
+                    f"Not watching {refused[0]} - it is inside AVGuard's own "
+                    "folder, which is never scanned.", "inverse-warning")
         else:
-            log.warning("no valid folders to watch; real-time protection is off")
+            log.warning("no folder could be watched; real-time protection is off")
             self.realtime_var.set(False)
+            self.cfg.realtime_enabled = False
+            detail = (f"{refused[0]} is inside AVGuard's own folder"
+                      if refused else "the folder does not exist")
+            self._banner(
+                f"Real-time protection is off: {detail}. "
+                "Choose a folder in Settings.", "inverse-warning")
 
     def _toggle_realtime(self) -> None:
         if self.realtime_var.get():
@@ -856,6 +879,10 @@ class AVGuardApp(tb.Window):
 
 
 def main() -> int:
+    # Called here, finally. Under the --noconsole executable build.py produces
+    # there is no stderr, so without these a crash is completely silent: the
+    # user double-clicks and nothing happens, with no log line to explain it.
+    logsetup.install_excepthooks()
     config.ensure_directories()
     app = AVGuardApp()
     app._show()

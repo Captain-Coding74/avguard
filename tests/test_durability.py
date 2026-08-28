@@ -482,3 +482,105 @@ class TestUserRuleNamespaces(TempCase):
             '  strings:\n    $a = { 51 51 51 51 }\n  condition:\n    $a\n}\n',
             encoding="utf-8")
         self.assertEqual(len(self.scanner().rule_sources), 2)
+
+
+# ------------------------------------- the window must always open
+
+class TestStartupSurvival(TempCase):
+    """A watch folder that has been deleted used to stop the app existing.
+
+    start() built an Observer, never started it, then called stop(), which
+    joined it -- RuntimeError out of start(), out of AVGuardApp.__init__, and
+    the window never appeared. realtime_enabled defaults to true, so a removable
+    drive or a cleared Downloads was enough. Under the --noconsole build there
+    was no stderr to say why.
+    """
+
+    def monitor(self) -> RealtimeMonitor:
+        scanner = Scanner(config.Config(cloud_enabled=False),
+                          SelfProtection([self.tmp / "prot"]),
+                          rules_path=RULES,
+                          cache=ScanCache(path=self.tmp / "c.json"))
+        return RealtimeMonitor(scanner, SelfProtection([self.tmp / "prot"]),
+                               on_verdict=lambda verdict: None)
+
+    def test_starting_on_a_missing_folder_returns_empty(self):
+        monitor = self.monitor()
+        self.addCleanup(monitor.stop)
+        self.assertEqual(monitor.start([self.tmp / "not-here"]), [])
+
+    def test_starting_on_a_missing_folder_does_not_raise(self):
+        monitor = self.monitor()
+        try:
+            monitor.start([self.tmp / "not-here"])
+        except Exception as exc:
+            self.fail(f"start() raised {type(exc).__name__}: {exc}")
+        finally:
+            monitor.stop()
+
+    def test_stopping_a_never_started_monitor_does_not_raise(self):
+        monitor = self.monitor()
+        try:
+            monitor.stop()
+        except Exception as exc:
+            self.fail(f"stop() raised {type(exc).__name__}: {exc}")
+
+    def test_a_protected_folder_is_refused_out_loud(self):
+        """Watching a folder inside the project protects nothing.
+
+        Self-protection refuses the whole tree before a file is opened, so
+        "clone the repo into Downloads and watch Downloads" watched something
+        it would always skip. Appearing to work is the failure mode this
+        project exists to avoid.
+        """
+        # The real default protection, which covers the whole project. The
+        # temp-dir protection the other tests use would not cover it.
+        scanner = Scanner(config.Config(cloud_enabled=False), SelfProtection(),
+                          rules_path=RULES, cache=ScanCache(path=self.tmp / "p.json"))
+        monitor = RealtimeMonitor(scanner, SelfProtection(),
+                                  on_verdict=lambda verdict: None)
+        self.addCleanup(monitor.stop)
+        watched = monitor.start([config.PROJECT_ROOT])
+        self.assertEqual(watched, [])
+        self.assertEqual([p.resolve() for p in monitor.refused],
+                         [config.PROJECT_ROOT.resolve()])
+
+    def test_a_good_folder_still_works_alongside_a_bad_one(self):
+        good = self.tmp / "watched"
+        good.mkdir()
+        monitor = self.monitor()
+        self.addCleanup(monitor.stop)
+        watched = monitor.start([self.tmp / "gone", good])
+        self.assertEqual([p.resolve() for p in watched], [good.resolve()])
+
+
+class TestCrashesReachTheLog(TempCase):
+    """install_excepthooks() was written, praised in two comments, and called
+    from nowhere. Under pythonw there is no stderr, so a crash left no trace."""
+
+    def test_both_entry_points_install_the_hooks(self):
+        import avguard.gui as gui_module
+        import avguard.__main__ as cli_module
+        import inspect
+        for module, name in ((gui_module, "gui"), (cli_module, "__main__")):
+            with self.subTest(entry_point=name):
+                source = inspect.getsource(module.main)
+                self.assertIn("install_excepthooks()", source,
+                              f"{name}.main() does not install the excepthooks")
+
+    def test_an_unhandled_exception_is_written_down(self):
+        import subprocess
+        env = dict(os.environ, AVGUARD_DATA=str(self.tmp / "data"))
+        code = (
+            "import sys; sys.path.insert(0, %r);"
+            "from avguard import config, logsetup;"
+            "config.ensure_directories(); logsetup.configure();"
+            "logsetup.install_excepthooks();"
+            "raise ValueError('crash-with-no-console')" % str(Path(__file__).resolve().parent.parent)
+        )
+        subprocess.run([sys.executable, "-c", code], env=env,
+                       capture_output=True, text=True, timeout=120)
+        log_file = self.tmp / "data" / "logs" / "avguard.log"
+        self.assertTrue(log_file.exists(), "no log file was written at all")
+        self.assertIn("crash-with-no-console",
+                      log_file.read_text(encoding="utf-8", errors="replace"))

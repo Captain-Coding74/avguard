@@ -109,6 +109,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
+    logsetup.install_excepthooks()
     config.ensure_directories()
 
     if args.list_quarantine:

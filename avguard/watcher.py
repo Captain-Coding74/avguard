@@ -230,6 +230,9 @@ class RealtimeMonitor:
         self.debouncer = Debouncer(debounce_seconds, self.pool.submit)
         self._observer: Observer | None = None
         self._watched: list[Path] = []
+        # Paths handed to start() that cannot be watched, kept so the caller
+        # can tell the user rather than silently protecting nothing.
+        self.refused: list[Path] = []
 
     @property
     def running(self) -> bool:
@@ -300,6 +303,7 @@ class RealtimeMonitor:
         self.pool.start()
         self.debouncer.start()
 
+        self.refused = []
         handler = _Handler(self.protection, self.debouncer.touch)
         self._observer = Observer()
         self._watched = []
@@ -308,6 +312,14 @@ class RealtimeMonitor:
             path = Path(path)
             if not path.is_dir():
                 log.warning("cannot watch %s: not a directory", path)
+                continue
+            if self.protection.is_protected(path):
+                # Self-protection refuses the whole project tree before a file
+                # is opened, so watching a folder inside it watches nothing.
+                # Saying so beats appearing to work.
+                log.warning("cannot watch %s: it is inside AVGuard's own "
+                            "directory, which is never scanned", path)
+                self.refused.append(path)
                 continue
             try:
                 self._observer.schedule(handler, str(path), recursive=True)
@@ -332,8 +344,19 @@ class RealtimeMonitor:
         watchdog thread behind.
         """
         if self._observer is not None:
-            self._observer.stop()
-            self._observer.join(timeout=5)
+            try:
+                # Both guarded: start() builds the Observer before scheduling
+                # anything, so a watch path that no longer exists left an
+                # unstarted thread here and join() raised "cannot join thread
+                # before it is started" -- out of stop(), out of start(), and
+                # out of AVGuardApp.__init__, so the window never appeared.
+                if self._observer.is_alive():
+                    self._observer.stop()
+                    self._observer.join(timeout=5)
+            except RuntimeError as exc:
+                log.debug("observer was never started: %s", exc)
+            except Exception:
+                log.exception("error stopping the observer")
             self._observer = None
         self.debouncer.stop()
         self.pool.stop()
