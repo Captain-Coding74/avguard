@@ -785,6 +785,14 @@ class TestScanCacheSchema(TempCase):
         prot = SelfProtection([self.tmp / "nothing"])
         one = Scanner(cfg, prot, rules_path=rules_a, cache=ScanCache(path=self.tmp / "1.json"))
         two = Scanner(cfg, prot, rules_path=rules_b, cache=ScanCache(path=self.tmp / "2.json"))
+        # The files deliberately share a name and a size, and on a fast
+        # filesystem they share an mtime to the nanosecond too. An earlier
+        # optimisation hashed exactly those three things and made two different
+        # rulesets look identical -- which would replay every cached verdict
+        # from a ruleset no longer in use. CI caught it; this asserts the
+        # collision cannot come back.
+        self.assertEqual(rules_a.name, rules_b.name)
+        self.assertEqual(rules_a.stat().st_size, rules_b.stat().st_size)
         self.assertNotEqual(one.detection_generation(), two.detection_generation())
 
 

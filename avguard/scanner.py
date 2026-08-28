@@ -447,21 +447,26 @@ class Scanner:
             digest.update(f"pack={pack.name}|{pack.sha256}|{pack.trusted}".encode())
         digest.update(f"sig={WEIGHT_SIGNATURE}|ent={WEIGHT_ENTROPY}"
                       f"|pe={WEIGHT_PE_STRUCTURE}|arc={WEIGHT_ARCHIVE_PROBLEM}".encode())
+        # Pack files are covered by pack.sha256 above -- a real content hash,
+        # recorded once at install time -- so they are skipped here. That is
+        # where the volume is: 310 files in the pack measured against 1 shipped
+        # rule file, which is what made reading everything expensive.
+        pack_files = {str(p.resolve()) for p in self.packs.rule_files()}
         for path in self.rule_files():
-            # Identity, not contents. Reading every rule file on construction
-            # is measurable once a user rules directory has real packs in it,
-            # and (name, size, mtime) changes whenever the bytes do. Falls back
-            # to the contents when the stat is unavailable, because being slow
-            # is better than keying a cache on nothing.
+            resolved = str(path.resolve())
+            if resolved in pack_files:
+                continue
+            # Contents, not (name, size, mtime). An earlier version used the
+            # stat, and CI caught two genuinely different rulesets hashing
+            # identically: same filename, same size, and -- on a fast
+            # filesystem -- the same mtime to the nanosecond. That would replay
+            # every cached verdict from a ruleset no longer in use, which is
+            # the exact failure DETECTION_VERSION exists to prevent.
             digest.update(path.name.encode())
             try:
-                stat = path.stat()
-                digest.update(f"{stat.st_size}|{stat.st_mtime_ns}".encode())
+                digest.update(path.read_bytes())
             except OSError:
-                try:
-                    digest.update(path.read_bytes())
-                except OSError:
-                    digest.update(b"<unreadable>")
+                digest.update(b"<unreadable>")
         return digest.hexdigest()[:16]
 
     def rule_files(self) -> list[Path]:
