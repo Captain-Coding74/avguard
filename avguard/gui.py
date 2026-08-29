@@ -786,6 +786,31 @@ class AVGuardApp(tb.Window):
         log.info("history cleared at the user's request")
         self._banner("History cleared.", "inverse-secondary")
 
+    def _describe_rules(self) -> str:
+        """What is actually loaded, not just the shipped file.
+
+        This row said "compiled from malware.yara" while 311 files and 1,240
+        imported rules were loaded. The Health view exists to answer whether
+        detection is working, and understating what is loaded is a way of
+        answering it wrongly.
+        """
+        total = len(self.scanner.rule_sources)
+        imported = sum(p.rule_count for p in self.scanner.packs.packs())
+        if not imported:
+            return f"{total} file(s), all shipped with AVGuard"
+        return (f"{total} file(s): the shipped ruleset plus "
+                f"{imported:,} rules from {len(self.scanner.packs.packs())} pack(s)")
+
+    def _describe_packs(self) -> str:
+        packs = self.scanner.packs.packs()
+        if not packs:
+            return ("none installed - detection is whatever the shipped rules "
+                    "catch. Add one with: avguard --packs add <folder>")
+        parts = []
+        for pack in packs:
+            state = "can move files" if pack.trusted else "reports only"
+            parts.append(f"{pack.name} ({pack.rule_count:,} rules, {state})")
+        return "; ".join(parts)
     def _show_health(self) -> None:
         """Every row is something that has failed silently before."""
         rules_ok = self.scanner.rules is not None
@@ -793,9 +818,9 @@ class AVGuardApp(tb.Window):
         watching = not broken and bool(self.monitor.watched)
         workers = self.monitor.pool.alive_workers
         checks = [
-            ("Detection rules", rules_ok,
-             f"compiled from {self.scanner.rules_path.name}" if rules_ok
+            ("Detection rules", rules_ok, self._describe_rules() if rules_ok
              else "FAILED TO COMPILE - most detection is off. See the log."),
+            ("Rule packs", True, self._describe_packs()),
             ("Real-time protection", watching,
              f"watching {len(self.monitor.watched)} folder(s)" if watching
              else ("; ".join(broken) if broken else "not running")),

@@ -16,7 +16,7 @@ import ttkbootstrap as tb
 from ttkbootstrap.constants import BOTH, END, LEFT, RIGHT, VERTICAL, X, Y
 from ttkbootstrap.dialogs import Messagebox
 
-from . import config, scheduling
+from . import config, rulepacks, scheduling
 
 log = logging.getLogger("avguard.dialogs")
 
@@ -119,6 +119,32 @@ class SettingsDialog(tb.Toplevel):
                        "Task Scheduler without opening AVGuard.")
                  ).pack(anchor="w", pady=(6, 0))
 
+        # --- rule packs ------------------------------------------------------
+        packs_frame = tb.Labelframe(body, text="Rule packs", padding=12)
+        packs_frame.pack(fill=X, pady=8)
+
+        self.pack_store = rulepacks.PackStore()
+        self.pack_list = tk.Listbox(packs_frame, height=3, bg="#12161c", fg="#cfd8dc",
+                                    relief="flat", highlightthickness=0)
+        self.pack_list.pack(fill=X)
+        self._refresh_packs()
+
+        row = tb.Frame(packs_frame, padding=(0, 6, 0, 0))
+        row.pack(fill=X)
+        tb.Button(row, text="Trust", bootstyle="warning-outline",
+                  command=lambda: self._set_pack_trust(True)).pack(side=LEFT, padx=(0, 4))
+        tb.Button(row, text="Report only", bootstyle="secondary-outline",
+                  command=lambda: self._set_pack_trust(False)).pack(side=LEFT, padx=(0, 4))
+        tb.Button(row, text="Remove", bootstyle="danger-outline",
+                  command=self._remove_pack).pack(side=LEFT)
+        tb.Label(packs_frame, bootstyle="secondary", wraplength=520, justify="left",
+                 text=("A pack reports only until you trust it: until then nothing "
+                       "it finds is moved, whatever severity its rules claim. Add "
+                       "one from a terminal, which is where the measurement "
+                       "against your own files happens:" + CHR_NL
+                       + "    python -m avguard --packs add <folder> --licence MIT")
+                 ).pack(anchor="w", pady=(6, 0))
+
         # --- buttons -------------------------------------------------------
         actions = tb.Frame(body, padding=(0, 14, 0, 0))
         actions.pack(fill=X)
@@ -126,6 +152,59 @@ class SettingsDialog(tb.Toplevel):
                   command=self._save).pack(side=RIGHT, padx=(6, 0))
         tb.Button(actions, text="Cancel", bootstyle="secondary-outline",
                   command=self.destroy).pack(side=RIGHT)
+
+    def _refresh_packs(self) -> None:
+        self.pack_list.delete(0, END)
+        packs = self.pack_store.packs()
+        if not packs:
+            self.pack_list.insert(END, "  (none installed)")
+            return
+        for pack in packs:
+            state = "trusted, can move files" if pack.trusted else "reports only"
+            self.pack_list.insert(
+                END, f"{pack.name}  -  {pack.rule_count:,} rules, {state}")
+
+    def _selected_pack(self):
+        selection = self.pack_list.curselection()
+        packs = self.pack_store.packs()
+        if not selection or not packs:
+            Messagebox.show_info("Select a rule pack first.", "AVGuard", parent=self)
+            return None
+        index = selection[0]
+        return packs[index] if index < len(packs) else None
+
+    def _set_pack_trust(self, trusted: bool) -> None:
+        pack = self._selected_pack()
+        if pack is None:
+            return
+        if trusted:
+            answer = Messagebox.yesno(
+                f"Let {pack.name} move files?" + CHR_NL + CHR_NL
+                + f"It contains {pack.rule_count:,} rules written by somebody else. "
+                  "When it was added, it flagged "
+                  f"{pack.false_positive_rate:.2%} of {pack.corpus_size} clean "
+                  "files on this machine." + CHR_NL + CHR_NL
+                + "Until now its detections have only been reported.",
+                "Trust this pack?", parent=self)
+            if answer != "Yes":
+                return
+        try:
+            self.pack_store.set_trusted(pack.name, trusted)
+        except rulepacks.PackError as exc:
+            Messagebox.show_error(str(exc), "AVGuard", parent=self)
+            return
+        self._refresh_packs()
+
+    def _remove_pack(self) -> None:
+        pack = self._selected_pack()
+        if pack is None:
+            return
+        if Messagebox.yesno(
+                f"Remove {pack.name} and its {pack.rule_count:,} rules?",
+                "Remove this pack?", parent=self) != "Yes":
+            return
+        self.pack_store.remove(pack.name)
+        self._refresh_packs()
 
     def _add_watch(self) -> None:
         chosen = filedialog.askdirectory(title="Watch this folder", parent=self)

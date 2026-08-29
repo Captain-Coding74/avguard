@@ -34,8 +34,27 @@ Ranked by the same rule as everything else in this project:
 | 10 | The app failed to start if a watched folder had been deleted | `tests/test_durability.py` |
 | 11 | A crash left no trace at all under the windowless build | `tests/test_durability.py` |
 | 12 | Watching a folder inside the project protected nothing, silently | `tests/test_durability.py` |
+| 13 | Self-protection missed our own **existing** files under path redirection | `tests/test_durability.py` |
+| 14 | The Health view understated what rules were loaded | `tests/test_rulepacks.py` |
 
 ### Notes worth keeping
+
+**Path redirection (13).** `%LOCALAPPDATA%/AVGuard/logs/avguard.log` resolves,
+on a packaged or containerised app, to
+`.../Packages/<app>/LocalCache/Local/AVGuard/logs/avguard.log`. Protected roots
+were stored in one form and candidates compared in another, so `is_relative_to`
+returned False and self-protection stopped covering AVGuard's own files.
+
+The sting is which files: `resolve()` follows the redirection only for paths
+that **exist**, so a missing path stayed unredirected and matched, while the
+live log, cache and config did not. Existing files were the unprotected ones,
+which is exactly backwards, and it is v1's failure reachable again through a
+platform detail nobody had looked at. Protection now stores and compares every
+form of every path, case-insensitively where the platform is.
+
+It surfaced because a test failed *only* when run alone. In the full suite it
+passed, for ordering reasons — which is its own lesson about trusting a green
+suite over a green test.
 
 **Quarantine (1).** The order was: write payload, unlink original, save record.
 The nonce that decodes the payload lived only in memory until that last step,

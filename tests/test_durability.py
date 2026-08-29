@@ -616,3 +616,84 @@ class TestCrashesReachTheLog(TempCase):
         self.assertTrue(log_file.exists(), "no log file was written at all")
         self.assertIn("crash-with-no-console",
                       log_file.read_text(encoding="utf-8", errors="replace"))
+
+
+# ------------------------------------------- self-protection across path forms
+
+class TestProtectionAcrossPathForms(TempCase):
+    """A path can have more than one true spelling, and Windows uses that.
+
+    On a packaged or containerised app, AppData is redirected: the log at
+    %LOCALAPPDATA%/AVGuard/logs/avguard.log resolves to
+    .../Packages/<app>/LocalCache/Local/AVGuard/logs/avguard.log. Roots were
+    stored in one form and candidates compared in another, so self-protection
+    silently stopped covering our own files.
+
+    Worse, it only affected files that EXIST -- resolve() on a missing path
+    does not follow the redirection -- so a fresh install looked protected and
+    a running one was not. That is v1's failure, reachable again through a
+    platform detail nobody had looked at.
+    """
+
+    def test_a_directory_protects_a_file_inside_it(self):
+        root = self.tmp / "data"
+        (root / "logs").mkdir(parents=True)
+        target = root / "logs" / "avguard.log"
+        target.write_text("real, existing file")
+        self.assertTrue(SelfProtection([root]).is_protected(target))
+
+    def test_protection_survives_a_symlinked_root(self):
+        """The shape of the redirection, as a link we can actually create."""
+        real = self.tmp / "real_data"
+        (real / "logs").mkdir(parents=True)
+        target = real / "logs" / "avguard.log"
+        target.write_text("x")
+
+        link = self.tmp / "linked_data"
+        try:
+            link.symlink_to(real, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("cannot create a directory symlink here")
+
+        # Protected by the link, asked about via the real path, and the
+        # reverse. Both must hold: the two are the same file.
+        self.assertTrue(SelfProtection([link]).is_protected(target))
+        self.assertTrue(
+            SelfProtection([real]).is_protected(link / "logs" / "avguard.log"))
+
+    def test_an_existing_file_is_as_protected_as_a_missing_one(self):
+        """The bug made existing files the unprotected ones."""
+        root = self.tmp / "data"
+        root.mkdir()
+        missing = root / "not_written_yet.json"
+        present = root / "written.json"
+        present.write_text("x")
+        protection = SelfProtection([root])
+        self.assertTrue(protection.is_protected(missing))
+        self.assertTrue(protection.is_protected(present))
+
+    @unittest.skipUnless(sys.platform == "win32", "case-insensitivity is a Windows thing")
+    def test_case_does_not_defeat_protection(self):
+        root = self.tmp / "Data"
+        root.mkdir()
+        target = root / "file.txt"
+        target.write_text("x")
+        protection = SelfProtection([root])
+        self.assertTrue(protection.is_protected(Path(str(target).upper())))
+        self.assertTrue(protection.is_protected(Path(str(target).lower())))
+
+    def test_the_real_data_directory_is_protected_in_full(self):
+        """The live check, against this machine's actual layout."""
+        protection = SelfProtection()
+        for path in (config.LOG_DIR / "avguard.log",
+                     config.QUARANTINE_DIR / "anything.quar",
+                     config.CONFIG_PATH,
+                     config.SCAN_CACHE_PATH):
+            with self.subTest(path=path.name):
+                self.assertTrue(protection.is_protected(path),
+                                f"{path} is not protected")
+
+    def test_unrelated_files_are_still_scannable(self):
+        """Protection that covers everything protects nothing."""
+        protection = SelfProtection([self.tmp / "data"])
+        self.assertFalse(protection.is_protected(self.tmp / "elsewhere" / "x.exe"))

@@ -301,3 +301,55 @@ class TestImportedRulesCannotCondemn(TempCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestPackReporting(TempCase):
+    """What the interface says about packs, checked without opening a window.
+
+    The Health view said "compiled from malware.yara" while 311 files and 1,240
+    imported rules were loaded, and a GUI-only user had no way to learn that a
+    pack was installed at all, let alone that it was reports-only. The window
+    that exists to answer "is detection working" was answering it wrongly by
+    omission.
+
+    These test the strings, not the widgets: the logic is what was wrong, and
+    it can be checked where tkinter is not installed.
+    """
+
+    def install(self, trusted: bool = False, rules: int = 3):
+        rule = self.simple_rule()
+        admission = self.store.admit("stranger", [rule], self.clean_corpus(),
+                                     licence="MIT")
+        pack = self.store.install("stranger", [rule], admission, licence="MIT")
+        pack.rule_count = rules
+        if trusted:
+            self.store.set_trusted("stranger", True)
+        return self.store.get("stranger")
+
+    def test_a_pack_describes_its_trust_state(self):
+        self.assertIn("reports only", self.install(trusted=False).describe())
+        self.store.set_trusted("stranger", True)
+        self.assertIn("trusted", self.store.get("stranger").describe())
+
+    def test_a_pack_describes_what_it_was_measured_at(self):
+        pack = self.install()
+        self.assertIn("clean files", pack.describe())
+        self.assertIn(f"{pack.corpus_size}", pack.describe())
+
+    def test_an_untrusted_pack_says_so_prominently(self):
+        """A user who thinks they are protected by a pack that reports only
+        is worse off than one who knows they are not."""
+        description = self.install(trusted=False).describe()
+        self.assertNotIn("trusted", description.replace("reports only", ""))
+
+    def test_the_store_reports_nothing_installed_honestly(self):
+        self.assertEqual(self.store.packs(), [])
+        self.assertEqual(self.store.rule_files(), [])
+        self.assertEqual(self.store.untrusted_namespaces(), set())
+
+    def test_rule_counts_survive_a_restart(self):
+        self.install(rules=3)
+        reopened = PackStore(directory=self.store.directory,
+                             index_path=self.store.index_path)
+        self.assertEqual(len(reopened.packs()), 1)
+        self.assertGreater(reopened.packs()[0].rule_count, 0)

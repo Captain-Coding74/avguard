@@ -15,6 +15,7 @@ refuse it if it sits under any protected root. Every scan entry point calls
 from __future__ import annotations
 
 import fnmatch
+import os
 import sys
 from pathlib import Path
 from typing import Iterable
@@ -54,13 +55,35 @@ class SelfProtection:
         return roots
 
     def protect(self, path: Path | str) -> None:
-        """Add a file or directory to the protected set."""
+        """Add a file or directory to the protected set.
+
+        Both the absolute and the fully resolved form are stored. On Windows
+        those can differ in ways that matter: a packaged or containerised app
+        has AppData redirected, so `%LOCALAPPDATA%/AVGuard/logs/avguard.log`
+        resolves to `.../Packages/<app>/LocalCache/Local/AVGuard/...`. Storing
+        only one form meant the roots were held unredirected while candidates
+        resolved redirected, and self-protection quietly stopped covering our
+        own files -- but only the ones that existed, because `resolve()` on a
+        missing path does not follow the redirection. Existing files being the
+        unprotected ones is precisely backwards.
+        """
+        candidate = Path(path)
+        for form in self._forms(candidate):
+            self._roots.add(form)
+
+    @staticmethod
+    def _forms(path: Path) -> set[Path]:
+        """Every spelling of a path this platform might hand us."""
+        forms: set[Path] = set()
         try:
-            self._roots.add(Path(path).resolve())
+            forms.add(Path(os.path.abspath(path)))
         except (OSError, ValueError):
-            # An unresolvable path cannot be compared against, so ignore it
-            # rather than letting a bad entry weaken the whole check.
             pass
+        try:
+            forms.add(path.resolve())
+        except (OSError, ValueError):
+            pass
+        return forms
 
     @property
     def roots(self) -> frozenset[Path]:
@@ -69,27 +92,44 @@ class SelfProtection:
     def is_protected(self, path: Path | str) -> bool:
         """True if `path` is one of our files, or lives inside one of our directories.
 
-        Comparison is on fully resolved paths, so symlinks, junctions, relative
-        paths and short 8.3 names all normalise to the same answer. The old
-        build compared raw substrings, which both missed real matches and
-        excluded innocent files whose path happened to contain the substring.
+        Every form of the candidate is compared against every form of every
+        root, and a match on any pair is enough. Comparison is case-insensitive
+        on Windows, where two spellings of the same file differ only in case.
         """
-        try:
-            candidate = Path(path).resolve()
-        except (OSError, ValueError):
-            # If we cannot resolve it we cannot prove it is safe, so refuse it.
+        candidate_forms = self._forms(Path(path))
+        if not candidate_forms:
+            # If we cannot express it at all we cannot prove it is safe.
             return True
 
-        for root in self._roots:
-            if candidate == root:
-                return True
-            if root.is_dir() or not root.suffix:
+        for candidate in candidate_forms:
+            for root in self._roots:
+                if _same(candidate, root):
+                    return True
                 try:
-                    if candidate.is_relative_to(root):
+                    if _within(candidate, root):
                         return True
                 except ValueError:
                     continue
         return False
+
+
+def _normalise(path: Path) -> str:
+    return os.path.normcase(str(path))
+
+
+def _same(candidate: Path, root: Path) -> bool:
+    return _normalise(candidate) == _normalise(root)
+
+
+def _within(candidate: Path, root: Path) -> bool:
+    """Is `candidate` inside `root`? Case-insensitive where the platform is.
+
+    Path.is_relative_to is case-sensitive even on Windows, so two spellings of
+    the same directory would not match.
+    """
+    root_text = _normalise(root).rstrip(os.sep + (os.altsep or ""))
+    candidate_text = _normalise(candidate)
+    return candidate_text.startswith(root_text + os.sep) or candidate_text == root_text
 
 
 def matches_excluded_glob(path: Path | str, patterns: Iterable[str]) -> bool:
