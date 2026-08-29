@@ -92,7 +92,7 @@ SUSPICIOUS_AT = 50
 # Learned by shipping it: the archive inspector stopped calling large resource
 # packs "hostile", and the machine kept reporting the old verdict because the
 # generation hash only covered the rule file.
-DETECTION_VERSION = 7
+DETECTION_VERSION = 8
 
 # Heuristics never add up to a condemnation, however many of them agree.
 #
@@ -699,33 +699,51 @@ class Scanner:
             log.warning("YARA could not scan %s: %s", facts.path, exc)
             return []
 
-        findings = []
-        for match in matches:
-            meta = dict(getattr(match, "meta", {}) or {})
-            severity = str(meta.get("severity", "")).strip().lower()
-            weight = SEVERITY_WEIGHTS.get(severity, WEIGHT_UNLABELLED)
+        return [self._finding_from_match(m) for m in matches]
 
-            # A rule from a pack nobody has promoted cannot move a file,
-            # whatever its own metadata claims. Third-party severities follow
-            # conventions this program knows nothing about, and importing
-            # somebody else's "critical" as decisive would hand a stranger the
-            # power to delete things here.
-            namespace = str(getattr(match, "namespace", "") or "")
-            imported = namespace in self._untrusted_namespaces
-            if imported:
-                weight = min(weight, SEVERITY_WEIGHTS["medium"])
-            if severity and severity not in SEVERITY_WEIGHTS:
-                log.warning("rule %s declares an unknown severity %r; scoring it as %d",
-                            match.rule, severity, weight)
-            description = str(meta.get("description", "")).strip()
-            detail = description or f"matched rule {match.rule}"
-            origin = self.packs.owner_of(namespace) if namespace else ""
-            attribution = f", from the {origin} pack" if origin else ""
-            findings.append(Finding(
-                "yara", match.rule, weight,
-                f"{detail} (rule {match.rule}, {severity or 'unrated'}{attribution})",
-                hard=weight >= MALICIOUS_AT and not imported))
-        return findings
+    def _finding_from_match(self, match, inside: str = "") -> Finding:
+        """Turn one YARA match into a scored finding.
+
+        The single place a match becomes a weight. There used to be two of
+        these -- one for loose files and a copy inside _archive_findings -- and
+        when the untrusted-pack cap was added it went into only one of them. A
+        never-promoted pack's `severity = "critical"` therefore scored 50 and
+        could not move a loose file, while scoring 100 and moving the identical
+        bytes inside a zip. Archive scanning is on by default and real-time
+        watches Downloads, so the uncapped path was the likely one.
+
+        Duplicated logic is where invariants go to die. Everything that scores
+        a match comes through here so the cap cannot be applied to some callers
+        and not others.
+        """
+        meta = dict(getattr(match, "meta", {}) or {})
+        severity = str(meta.get("severity", "")).strip().lower()
+        weight = SEVERITY_WEIGHTS.get(severity, WEIGHT_UNLABELLED)
+
+        if severity and severity not in SEVERITY_WEIGHTS:
+            log.warning("rule %s declares an unknown severity %r; scoring it as %d",
+                        match.rule, severity, weight)
+
+        # A rule from a pack nobody has promoted cannot move a file, whatever
+        # its own metadata claims. Third-party severities follow conventions
+        # this program knows nothing about, and treating somebody else's
+        # "critical" as decisive would hand a stranger the power to delete
+        # things here.
+        namespace = str(getattr(match, "namespace", "") or "")
+        imported = namespace in self._untrusted_namespaces
+        if imported:
+            weight = min(weight, SEVERITY_WEIGHTS["medium"])
+
+        description = str(meta.get("description", "")).strip()
+        detail = description or f"matched rule {match.rule}"
+        origin = self.packs.owner_of(namespace) if namespace else ""
+        attribution = f", from the {origin} pack" if origin else ""
+        location = f" inside {inside}" if inside else ""
+
+        return Finding(
+            "yara", match.rule, weight,
+            f"{detail} (rule {match.rule}, {severity or 'unrated'}{attribution}){location}",
+            hard=weight >= MALICIOUS_AT and not imported)
 
     def _match_large_file(self, facts: FileFacts):
         """YARA-match a file too big to have been buffered during the read.
@@ -812,15 +830,9 @@ class Scanner:
                     log.debug("YARA could not scan %s: %s", display, exc)
                     continue
                 for match in matches:
-                    meta = dict(getattr(match, "meta", {}) or {})
-                    severity = str(meta.get("severity", "")).strip().lower()
-                    weight = SEVERITY_WEIGHTS.get(severity, WEIGHT_UNLABELLED)
-                    description = str(meta.get("description", "")).strip() or match.rule
-                    findings.append(Finding(
-                        "yara", match.rule, weight,
-                        f"{description} (rule {match.rule}, {severity or 'unrated'}) "
-                        f"inside {display}",
-                        hard=weight >= MALICIOUS_AT))
+                    # Same scoring as a loose file, including the cap on
+                    # rules from packs nobody has promoted.
+                    findings.append(self._finding_from_match(match, inside=display))
 
         if report.members and report.inspected:
             log.debug("%s: inspected %d of %d archive members",

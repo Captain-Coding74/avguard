@@ -353,3 +353,95 @@ class TestPackReporting(TempCase):
                              index_path=self.store.index_path)
         self.assertEqual(len(reopened.packs()), 1)
         self.assertGreater(reopened.packs()[0].rule_count, 0)
+
+
+class TestTheCapAppliesOnEveryPath(TempCase):
+    """The guarantee, checked wherever a match can be scored.
+
+    It held for loose files and not for archive members: `_archive_findings`
+    was a second copy of the scoring loop, and when the cap was added it went
+    into only one of them. A never-promoted pack's `severity = "critical"`
+    scored 50 on a loose file and 100 on the identical bytes inside a zip, so
+    the file was moved. Archive scanning is on by default and real-time
+    watching is aimed at Downloads, so the uncapped path was the likely one.
+
+    The class that was supposed to guard this tested only loose files. These
+    tests exist so the next duplicated scoring loop is caught by the suite
+    rather than by an audit.
+    """
+
+    PAD = b" padding so deflate changes the bytes " * 60
+
+    def setUp(self) -> None:
+        super().setUp()
+        rule = self.simple_rule(severity="critical")
+        admission = self.store.admit("stranger", [rule], self.clean_corpus(),
+                                     licence="MIT")
+        self.store.install("stranger", [rule], admission, licence="MIT")
+
+    def scanner(self) -> Scanner:
+        scanner = Scanner(config.Config(cloud_enabled=False),
+                          SelfProtection([self.tmp / "nothing"]),
+                          cache=ScanCache(path=self.tmp / f"c{id(self)}.json"),
+                          packs=self.store)
+        scanner.load_rules()
+        return scanner
+
+    def payload(self) -> bytes:
+        return TRIPWIRE.encode() + self.PAD
+
+    def loose(self) -> Path:
+        target = self.tmp / "sample.txt"
+        target.write_bytes(self.payload())
+        return target
+
+    def zipped(self, depth: int = 1) -> Path:
+        import io
+        import zipfile
+        data = self.payload()
+        for level in range(depth):
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("sample.txt" if level == 0 else "inner.zip", data)
+            data = buffer.getvalue()
+        target = self.tmp / f"sample{depth}.zip"
+        with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("sample.txt" if depth == 0 else "member.zip", data)
+        return target
+
+    def test_the_payload_is_not_visible_in_the_container(self):
+        """Otherwise a plain signature match would look like the cap working."""
+        self.assertNotIn(TRIPWIRE.encode(), self.zipped(1).read_bytes())
+
+    def test_untrusted_cannot_condemn_a_loose_file(self):
+        self.assertFalse(self.scanner().scan(self.loose(), use_cache=False).is_threat)
+
+    def test_untrusted_cannot_condemn_inside_an_archive(self):
+        """The case that was broken."""
+        verdict = self.scanner().scan(self.zipped(1), use_cache=False)
+        self.assertIs(verdict.level, Level.SUSPICIOUS)
+        self.assertFalse(verdict.is_threat,
+                         "an unpromoted pack moved a file because it was zipped")
+
+    def test_untrusted_cannot_condemn_deeper_in(self):
+        self.assertFalse(self.scanner().scan(self.zipped(2), use_cache=False).is_threat)
+
+    def test_no_finding_from_an_untrusted_pack_is_ever_hard(self):
+        for target in (self.loose(), self.zipped(1), self.zipped(2)):
+            with self.subTest(target=target.name):
+                findings = self.scanner().scan(target, use_cache=False).findings
+                yara_findings = [f for f in findings if f.source == "yara"]
+                self.assertTrue(yara_findings, "the rule should have matched")
+                self.assertFalse(any(f.hard for f in yara_findings))
+
+    def test_promotion_works_on_every_path_too(self):
+        """The cap must lift uniformly, or trust would be as patchy as the cap."""
+        self.store.set_trusted("stranger", True)
+        for target in (self.loose(), self.zipped(1)):
+            with self.subTest(target=target.name):
+                self.assertTrue(self.scanner().scan(target, use_cache=False).is_threat)
+
+    def test_an_archive_finding_names_the_pack_that_produced_it(self):
+        """The archive path dropped the attribution as well as the cap."""
+        verdict = self.scanner().scan(self.zipped(1), use_cache=False)
+        self.assertIn("stranger", " ".join(verdict.reasons))

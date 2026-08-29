@@ -37,8 +37,23 @@ Ranked by the same rule as everything else in this project:
 | 13 | Self-protection missed our own **existing** files under path redirection | `tests/test_durability.py` |
 | 14 | The Health view understated what rules were loaded | `tests/test_rulepacks.py` |
 | 15 | `--no-gui-deps` blocked nothing, so its passes were unearned | `tests/test_tier3.py` |
+| 16 | **An unpromoted rule pack could quarantine a file, if it was zipped** | `tests/test_rulepacks.py` |
 
 ### Notes worth keeping
+
+**The archive path (16).** The headline guarantee of rule packs is that an
+imported rule cannot move a file until the pack is promoted by name. It held
+for loose files and not for archive members, because `_archive_findings` was a
+second copy of the scoring loop and the cap went into only one of them. A
+never-promoted pack's `severity = "critical"` scored 50 on a loose file and 100
+on the identical bytes inside a zip -- so the file was moved. Archive scanning
+is on by default and real-time watching is aimed at Downloads, which is where
+zips arrive, so the uncapped path was the likely one rather than the exotic one.
+
+I had claimed this guarantee verified "in both directions". It was: both
+directions of *promotion*, on one of two code paths. The fix is not a second
+copy of the cap but a single `_finding_from_match` that every path goes
+through, because duplicated logic is where invariants go to die.
 
 **Path redirection (13).** `%LOCALAPPDATA%/AVGuard/logs/avguard.log` resolves,
 on a packaged or containerised app, to
