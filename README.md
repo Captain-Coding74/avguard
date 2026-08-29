@@ -302,6 +302,15 @@ name:
 python -m avguard --packs trust <name>
 ```
 
+A pack is measured once, when it is admitted. That is not enough on its own —
+software gets installed on a machine, and a pack's files can be edited after
+the fact — so the test suite re-measures whatever is installed, and you can run
+the same check yourself:
+
+```bash
+python -m avguard --packs verify
+```
+
 Nothing is ever fetched on its own. No auto-update, no check on startup. A
 scanner that changes its own detection logic overnight is one that can start
 eating your files overnight.

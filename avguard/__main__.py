@@ -145,6 +145,41 @@ def _packs_command(args) -> int:
         print(f"    python -m avguard --packs trust {pack.name}")
         return 0
 
+    if action == "verify":
+        packs = store.packs()
+        if not packs:
+            print("No rule packs installed.")
+            return 0
+        corpus = _clean_corpus()
+        if not corpus:
+            print("No clean binaries available to measure against.", file=sys.stderr)
+            return 1
+        print(f"re-measuring {len(packs)} pack(s) against {len(corpus)} clean "
+              "binaries from this machine...")
+        worst = 0
+        for pack in packs:
+            files = sorted(list(store.pack_dir(pack.name).glob("*.yara"))
+                           + list(store.pack_dir(pack.name).glob("*.yar")))
+            # Re-admit against today's corpus rather than trusting the number
+            # recorded when it was installed. Software gets added to a machine,
+            # and a pack's files can be edited after the fact.
+            check = store.admit(pack.name, files, corpus,
+                                source=pack.source, licence=pack.licence)
+            state = "ok" if check.accepted else "OVER THE CEILING"
+            print(f"  {pack.name}: {state}  "
+                  f"({check.false_positive_rate:.2%} of {check.corpus_size} flagged, "
+                  f"was {pack.false_positive_rate:.2%} at install)")
+            for reason in check.reasons:
+                print(f"      {reason[:150]}")
+            if not check.accepted:
+                worst = 1
+        if worst:
+            print("\nA pack no longer meets the bar it was admitted under.",
+                  file=sys.stderr)
+            print("Remove it with:  python -m avguard --packs remove <name>",
+                  file=sys.stderr)
+        return worst
+
     if action in ("remove", "trust", "untrust"):
         if not rest:
             print(f"--packs {action} needs a pack name", file=sys.stderr)
@@ -226,8 +261,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--schedule-path", metavar="DIR", type=Path,
                         help="folder for the daily scan (default: Downloads)")
     parser.add_argument("--packs", nargs="?", const="list", metavar="ACTION",
-                        help="rule packs: list (default), add PATH, remove NAME, "
-                             "trust NAME, untrust NAME")
+                        help="rule packs: list (default), add PATH, verify, "
+                             "remove NAME, trust NAME, untrust NAME")
     parser.add_argument("pack_args", nargs="*", default=[],
                         help=argparse.SUPPRESS)
     parser.add_argument("--licence", "--license", dest="licence", default="",

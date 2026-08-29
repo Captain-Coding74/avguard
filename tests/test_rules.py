@@ -377,3 +377,91 @@ class TestScoring(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestInstalledPacks(unittest.TestCase):
+    """Whatever packs are actually installed, held to the same bar.
+
+    A pack is measured once, at admission, and then never again. That is not
+    enough on its own: the corpus changes as software is installed, a pack's
+    files can be edited afterwards, and a pack admitted against a small corpus
+    was never really tested. So the suite re-measures what is installed rather
+    than trusting a number recorded at some point in the past.
+
+    Skips cleanly when nothing is installed, which is the case on CI.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from avguard.rulepacks import PackStore
+        cls.store = PackStore()
+        cls.installed = cls.store.packs()
+        cls.rule_files = cls.store.rule_files()
+        cls.corpus = _collect_corpus()
+
+    def setUp(self) -> None:
+        if not self.installed:
+            self.skipTest("no rule packs installed")
+        if not self.rule_files:
+            self.skipTest("installed packs have no rule files on disk")
+
+    def _compiled(self):
+        return yara.compile(filepaths={str(p.resolve()): str(p)
+                                       for p in self.rule_files})
+
+    def test_installed_packs_still_compile(self):
+        """A pack whose files were edited after admission must not be silent."""
+        self.assertIsNotNone(self._compiled())
+
+    def test_no_installed_pack_matches_avguard_itself(self):
+        """The v1 failure, arriving from outside instead of from our own rules."""
+        compiled = self._compiled()
+        for folder in ("rules", "avguard"):
+            base = PROJECT / folder
+            if not base.is_dir():
+                continue
+            for path in base.rglob("*"):
+                if not path.is_file() or "__pycache__" in path.parts:
+                    continue
+                with self.subTest(path=path.name):
+                    self.assertEqual(
+                        [m.rule for m in compiled.match(data=path.read_bytes())], [],
+                        f"an installed pack matches AVGuard's own {path.name}")
+
+    def test_installed_packs_stay_under_the_ceiling(self):
+        if not self.corpus:
+            self.skipTest("no clean binaries available to measure against")
+        compiled = self._compiled()
+        counts: dict[str, int] = {}
+        examined = 0
+        for path in self.corpus:
+            try:
+                matches = compiled.match(filepath=str(path), timeout=30)
+            except Exception:
+                continue
+            examined += 1
+            for match in matches:
+                counts[match.rule] = counts.get(match.rule, 0) + 1
+
+        names = ", ".join(p.name for p in self.installed)
+        print(f"\n  installed packs ({names}) re-measured on {examined} clean binaries:")
+        if not counts:
+            print("     no rule fired")
+        for rule, count in sorted(counts.items(), key=lambda kv: -kv[1])[:8]:
+            print(f"     {rule:<46} {count:>3}  ({count / examined:.2%})")
+
+        for rule, count in counts.items():
+            with self.subTest(rule=rule):
+                self.assertLessEqual(
+                    count / examined, MAX_FALSE_POSITIVE_RATE,
+                    f"{rule} now matches {count / examined:.2%} of clean binaries, "
+                    f"above the {MAX_FALSE_POSITIVE_RATE:.0%} ceiling it was "
+                    "admitted under")
+
+    def test_every_installed_pack_records_what_it_was_measured_at(self):
+        """A pack with no recorded measurement is one nobody checked."""
+        for pack in self.installed:
+            with self.subTest(pack=pack.name):
+                self.assertGreater(pack.corpus_size, 0,
+                                   f"{pack.name} has no recorded measurement")
+                self.assertTrue(pack.licence, f"{pack.name} records no licence")

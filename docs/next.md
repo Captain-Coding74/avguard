@@ -17,7 +17,7 @@ program rather than a tidier one.
 
 ---
 
-## Part 1 — close the four open items
+## Part 1 — close the four open items  DONE
 
 Small, real, an hour's work. Listed in
 [open-issues.md](open-issues.md) under "Smaller, real, not urgent".
@@ -29,11 +29,13 @@ Small, real, an hour's work. Listed in
 | A3 | `EventStore.summary()` reads up to 5,000 events to count them | Keep a running counter in a small sidecar, rebuilt on rotation |
 | A4 | `archives.iter_nested` takes a `depth` its only caller never passes | Either thread it through or delete the parameter — a limit enforced by a constant that pretends to be a parameter is a lie in the signature |
 
-A4 is the one worth caring about: the docstring promises a configurable depth
-and the code has a fixed one. Everything else here is tidying.
-
-**Done when:** all four fixed, tests still green in both modes, and the
-"Smaller, real" section of open-issues.md is empty.
+All four done. A4 was filed as tidying and turned out to be a real detection
+gap: `MAX_DEPTH = 2` promised "an archive inside an archive" while the code
+unrolled exactly one level, so a marker two archives deep was missed. It nearly
+escaped a second time because the first check used uncompressed zips, where the
+payload bytes sit verbatim in the container and an ordinary signature match
+looks exactly like successful traversal. See
+[open-issues.md](open-issues.md).
 
 ---
 
@@ -55,92 +57,29 @@ reaching into the real pack store by default, so installing a pack broke three
 existing tests that were silently measuring whatever happened to be on the
 machine. The store is injectable now.
 
-## Part 2 — the original plan
+### What it looks like now
 
-This is the chapter that matters, and it is the one previously written off as
-"a different project". That was half right. Writing and maintaining a malware
-corpus *is* a different project. **Using one somebody else already maintains is
-not** — and the machinery that makes doing it safely is already built here.
+```bash
+python -m avguard --packs add path/to/rules --licence MIT
+python -m avguard --packs list
+python -m avguard --packs verify        # re-measure against today's corpus
+python -m avguard --packs trust <name>  # let its rules move files
+```
 
-### Why this is now reasonable
+A pack is admitted only if it compiles, carries descriptions, matches none of
+AVGuard's own files, and stays under the same 1% false-positive ceiling the
+shipped rules face — measured against real binaries from the machine it is
+being installed on. Refused packs print their measurement and write nothing.
 
-Three things exist today that did not when this was deferred:
+An imported rule cannot move a file whatever severity it claims, until the pack
+is promoted by name. Nothing is ever fetched unless asked for.
 
-- a **validator** that refuses a ruleset which matches its own files, which is
-  how v1 destroyed itself
-- a **400-binary corpus** that measures the real false-positive rate of every
-  rule, and fails the build over a ceiling
-- a **hard/heuristic split** where nothing but a byte signature or an
-  explicitly-trusted rule can move a file
-
-So the risk of importing somebody else's rules — that they are over-broad and
-start eating files — is exactly the risk this project has spent three rounds
-building instruments against. Importing rules is the first thing those
-instruments have been *for*.
-
-### The shape
-
-A new `avguard/rulepacks.py` and a `--rules` CLI verb.
-
-**Getting a pack.** From a local file or a URL, always deliberately. No
-auto-update, no phoning home on startup, nothing fetched unless the user asked
-for it by name. A scanner that silently changes its own detection logic
-overnight is a scanner that can silently start eating files overnight.
-
-**Admitting a pack.** A pack is not trusted because of where it came from. It
-is admitted only if it passes, in this order:
-
-1. it compiles, on its own, in its own namespace
-2. no rule in it matches any AVGuard file, or any file in the other packs
-3. every non-private rule declares a `description`
-4. measured against the local benign corpus, no rule exceeds the
-   false-positive ceiling
-5. the whole pack, applied to the corpus, produces **zero** MALICIOUS verdicts
-
-Fail any of those and the pack is refused with the measurement printed, and
-nothing on disk changes. This is the same bar the shipped ruleset is held to
-by `tests/test_rules.py`; there is no reason a stranger's rules should clear a
-lower one.
-
-**Trusting a pack.** Imported rules are forced to `medium` regardless of what
-their own metadata claims. Third-party severities use conventions this program
-knows nothing about, and `severity = "critical"` in somebody else's file must
-not be able to move a file here. So an imported pack **reports and never
-quarantines** until the user promotes it explicitly, per pack, having seen it
-run. That promotion is a separate, named action.
-
-**Recording a pack.** Name, source, licence, SHA-256, when it was added, how
-many rules, and the measured false-positive rate at admission. Listed by
-`--rules list`, removable by `--rules remove`. A pack whose licence is unknown
-is not admitted, because this repository is MIT and quietly vendoring
-incompatible rules would be a real problem for anyone who forks it.
-
-**Rolling back.** Packs live in their own directory. Removing one is deleting
-a file and recompiling. A pack that breaks compilation after a later change
-gets reported and skipped rather than taking the whole ruleset down — which
-already works, since each file compiles into its own namespace.
-
-### What has to be measured before building it
-
-Two questions decide whether this is worth doing at all, and neither is
-answerable from an armchair:
-
-- **What false-positive rate does a real public ruleset have against 400 clean
-  Windows binaries?** If a well-regarded pack trips 10% of them, the honest
-  finding is that general-purpose rules are unusable at this scale and the
-  chapter stops there — which is itself worth writing down.
-- **Are there packs with a licence compatible with MIT redistribution?**
-  Several large collections are permissively licensed; some well-known ones
-  are not. If the answer is no, the feature ships as "point it at a pack you
-  have" and nothing is vendored.
-
-**Measure first, build second.** If the numbers are bad, Part 2 becomes a
-paragraph in the README explaining why, and that is a perfectly good outcome.
-
-**Done when:** a pack can be admitted, listed, promoted and removed; a
-deliberately over-broad pack is refused with its measured rate; the corpus test
-covers imported packs as well as shipped ones; and the README states what
-changed about what this program detects.
+**One thing the plan promised and the first pass missed:** the corpus test only
+covered the shipped ruleset, so a pack was measured once at admission and never
+again. Software gets installed on a machine and a pack's files can be edited
+afterwards, so a number recorded months ago is not evidence about today.
+`tests/test_rules.py` now re-measures whatever packs are installed, and
+`--packs verify` is the same check on demand.
 
 ---
 
