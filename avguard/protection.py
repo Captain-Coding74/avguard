@@ -113,6 +113,33 @@ class SelfProtection:
         return False
 
 
+def path_forms(path: Path | str) -> set[Path]:
+    """Every spelling of a path this platform might hand us.
+
+    Public because more than one safety check needs it. Windows can give a
+    file two true names: on a packaged or containerised app, AppData is
+    redirected, and `resolve()` follows the redirection only for paths that
+    already exist. So the same directory compares equal or not depending on
+    which files happen to have been written into it -- a coin flip, and not one
+    a guard should be decided by.
+    """
+    return SelfProtection._forms(Path(path))
+
+
+def same_path(a: Path | str, b: Path | str) -> bool:
+    """True if these name the same thing, in any spelling either might take."""
+    return any(_same(x, y) for x in path_forms(a) for y in path_forms(b))
+
+
+def path_within(candidate: Path | str, root: Path | str) -> bool:
+    """True if `candidate` is inside `root`, in any spelling of either."""
+    for form in path_forms(candidate):
+        for base in path_forms(root):
+            if _same(form, base) or _within(form, base):
+                return True
+    return False
+
+
 def _normalise(path: Path) -> str:
     return os.path.normcase(str(path))
 

@@ -56,6 +56,16 @@ It surfaced because a test failed *only* when run alone. In the full suite it
 passed, for ordering reasons — which is its own lesson about trusting a green
 suite over a green test.
 
+Having found one instance, the class was worth sweeping. Two other guards
+compared paths the same way: the check that refuses restoring a file *into* the
+quarantine directory, and rule-pack attribution. Both happened to work on this
+machine today, and both would have stopped working once a file was written into
+the wrong directory — a guard whose behaviour depends on unrelated filesystem
+history is not a guard. `protection.path_within` is now the one place that
+answers "is this inside that", and the tests exercise every guard through a
+symlink so the two-spellings case is covered portably rather than only where
+the redirection happens to exist.
+
 **Quarantine (1).** The order was: write payload, unlink original, save record.
 The nonce that decodes the payload lived only in memory until that last step,
 so a full disk or a process kill in the window deleted the file and left a

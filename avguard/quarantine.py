@@ -30,7 +30,7 @@ from pathlib import Path
 
 from . import config
 from .allowlist import Allowlist
-from .protection import SelfProtection
+from .protection import SelfProtection, path_within
 
 log = logging.getLogger(__name__)
 
@@ -324,11 +324,13 @@ class QuarantineStore:
         if not resolved.is_absolute():
             raise QuarantineError("refusing to restore to a relative path")
 
-        try:
-            if resolved.is_relative_to(self.directory.resolve()):
-                raise QuarantineError("refusing to restore into the quarantine directory")
-        except ValueError:
-            pass
+        # path_within, not is_relative_to: the destination does not exist yet
+        # while the quarantine directory does, and on Windows `resolve()`
+        # follows AppData redirection only for paths that already exist. The
+        # two sides were being compared in different spellings, so whether this
+        # guard fired at all depended on which files happened to be there.
+        if path_within(resolved, self.directory):
+            raise QuarantineError("refusing to restore into the quarantine directory")
 
         if self.protection is not None and self.protection.is_protected(resolved):
             raise QuarantineError("refusing to restore over a protected AVGuard path")

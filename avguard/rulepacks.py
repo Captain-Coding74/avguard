@@ -48,6 +48,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import config
+from .protection import path_within
 
 log = logging.getLogger(__name__)
 
@@ -197,16 +198,9 @@ class PackStore:
 
     def owner_of(self, namespace: str) -> str:
         """Which pack a namespace belongs to, or "" for the shipped rules."""
-        try:
-            path = Path(namespace).resolve()
-        except (OSError, ValueError):
-            return ""
         for pack in self.packs():
-            try:
-                if path.is_relative_to(self.pack_dir(pack.name).resolve()):
-                    return pack.name
-            except (OSError, ValueError):
-                continue
+            if path_within(namespace, self.pack_dir(pack.name)):
+                return pack.name
         return ""
 
     # ------------------------------------------------------------ admission

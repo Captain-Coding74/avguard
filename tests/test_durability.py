@@ -697,3 +697,73 @@ class TestProtectionAcrossPathForms(TempCase):
         """Protection that covers everything protects nothing."""
         protection = SelfProtection([self.tmp / "data"])
         self.assertFalse(protection.is_protected(self.tmp / "elsewhere" / "x.exe"))
+
+
+class TestGuardsSurviveTwoSpellings(TempCase):
+    """Every guard that gates a decision on a path, checked through a link.
+
+    The self-protection hole was one instance of a class: a path can have more
+    than one true spelling, `resolve()` follows a Windows AppData redirection
+    only for paths that already exist, and so a comparison between a root and a
+    candidate can silently be comparing two different spellings of the same
+    place. Whether a guard fires then depends on which files happen to have
+    been written, which is not a basis for a safety check.
+
+    A directory symlink reproduces the shape portably.
+    """
+
+    def _linked(self) -> tuple[Path, Path]:
+        real = self.tmp / "real"
+        real.mkdir()
+        link = self.tmp / "link"
+        try:
+            link.symlink_to(real, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("cannot create a directory symlink here")
+        return real, link
+
+    def test_restore_refuses_the_quarantine_directory_by_either_name(self):
+        """Restoring into quarantine must be refused however it is spelled."""
+        real, link = self._linked()
+        store = QuarantineStore(directory=real, index_path=real / "index.json",
+                                protection=SelfProtection([self.tmp / "prot"]))
+        record = store.quarantine(self.write("threat.bin", b"payload"), [])
+
+        for spelling, label in ((real / "sneaky.exe", "the real path"),
+                                (link / "sneaky.exe", "the linked path")):
+            with self.subTest(spelling=label):
+                with self.assertRaises(QuarantineError) as caught:
+                    store.restore(record.entry_id, spelling)
+                self.assertIn("quarantine directory", str(caught.exception))
+
+    def test_protection_covers_a_directory_by_either_name(self):
+        real, link = self._linked()
+        (real / "inner").mkdir()
+        target = real / "inner" / "file.txt"
+        target.write_text("x")
+        for root, label in ((real, "real"), (link, "link")):
+            with self.subTest(root=label):
+                protection = SelfProtection([root])
+                self.assertTrue(protection.is_protected(target))
+                self.assertTrue(protection.is_protected(link / "inner" / "file.txt"))
+
+    def test_pack_attribution_works_by_either_name(self):
+        from avguard.rulepacks import PackStore
+        real, link = self._linked()
+        store = PackStore(directory=real, index_path=real / "packs.json")
+        rule = self.write("src/pack.yara",
+                          b'rule R { meta: description = "d" strings: $a = "zzz" condition: $a }')
+        from avguard.rulepacks import Admission
+        admission = Admission(accepted=True, rule_count=1, corpus_size=1)
+        pack = store.install("p", [rule], admission, licence="MIT")
+
+        inside = store.pack_dir(pack.name) / "pack.yara"
+        linked = link / pack.name / "pack.yara"
+        self.assertEqual(store.owner_of(str(inside)), pack.name)
+        self.assertEqual(store.owner_of(str(linked)), pack.name,
+                         "attribution must not depend on how the path is spelled")
+
+    def test_an_unrelated_path_is_still_outside(self):
+        """A comparison that says yes to everything guards nothing."""
+        real, _link = self._linked()
+        self.assertFalse(SelfProtection([real]).is_protected(self.tmp / "elsewhere.txt"))
