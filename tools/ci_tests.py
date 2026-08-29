@@ -54,16 +54,40 @@ def _summary(lines: list[str]) -> None:
 
 
 class _HideModules:
-    """Import blocker, so the Linux job's world can be reproduced locally."""
+    """Import blocker, so the Linux job's world can be reproduced locally.
+
+    Uses `find_spec`, which is the only finder hook the import system still
+    consults. The first version of this class implemented `find_module` and
+    `load_module` -- the protocol Python 3.12 removed -- so it silently blocked
+    nothing at all. `--no-gui-deps` reported the whole suite passing while
+    importing ttkbootstrap perfectly happily, and the Linux CI job then failed
+    on exactly the import this was built to catch.
+
+    A tool that reports success without doing its work is worse than no tool,
+    because it gets believed. Hence the self-check below.
+    """
 
     def __init__(self, names: set[str]) -> None:
         self.names = names
 
-    def find_module(self, name, path=None):
-        return self if name.split(".")[0] in self.names else None
+    def find_spec(self, name, path=None, target=None):
+        if name.split(".")[0] in self.names:
+            raise ImportError(f"No module named {name!r} (hidden by --no-gui-deps)")
+        return None
 
-    def load_module(self, name):
-        raise ImportError(f"No module named {name!r} (hidden by --no-gui-deps)")
+
+def _prove_blocking_works(names: set[str]) -> None:
+    """Refuse to run rather than report a result the blocker did not produce."""
+    probe = sorted(names)[0]
+    try:
+        __import__(probe)
+    except ImportError:
+        return
+    print(f"::error title=--no-gui-deps is not working::{probe} imported despite "
+          "being hidden; the check would report a pass it did not earn"
+          if os.getenv("GITHUB_ACTIONS") else
+          f"--no-gui-deps is not working: {probe} imported despite being hidden.")
+    raise SystemExit(2)
 
 
 GUI_DEPENDENCIES = {"ttkbootstrap", "pystray", "PIL", "tkinter"}
@@ -72,8 +96,9 @@ GUI_DEPENDENCIES = {"ttkbootstrap", "pystray", "PIL", "tkinter"}
 def main() -> int:
     if "--no-gui-deps" in sys.argv:
         sys.meta_path.insert(0, _HideModules(GUI_DEPENDENCIES))
+        _prove_blocking_works(GUI_DEPENDENCIES)
         print(f"hiding {', '.join(sorted(GUI_DEPENDENCIES))} "
-              "to reproduce the Linux CI job")
+              "to reproduce the Linux CI job (blocking verified)")
 
     # No top_level_dir: tests/ has no __init__.py, and passing one makes
     # discovery refuse the directory outright. This matches how the suite is

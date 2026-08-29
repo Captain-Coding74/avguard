@@ -36,6 +36,7 @@ Ranked by the same rule as everything else in this project:
 | 12 | Watching a folder inside the project protected nothing, silently | `tests/test_durability.py` |
 | 13 | Self-protection missed our own **existing** files under path redirection | `tests/test_durability.py` |
 | 14 | The Health view understated what rules were loaded | `tests/test_rulepacks.py` |
+| 15 | `--no-gui-deps` blocked nothing, so its passes were unearned | `tests/test_tier3.py` |
 
 ### Notes worth keeping
 

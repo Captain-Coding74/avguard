@@ -5,6 +5,7 @@ Run with:  python -m unittest discover -s tests
 
 from __future__ import annotations
 
+import importlib
 import logging
 import os
 import shutil
@@ -361,3 +362,76 @@ class TestScheduling(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestTheLinuxSimulationActuallySimulates(unittest.TestCase):
+    """The tool built to catch Linux-only failures, checked that it works.
+
+    `tools/ci_tests.py --no-gui-deps` hides the GUI packages so the Linux CI
+    job can be reproduced on a Windows laptop. Its first version implemented
+    `find_module` and `load_module` -- the finder protocol Python 3.12 removed
+    -- so it blocked nothing at all. It reported the whole suite passing while
+    importing ttkbootstrap perfectly happily, and CI then failed on exactly the
+    import it existed to catch.
+
+    A tool that reports success without doing its work is worse than no tool,
+    because it gets believed. This is here so that cannot happen quietly again.
+    """
+
+    def _blocker(self, names):
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+        import importlib
+        module = importlib.import_module("ci_tests")
+        return module._HideModules(names)
+
+    def test_a_hidden_module_really_cannot_be_imported(self):
+        """Uses a module not already loaded.
+
+        An already-imported module is served straight from sys.modules and no
+        finder is consulted at all -- so testing against one would pass with a
+        blocker that does nothing, which is the very failure being guarded.
+        """
+        victim = "wave"           # stdlib, and nothing here imports it
+        self.assertNotIn(victim, sys.modules, "pick a module nothing has loaded")
+        blocker = self._blocker({victim})
+        sys.meta_path.insert(0, blocker)
+        try:
+            importlib.invalidate_caches()
+            with self.assertRaises(ImportError):
+                importlib.import_module(victim)
+        finally:
+            sys.meta_path.remove(blocker)
+            sys.modules.pop(victim, None)
+
+    def test_the_check_would_fail_with_the_old_broken_blocker(self):
+        """Proves the test can tell the difference, rather than always passing."""
+        class OldStyle:
+            def find_module(self, name, path=None):
+                return self if name == "colorsys" else None
+            def load_module(self, name):
+                raise ImportError("blocked")
+
+        self.assertNotIn("colorsys", sys.modules)
+        sys.meta_path.insert(0, OldStyle())
+        try:
+            importlib.invalidate_caches()
+            importlib.import_module("colorsys")   # the old API blocks nothing
+        finally:
+            sys.meta_path.pop(0)
+            sys.modules.pop("colorsys", None)
+
+    def test_a_module_that_is_not_hidden_still_imports(self):
+        """A blocker that blocks everything proves nothing either."""
+        blocker = self._blocker({"ttkbootstrap"})
+        sys.meta_path.insert(0, blocker)
+        try:
+            importlib.invalidate_caches()
+            self.assertIsNotNone(importlib.import_module("base64"))
+        finally:
+            sys.meta_path.remove(blocker)
+
+    def test_the_blocker_uses_the_api_the_interpreter_consults(self):
+        """find_module was removed in 3.12 and is silently never called."""
+        blocker = self._blocker({"x"})
+        self.assertTrue(hasattr(blocker, "find_spec"),
+                        "only find_spec is consulted by the import system")
