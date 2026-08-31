@@ -33,6 +33,28 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# Isolate the data directory BEFORE avguard is imported.
+#
+# config computes DATA_DIR at import time, so this has to happen first. Without
+# it, any object built with its default path -- Scanner's Allowlist,
+# QuarantineStore's, a PackStore -- reaches into the real
+# %LOCALAPPDATA%/AVGuard. The suite silently wrote seven entries into the
+# user's live allowlist that way, one of them the hash of SELFTEST_MARKER,
+# which then suppressed its own detection and broke four unrelated tests.
+#
+# Patching each construction was tried first and missed one. Isolating the
+# directory is the fix that cannot be missed.
+import os as _os
+import tempfile as _tempfile
+
+# Per run, not a fixed path: a shared directory accumulates state between
+# runs, and a stale allowlist entry from one run silently broke the next.
+_os.environ.setdefault(
+    "AVGUARD_DATA",
+    _os.path.join(_tempfile.gettempdir(), f"avguard-test-data-{_os.getpid()}"))
+
+
+
 import yara
 
 from avguard import config

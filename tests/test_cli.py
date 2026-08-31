@@ -28,6 +28,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import os as _os
+import tempfile as _tempfile
+
+# Isolate the data directory before avguard is imported. See test_avguard.py
+# for why: objects built with default paths otherwise reach into the user's
+# real %LOCALAPPDATA%/AVGuard.
+_os.environ.setdefault(
+    "AVGUARD_DATA",
+    _os.path.join(_tempfile.gettempdir(), f"avguard-test-data-{_os.getpid()}"))
+
+
+
 logging.getLogger("avguard").addHandler(logging.NullHandler())
 logging.getLogger("avguard").propagate = False
 

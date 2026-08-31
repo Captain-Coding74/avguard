@@ -18,8 +18,32 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# Isolate the data directory BEFORE avguard is imported.
+#
+# config computes DATA_DIR at import time, so this has to happen first. Without
+# it, any object built with its default path -- Scanner's Allowlist,
+# QuarantineStore's, a PackStore -- reaches into the real
+# %LOCALAPPDATA%/AVGuard. The suite silently wrote seven entries into the
+# user's live allowlist that way, one of them the hash of SELFTEST_MARKER,
+# which then suppressed its own detection and broke four unrelated tests.
+#
+# Patching each construction was tried first and missed one. Isolating the
+# directory is the fix that cannot be missed.
+import os as _os
+import tempfile as _tempfile
+
+# Per run, not a fixed path: a shared directory accumulates state between
+# runs, and a stale allowlist entry from one run silently broke the next.
+_os.environ.setdefault(
+    "AVGUARD_DATA",
+    _os.path.join(_tempfile.gettempdir(), f"avguard-test-data-{_os.getpid()}"))
+
+
+
 from avguard import config, rulepacks
+from avguard.allowlist import Allowlist
 from avguard.protection import SelfProtection
+from avguard.quarantine import QuarantineStore
 from avguard.rulepacks import Admission, PackError, PackStore
 from avguard.scanner import Level, ScanCache, Scanner
 
@@ -445,3 +469,93 @@ class TestTheCapAppliesOnEveryPath(TempCase):
         """The archive path dropped the attribution as well as the cap."""
         verdict = self.scanner().scan(self.zipped(1), use_cache=False)
         self.assertIn("stranger", " ".join(verdict.reasons))
+
+
+class TestSharedStateHasOneOwner(TempCase):
+    """Objects that back a file on disk must not be built twice.
+
+    Two failures, one shape. The Scanner and the QuarantineStore each built
+    their own Allowlist, so `restore()` recorded a decision in one and `scan()`
+    read from the other: in the running GUI a restored file was re-detected on
+    the very next scan, which is the exact failure the allowlist exists to
+    prevent. `Allowlist.reload()` was written for this and had zero call sites.
+
+    Settings likewise built its own PackStore, so trusting or untrusting a pack
+    wrote to disk and the running scanner never saw it. The dangerous direction
+    is trusted to reports-only: a user turns a pack off after a false positive
+    and it keeps condemning for the rest of the session.
+
+    Both were invisible to the tests because the tests wired the objects
+    together themselves -- they exercised an arrangement no entry point builds.
+    """
+
+    def test_a_restore_reaches_the_scanner_when_they_share_an_allowlist(self):
+        from avguard.scanner import SELFTEST_MARKER
+        # One Allowlist, shared between the two -- which is the point of the
+        # test -- but isolated from every other test. Using the default meant
+        # allowlisting the selftest marker for the whole process, and three
+        # unrelated tests then found it CLEAN.
+        shared = Allowlist(path=self.tmp / "allow.json")
+        scanner = Scanner(config.Config(cloud_enabled=False),
+                          SelfProtection([self.tmp / "prot"]),
+                          cache=ScanCache(path=self.tmp / "c.json"),
+                          packs=self.store,
+                          allowlist=shared)
+        store = QuarantineStore(directory=self.tmp / "q",
+                                index_path=self.tmp / "q" / "index.json",
+                                protection=SelfProtection([self.tmp / "prot"]),
+                                allowlist=scanner.allowlist)
+        self.assertIs(store.allowlist, scanner.allowlist)
+
+        target = self.tmp / "kept.bin"
+        target.write_bytes(SELFTEST_MARKER)
+        record = store.quarantine(target, scanner.scan(target, use_cache=False).reasons)
+        restored = store.restore(record.entry_id)
+
+        verdict = scanner.scan(restored, use_cache=False)
+        self.assertIs(verdict.level, Level.CLEAN)
+        self.assertFalse(verdict.is_threat)
+
+    def test_a_second_allowlist_does_not_see_the_first(self):
+        """Pins why sharing is required rather than merely tidy."""
+        from avguard.allowlist import Allowlist
+        shared = self.tmp / "allow.json"
+        first, second = Allowlist(path=shared), Allowlist(path=shared)
+        first.add("a" * 64, "thing.bin", ["reason"])
+        self.assertIsNone(second.allows("a" * 64),
+                          "a separate instance cannot see it without reload")
+        second.reload()
+        self.assertIsNotNone(second.allows("a" * 64))
+
+    def test_pack_store_reload_picks_up_another_owners_change(self):
+        rule = self.simple_rule()
+        admission = self.store.admit("stranger", [rule], self.clean_corpus(),
+                                     licence="MIT")
+        self.store.install("stranger", [rule], admission, licence="MIT")
+
+        other = PackStore(directory=self.store.directory,
+                          index_path=self.store.index_path)
+        other.set_trusted("stranger", True)
+
+        self.assertFalse(self.store.get("stranger").trusted, "stale, as expected")
+        self.store.reload()
+        self.assertTrue(self.store.get("stranger").trusted)
+
+    def test_a_mutation_does_not_clobber_another_owners_write(self):
+        """set_trusted and remove read before they write."""
+        rule = self.simple_rule()
+        admission = self.store.admit("one", [rule], self.clean_corpus(), licence="MIT")
+        self.store.install("one", [rule], admission, licence="MIT")
+
+        other = PackStore(directory=self.store.directory,
+                          index_path=self.store.index_path)
+        two = self.rule_file("two.yara", (self.source / "pack.yara").read_text())
+        other.install("two", [two],
+                      other.admit("two", [two], self.clean_corpus(), licence="MIT"),
+                      licence="MIT")
+
+        # self.store has never seen "two". Mutating it must not erase it.
+        self.store.set_trusted("one", True)
+        final = PackStore(directory=self.store.directory,
+                          index_path=self.store.index_path)
+        self.assertEqual({p.name for p in final.packs()}, {"one", "two"})

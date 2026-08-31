@@ -20,7 +20,30 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# Isolate the data directory BEFORE avguard is imported.
+#
+# config computes DATA_DIR at import time, so this has to happen first. Without
+# it, any object built with its default path -- Scanner's Allowlist,
+# QuarantineStore's, a PackStore -- reaches into the real
+# %LOCALAPPDATA%/AVGuard. The suite silently wrote seven entries into the
+# user's live allowlist that way, one of them the hash of SELFTEST_MARKER,
+# which then suppressed its own detection and broke four unrelated tests.
+#
+# Patching each construction was tried first and missed one. Isolating the
+# directory is the fix that cannot be missed.
+import os as _os
+import tempfile as _tempfile
+
+# Per run, not a fixed path: a shared directory accumulates state between
+# runs, and a stale allowlist entry from one run silently broke the next.
+_os.environ.setdefault(
+    "AVGUARD_DATA",
+    _os.path.join(_tempfile.gettempdir(), f"avguard-test-data-{_os.getpid()}"))
+
+
+
 from avguard import config
+from avguard.allowlist import Allowlist
 from avguard.cloud import TokenBucket, VirusTotalClient
 from avguard.protection import SelfProtection, matches_excluded_glob
 from avguard.quarantine import QuarantineError, QuarantineStore, _mask
@@ -36,6 +59,27 @@ RULES = Path(__file__).resolve().parent.parent / "rules" / "malware.yara"
 # handler and scroll past the actual test results.
 logging.getLogger("avguard").addHandler(logging.NullHandler())
 logging.getLogger("avguard").propagate = False
+
+
+def _refuse_to_touch_real_data() -> None:
+    """Fail loudly if a test is about to write into the user's real data.
+
+    The suite silently wrote seven entries into
+    %LOCALAPPDATA%/AVGuard/allowlist.json, because QuarantineStore builds a
+    default Allowlist when it is not handed one. One of those entries was the
+    hash of SELFTEST_MARKER, which then suppressed its own detection and broke
+    four unrelated tests. A test that reaches into a user's real state is not
+    a test, it is a side effect with an assertion attached.
+    """
+    import os
+    from avguard import config
+    override = os.getenv("AVGUARD_DATA")
+    if not override:
+        return
+    if not str(config.DATA_DIR).startswith(str(pathlib.Path(override).resolve())):
+        raise RuntimeError(
+            f"AVGUARD_DATA is set to {override} but config.DATA_DIR is "
+            f"{config.DATA_DIR}; the suite would write to the real location")
 
 
 class TempCase(unittest.TestCase):
@@ -273,7 +317,7 @@ class TestQuarantine(TempCase):
             directory=self.qdir,
             index_path=self.qdir / "index.json",
             protection=self.protection,
-        )
+            allowlist=Allowlist(path=self.tmp / 'allow.json'))
 
     def test_quarantine_then_restore_round_trips_exactly(self):
         original = b"\x00\x01payload bytes\xff" * 40
@@ -360,7 +404,8 @@ class TestQuarantine(TempCase):
         record = self.store.quarantine(target, ["reason"])
         reopened = QuarantineStore(directory=self.qdir,
                                    index_path=self.qdir / "index.json",
-                                   protection=self.protection)
+                                   protection=self.protection,
+                                       allowlist=Allowlist(path=self.tmp / 'allow.json'))
         self.assertEqual(len(reopened), 1)
         self.assertEqual(reopened.get(record.entry_id).reasons, ["reason"])
 
@@ -368,7 +413,8 @@ class TestQuarantine(TempCase):
         (self.qdir / "index.json").write_text("{ this is not json")
         store = QuarantineStore(directory=self.qdir,
                                 index_path=self.qdir / "index.json",
-                                protection=self.protection)
+                                protection=self.protection,
+                                    allowlist=Allowlist(path=self.tmp / 'allow.json'))
         self.assertEqual(len(store), 0)
 
     def test_refuses_to_quarantine_a_protected_file(self):
@@ -717,7 +763,8 @@ class TestConcurrentQuarantine(TempCase):
 
     def store(self):
         return QuarantineStore(directory=self.qdir, index_path=self.qdir / "index.json",
-                               protection=self.protection)
+                               protection=self.protection,
+                                   allowlist=Allowlist(path=self.tmp / 'allow.json'))
 
     def test_a_stale_second_store_does_not_erase_the_first(self):
         gui, cli = self.store(), self.store()      # both opened before either writes

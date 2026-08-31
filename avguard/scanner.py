@@ -92,7 +92,7 @@ SUSPICIOUS_AT = 50
 # Learned by shipping it: the archive inspector stopped calling large resource
 # packs "hostile", and the machine kept reporting the old verdict because the
 # generation hash only covered the rule file.
-DETECTION_VERSION = 8
+DETECTION_VERSION = 9
 
 # Heuristics never add up to a condemnation, however many of them agree.
 #
@@ -383,6 +383,7 @@ class Scanner:
         cache: ScanCache | None = None,
         cloud_lookup: Callable[[str, Path], list[str]] | None = None,
         packs: "rulepacks.PackStore | None" = None,
+        allowlist: "allowlist_module.Allowlist | None" = None,
     ) -> None:
         self.cfg = cfg
         self.protection = protection
@@ -392,7 +393,12 @@ class Scanner:
         self.rules = None
         self.rule_sources: list[Path] = []
         self.signatures = signing.SignatureChecker()
-        self.allowlist = allowlist_module.Allowlist()
+        # Injectable for the same reason the pack store is. The quarantine
+        # store records a restore into ITS allowlist and the scanner reads
+        # ITS own: two objects over one file, so in the running GUI a restored
+        # file was re-detected on the very next scan. The decision never
+        # reached the code that needed it.
+        self.allowlist = allowlist if allowlist is not None else allowlist_module.Allowlist()
         # Injectable, so a caller can scan without whatever packs happen to be
         # installed on this machine. Reaching into global state by default made
         # three tests fail the moment a real pack was added.

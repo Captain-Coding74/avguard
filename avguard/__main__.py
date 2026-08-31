@@ -29,7 +29,8 @@ def _console_scan(target: Path, quarantine_threats: bool, verbose: bool) -> int:
     protection = SelfProtection()
     cloud = VirusTotalClient(cfg)
     scanner = Scanner(cfg, protection, cloud_lookup=cloud.reasons_for)
-    store = QuarantineStore(protection=protection)
+    store = QuarantineStore(protection=protection,
+                            allowlist=scanner.allowlist)
 
     if not scanner.rules:
         print("warning: YARA rules did not load; detection is reduced", file=sys.stderr)

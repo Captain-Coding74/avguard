@@ -31,10 +31,12 @@ class SettingsDialog(tb.Toplevel):
     file, where changing them is a deliberate act.
     """
 
-    def __init__(self, parent, cfg: config.Config, on_saved) -> None:
+    def __init__(self, parent, cfg: config.Config, on_saved,
+                 pack_store=None, on_packs_changed=None) -> None:
         super().__init__(title="Settings", transient=parent, resizable=(False, False))
         self.cfg = cfg
         self._on_saved = on_saved
+        self._on_packs_changed = on_packs_changed
 
         body = tb.Frame(self, padding=18)
         body.pack(fill=BOTH, expand=True)
@@ -123,7 +125,9 @@ class SettingsDialog(tb.Toplevel):
         packs_frame = tb.Labelframe(body, text="Rule packs", padding=12)
         packs_frame.pack(fill=X, pady=8)
 
-        self.pack_store = rulepacks.PackStore()
+        # Handed the scanner's store, not a second one. A private copy
+        # wrote trust changes to disk that the running scanner never saw.
+        self.pack_store = pack_store if pack_store is not None else rulepacks.PackStore()
         self.pack_list = tk.Listbox(packs_frame, height=3, bg="#12161c", fg="#cfd8dc",
                                     relief="flat", highlightthickness=0)
         self.pack_list.pack(fill=X)
@@ -190,6 +194,8 @@ class SettingsDialog(tb.Toplevel):
                 return
         try:
             self.pack_store.set_trusted(pack.name, trusted)
+            if self._on_packs_changed:
+                self._on_packs_changed()
         except rulepacks.PackError as exc:
             Messagebox.show_error(str(exc), "AVGuard", parent=self)
             return
@@ -204,6 +210,8 @@ class SettingsDialog(tb.Toplevel):
                 "Remove this pack?", parent=self) != "Yes":
             return
         self.pack_store.remove(pack.name)
+        if self._on_packs_changed:
+            self._on_packs_changed()
         self._refresh_packs()
 
     def _add_watch(self) -> None:

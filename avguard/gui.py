@@ -71,15 +71,23 @@ class AVGuardApp(tb.Window):
 
         self.cfg = config.Config.load()
         self.protection = SelfProtection()
-        self.quarantine = QuarantineStore(protection=self.protection)
         self.events = EventStore()
 
         self.cloud = VirusTotalClient(self.cfg)
+        # The Scanner is built FIRST and owns the shared state. The quarantine
+        # store and the settings dialog are handed its objects rather than
+        # constructing their own. Two Allowlists over one file meant a restore
+        # was recorded in one and read from the other, so a restored file was
+        # re-detected on the very next scan -- the exact failure the allowlist
+        # exists to prevent. Two PackStores meant a trust change in Settings
+        # never reached the running scanner.
         self.scanner = Scanner(
             self.cfg,
             self.protection,
             cloud_lookup=self.cloud.reasons_for,
         )
+        self.quarantine = QuarantineStore(protection=self.protection,
+                                          allowlist=self.scanner.allowlist)
         # Adopt the Scanner's cache rather than handing it one. Building a
         # ScanCache here meant it had no generation, and a cache with no
         # generation accepted verdicts written under any ruleset for the full
@@ -757,7 +765,23 @@ class AVGuardApp(tb.Window):
     # ------------------------------------------------------------- windows
 
     def _show_settings(self) -> None:
-        dialogs.SettingsDialog(self, self.cfg, self._settings_saved)
+        dialogs.SettingsDialog(self, self.cfg, self._settings_saved,
+                               pack_store=self.scanner.packs,
+                               on_packs_changed=self._packs_changed)
+
+    def _packs_changed(self) -> None:
+        """A pack was trusted, untrusted or removed. Adopt it now.
+
+        Trust changes must not wait for Save: the dialog writes to disk
+        immediately, and until the ruleset is recompiled the running scanner
+        keeps scoring by the old trust state. The dangerous direction is
+        trusted to reports-only -- a user turning a pack off after a false
+        positive, while it carries on condemning.
+        """
+        self.scanner.reload_rules()
+        self.scanner.rekey_cache()
+        self.cache = self.scanner.cache
+        log.info("rule packs changed; ruleset and cache rebuilt")
 
     def _settings_saved(self) -> None:
         """Apply what can be applied live, and say what cannot."""

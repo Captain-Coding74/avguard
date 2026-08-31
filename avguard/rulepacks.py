@@ -154,6 +154,17 @@ class PackStore:
         payload = {k: asdict(v) for k, v in self._packs.items()}
         config.atomic_write_text(self.index_path, json.dumps(payload, indent=2))
 
+    def reload(self) -> None:
+        """Re-read the index, so another owner's change is visible.
+
+        Settings built its own PackStore and wrote trust changes to disk that
+        the running scanner never saw. The dangerous direction is trusted to
+        reports-only: a user turns a pack off after a false positive and it
+        keeps condemning for the rest of the session.
+        """
+        with self._lock:
+            self._load()
+
     def pack_dir(self, name: str) -> Path:
         return self.directory / _safe_name(name)
 
@@ -315,6 +326,7 @@ class PackStore:
 
         safe = _safe_name(name)
         with self._lock:
+            self._load()   # never write over another owner's change
             destination = self.pack_dir(safe)
             if destination.exists():
                 shutil.rmtree(destination, ignore_errors=True)
@@ -348,6 +360,7 @@ class PackStore:
     def remove(self, name: str) -> bool:
         safe = _safe_name(name)
         with self._lock:
+            self._load()   # never write over another owner's change
             if safe not in self._packs:
                 return False
             shutil.rmtree(self.pack_dir(safe), ignore_errors=True)
@@ -364,6 +377,7 @@ class PackStore:
         """
         safe = _safe_name(name)
         with self._lock:
+            self._load()   # never write over another owner's change
             pack = self._packs.get(safe)
             if pack is None:
                 raise PackError(f"no rule pack called {name!r}")

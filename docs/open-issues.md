@@ -38,8 +38,34 @@ Ranked by the same rule as everything else in this project:
 | 14 | The Health view understated what rules were loaded | `tests/test_rulepacks.py` |
 | 15 | `--no-gui-deps` blocked nothing, so its passes were unearned | `tests/test_tier3.py` |
 | 16 | **An unpromoted rule pack could quarantine a file, if it was zipped** | `tests/test_rulepacks.py` |
+| 17 | A restore was recorded in one Allowlist and read from another, so it never took effect | `tests/test_rulepacks.py` |
+| 18 | Settings wrote pack trust changes the running scanner never saw | `tests/test_rulepacks.py` |
+| 19 | **The test suite wrote into the user's real allowlist** | every test module isolates `AVGUARD_DATA` |
 
 ### Notes worth keeping
+
+**Shared state with two owners (17, 18, 19).** Three faults, one shape: an
+object that backs a file on disk was constructed twice.
+
+`Scanner` and `QuarantineStore` each built their own `Allowlist`, so `restore()`
+recorded a decision in one and `scan()` read from the other. In the running GUI
+a restored file was re-detected on the very next scan -- the exact failure the
+allowlist exists to prevent. `Allowlist.reload()` had been written for this and
+had **zero call sites**. Settings built its own `PackStore` the same way, so
+turning a pack off after a false positive wrote to disk while the scanner
+carried on condemning.
+
+Neither was visible to the tests, because the tests wired the objects together
+themselves. They exercised an arrangement no entry point builds.
+
+The third was worse. Because `QuarantineStore` builds a default `Allowlist`
+when it is not handed one, the suite had been writing into the user's live
+`%LOCALAPPDATA%/AVGuard/allowlist.json` -- seven entries, one of them the hash
+of `SELFTEST_MARKER`, which then suppressed its own detection and broke four
+unrelated tests. Patching each construction was tried first and missed one.
+Every test module now sets `AVGUARD_DATA` to a per-run directory *before*
+importing avguard, which is the fix that cannot be missed: a shared fixed path
+also accumulated state between runs.
 
 **The archive path (16).** The headline guarantee of rule packs is that an
 imported rule cannot move a file until the pack is promoted by name. It held
