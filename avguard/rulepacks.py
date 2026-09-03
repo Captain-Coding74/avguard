@@ -41,6 +41,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import shutil
 import threading
 from dataclasses import asdict, dataclass, field
@@ -48,7 +49,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import config
-from .protection import path_within
+from .protection import path_within, same_path
 
 log = logging.getLogger(__name__)
 
@@ -92,6 +93,10 @@ class RulePack:
     # Until this is set, every rule in the pack is capped to medium and so can
     # never reach the quarantine threshold on its own.
     trusted: bool = False
+
+    # The name the user typed. `name` is the directory-safe form of it, and
+    # two different typed names can sanitise to the same directory.
+    display_name: str = ""
 
     notes: list[str] = field(default_factory=list)
 
@@ -326,28 +331,99 @@ class PackStore:
         return result
 
     def install(self, name: str, rule_files: list[Path], admission: Admission,
-                source: str = "", licence: str = "") -> RulePack:
-        """Copy an admitted pack into place and record what was measured."""
+                source: str = "", licence: str = "", replace: bool = False) -> RulePack:
+        """Copy an admitted pack into place and record what was measured.
+
+        Transactional. The first version did `rmtree(destination)` before it
+        had read a single source byte, so three things went wrong:
+
+          * installing a pack from its own directory -- a plausible way to
+            refresh one -- deleted every rule file and then raised, leaving
+            the index still claiming the pack was there
+          * two typed names that sanitise to one directory clobbered each
+            other, and the second install silently threw away a pack the
+            user had promoted, trust flag and all
+          * a pack that compiled in its source folder thanks to a relative
+            `include` was admitted, copied flat, and never compiled again
+
+        Now the files are copied into a staging directory beside the
+        destination, compiled FROM that copy, and only then swapped into
+        place. Any failure leaves the previous pack and the index untouched.
+        """
         if not admission.accepted:
             raise PackError("refusing to install a pack that was not admitted")
+        if yara is None:
+            raise PackError("yara-python is not installed")
+        if not rule_files:
+            raise PackError("the pack contains no rule files")
 
         safe = _safe_name(name)
+        destination = self.pack_dir(safe)
+
+        for path in rule_files:
+            if path_within(path, destination) or same_path(path, destination):
+                raise PackError(
+                    f"{path.name} is already inside the installed pack {safe!r}; "
+                    "refusing to install a pack over itself")
+
+        seen: dict[str, Path] = {}
+        for path in rule_files:
+            if path.name in seen:
+                raise PackError(
+                    f"two source files would both be installed as {path.name!r}: "
+                    f"{seen[path.name]} and {path}")
+            seen[path.name] = path
+
         with self._lock:
             self._load()   # never write over another owner's change
-            destination = self.pack_dir(safe)
-            if destination.exists():
-                shutil.rmtree(destination, ignore_errors=True)
-            destination.mkdir(parents=True, exist_ok=True)
+            existing = self._packs.get(safe)
+            if existing is not None and not replace:
+                typed = existing.display_name or existing.name
+                raise PackError(
+                    f"a pack is already installed as {safe!r} (added as {typed!r}); "
+                    "remove it first, or install with replace=True")
 
-            digest = hashlib.sha256()
-            for path in sorted(rule_files, key=lambda p: p.name):
-                data = path.read_bytes()
-                digest.update(path.name.encode())
-                digest.update(data)
-                (destination / path.name).write_bytes(data)
+            staging = self.directory / f".{safe}.staging"
+            backup = self.directory / f".{safe}.previous"
+            for leftover in (staging, backup):
+                if leftover.exists():
+                    shutil.rmtree(leftover, ignore_errors=True)
+            staging.mkdir(parents=True)
+
+            try:
+                digest = hashlib.sha256()
+                for path in sorted(rule_files, key=lambda p: p.name):
+                    data = path.read_bytes()
+                    digest.update(path.name.encode())
+                    digest.update(data)
+                    (staging / path.name).write_bytes(data)
+
+                staged = sorted(staging.glob("*.yara")) + sorted(staging.glob("*.yar"))
+                try:
+                    yara.compile(filepaths={str(f.resolve()): str(f) for f in staged})
+                except yara.Error as exc:
+                    raise PackError(
+                        "the pack was admitted but does not compile once installed "
+                        "-- most likely an `include` of a file outside the pack: "
+                        f"{exc}") from exc
+
+                if destination.exists():
+                    os.replace(destination, backup)
+                try:
+                    os.replace(staging, destination)
+                except OSError:
+                    if backup.exists():
+                        os.replace(backup, destination)
+                    raise
+                if backup.exists():
+                    shutil.rmtree(backup, ignore_errors=True)
+            except BaseException:
+                shutil.rmtree(staging, ignore_errors=True)
+                raise
 
             pack = RulePack(
                 name=safe,
+                display_name=name,
                 source=source,
                 licence=licence,
                 sha256=digest.hexdigest(),

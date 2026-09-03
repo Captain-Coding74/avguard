@@ -679,3 +679,138 @@ class TestEditingAnInstalledPackIsNoticed(TempCase):
         self.assertNotEqual(before, scanner.detection_generation(),
                             "an edited pack must invalidate the cache")
 
+
+class TestInstallIsTransactional(TempCase):
+    """install() used to rmtree the destination before reading a source byte.
+
+    Three things fell out, all verified before this was written:
+
+      * re-installing a pack from its own directory emptied it and then
+        raised, with the index still claiming the pack was there
+      * "ReversingLabs 2024" and "ReversingLabs+2024" sanitise to the same
+        directory, and the second install silently overwrote the first --
+        including its trusted flag
+      * a pack that compiled in its source folder via a relative `include`
+        was admitted, copied flat, and never compiled again
+
+    Now the pack is staged, compiled FROM the staged copy, and swapped into
+    place last. Any failure leaves the previous pack and the index untouched.
+    """
+
+    OK = Admission(accepted=True, rule_count=1, corpus_size=1)
+
+    def _rule(self, name: str, needle: str, folder: str = "") -> Path:
+        directory = self.source / folder if folder else self.source
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / name
+        path.write_text("\n".join([
+            f"rule R_{needle.replace('-', '_')} {{",
+            "  meta:",
+            '    description = "d"',
+            '    severity = "medium"',
+            "  strings:",
+            f'    $a = "{needle}"',
+            "  condition:",
+            "    $a",
+            "}",
+        ]), encoding="utf-8")
+        return path
+
+    def test_a_name_collision_is_refused_not_clobbered(self):
+        first = self._rule("a.yara", "zz-first")
+        self.store.install("ReversingLabs 2024", [first], self.OK, licence="MIT")
+        self.store.set_trusted("ReversingLabs 2024", True)
+
+        second = self._rule("b.yara", "zz-second")
+        with self.assertRaises(PackError) as caught:
+            self.store.install("ReversingLabs+2024", [second], self.OK, licence="MIT")
+        self.assertIn("already installed", str(caught.exception))
+        self.assertIn("ReversingLabs 2024", str(caught.exception),
+                      "the refusal must name what the user actually typed")
+
+        survivor = self.store.packs()
+        self.assertEqual(len(survivor), 1)
+        self.assertTrue(survivor[0].trusted, "the promoted pack lost its trust flag")
+        self.assertEqual([f.name for f in self.store.rule_files_for(survivor[0].name)],
+                         ["a.yara"])
+
+    def test_replace_is_an_explicit_choice(self):
+        first = self._rule("a.yara", "zz-first")
+        self.store.install("vendor", [first], self.OK, licence="MIT")
+        second = self._rule("b.yara", "zz-second")
+        pack = self.store.install("vendor", [second], self.OK, licence="MIT",
+                                  replace=True)
+        self.assertEqual([f.name for f in self.store.rule_files_for(pack.name)],
+                         ["b.yara"])
+
+    def test_installing_a_pack_over_itself_is_refused(self):
+        """Re-installing from the pack's own directory used to empty it."""
+        self.store.install("vendor", [self._rule("a.yara", "zz-a")], self.OK,
+                           licence="MIT")
+        own_files = self.store.rule_files_for("vendor")
+        with self.assertRaises(PackError) as caught:
+            self.store.install("vendor", own_files, self.OK, licence="MIT",
+                               replace=True)
+        self.assertIn("over itself", str(caught.exception))
+        self.assertEqual([f.name for f in self.store.rule_files_for("vendor")],
+                         ["a.yara"], "the pack was emptied")
+
+    def test_a_pack_needing_an_include_is_refused_at_install(self):
+        """Admitted in its source folder, it would never compile once copied."""
+        (self.source / "lib").mkdir()
+        (self.source / "lib" / "base.yar").write_text(
+            'rule Base { meta: description="d" strings: $a="zz-base" condition: $a }',
+            encoding="utf-8")
+        main = self.source / "main.yara"
+        main.write_text('include "./lib/base.yar"\n'
+                        'rule Main { meta: description="d" strings: $a="zz-main" '
+                        'condition: $a }', encoding="utf-8")
+
+        admission = self.store.admit("inc", [main], self.clean_corpus(), licence="MIT")
+        self.assertTrue(admission.accepted, "it does compile where it lives")
+
+        with self.assertRaises(PackError) as caught:
+            self.store.install("inc", [main], admission, licence="MIT")
+        self.assertIn("does not compile once installed", str(caught.exception))
+        self.assertIsNone(self.store.get("inc"))
+        self.assertFalse(self.store.pack_dir("inc").exists(),
+                         "a refused install must leave nothing behind")
+
+    def test_a_failed_replace_leaves_the_previous_pack_intact(self):
+        good = self._rule("a.yara", "zz-good")
+        self.store.install("vendor", [good], self.OK, licence="MIT")
+        self.store.set_trusted("vendor", True)
+
+        broken = self.source / "broken.yara"
+        broken.write_text('include "./nowhere.yar"\nrule X { condition: true }',
+                          encoding="utf-8")
+        with self.assertRaises(PackError):
+            self.store.install("vendor", [broken], self.OK, licence="MIT",
+                               replace=True)
+
+        pack = self.store.get("vendor")
+        self.assertIsNotNone(pack)
+        self.assertTrue(pack.trusted)
+        self.assertEqual([f.name for f in self.store.rule_files_for("vendor")],
+                         ["a.yara"])
+
+    def test_duplicate_basenames_are_refused(self):
+        one = self._rule("x.yara", "zz-one", folder="a")
+        two = self._rule("x.yara", "zz-two", folder="b")
+        with self.assertRaises(PackError) as caught:
+            self.store.install("vendor", [one, two], self.OK, licence="MIT")
+        self.assertIn("both be installed as", str(caught.exception))
+
+    def test_the_typed_name_is_kept_beside_the_safe_one(self):
+        pack = self.store.install("ReversingLabs 2024", [self._rule("a.yara", "zz-a")],
+                                  self.OK, licence="MIT")
+        self.assertEqual(pack.display_name, "ReversingLabs 2024")
+        self.assertNotEqual(pack.name, pack.display_name)
+
+    def test_no_staging_directory_is_left_behind(self):
+        self.store.install("vendor", [self._rule("a.yara", "zz-a")], self.OK,
+                           licence="MIT")
+        leftovers = [d.name for d in self.store.directory.iterdir()
+                     if d.name.startswith(".")]
+        self.assertEqual(leftovers, [])
+

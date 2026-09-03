@@ -105,6 +105,8 @@ def _packs_command(args) -> int:
             return 0
         for pack in packs:
             print(f"{pack.name}")
+            if pack.display_name and pack.display_name != pack.name:
+                print(f"    added as: {pack.display_name}")
             print(f"    rules   : {pack.rule_count} in {pack.file_count} file(s)")
             print(f"    measured: {pack.false_positive_rate:.2%} of "
                   f"{pack.corpus_size} clean files flagged, when it was added")
@@ -139,8 +141,14 @@ def _packs_command(args) -> int:
         if not admission.accepted:
             print("Refused. Nothing was installed.", file=sys.stderr)
             return 1
-        pack = store.install(name, files, admission,
-                             source=str(folder), licence=args.licence)
+        try:
+            pack = store.install(name, files, admission,
+                                 source=str(folder), licence=args.licence)
+        except (rulepacks.PackError, OSError) as exc:
+            # A refusal is an answer, not a traceback.
+            print(f"Refused: {exc}", file=sys.stderr)
+            print("Nothing was installed.", file=sys.stderr)
+            return 1
         print(f"Installed {pack.name}.")
         print("It reports only. Nothing it finds will be moved until you run:")
         print(f"    python -m avguard --packs trust {pack.name}")

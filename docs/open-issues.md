@@ -43,8 +43,28 @@ Ranked by the same rule as everything else in this project:
 | 19 | **The test suite wrote into the user's real allowlist** | every test module isolates `AVGUARD_DATA` |
 | 20 | **One broken pack file switched off every rule, the shipped ones included** | `tests/test_rulepacks.py` |
 | 21 | Editing an installed pack left the cache generation unchanged | `tests/test_rulepacks.py` |
+| 22 | Two pack names that sanitise alike: the second install silently overwrote a promoted pack | `tests/test_rulepacks.py` |
+| 23 | Re-installing a pack from its own directory emptied it | `tests/test_rulepacks.py` |
+| 24 | A pack using `include` was admitted, then never compiled once installed | `tests/test_rulepacks.py` |
 
 ### Notes worth keeping
+
+**install() was not a transaction (22, 23, 24).** It ran `rmtree(destination)`
+before reading a single source byte. Re-installing a pack from its own
+directory -- a plausible way to refresh one -- deleted every rule file and then
+raised, leaving the index still claiming the pack existed. "ReversingLabs 2024"
+and "ReversingLabs+2024" sanitise to one directory, so the second install
+silently threw away the first, trusted flag and all. And a pack that compiled
+in its source folder via a relative `include` was admitted, copied flat, and
+never compiled again -- an `Admission` was a boolean, not a receipt for what
+was actually installed.
+
+The pack is staged beside its destination, compiled FROM the staged copy, and
+swapped into place last; any failure leaves the previous pack and the index
+untouched. Collisions and self-overwrites are refused by name, with the name
+the user actually typed kept beside the directory-safe one. The smoke check
+now runs a full `--packs` round trip; the audit noted it had never invoked
+`--packs` at all.
 
 **One compile for everything (20, 21).** `load_rules()` promised "a bad rule
 should cost you that rule, not all detection" and compiled every file in one

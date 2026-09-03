@@ -124,6 +124,51 @@ def main() -> int:
         check("a restored file is not taken again", "MALICIOUS" not in output,
               f"the restored file was flagged again: {output[-400:]}")
 
+    # --- rule packs: add, list, verify, refuse a duplicate, trust, remove -----
+    # The audit noted ci_smoke never invoked --packs at all, so a CLI-only
+    # breakage in the one feature that runs somebody else's code would have
+    # reached users before it reached CI.
+    pack_src = work / "packsrc"
+    pack_src.mkdir()
+    (pack_src / "smoke.yara").write_text(
+        "rule Smoke_Pack_Rule {\n"
+        "  meta:\n"
+        '    description = "smoke test rule"\n'
+        '    severity = "medium"\n'
+        "  strings:\n"
+        '    $a = "zz-smoke-needle-9c1e"\n'
+        "  condition:\n"
+        "    $a\n"
+        "}\n", encoding="utf-8")
+
+    code, output = run("--packs", "add", str(pack_src), "smokepack", "--licence", "MIT")
+    check("--packs add admits a clean pack", code == 0,
+          f"exit {code}: {output[-400:]}")
+
+    code, listing = run("--packs", "list")
+    check("--packs list shows the pack", "smokepack" in listing, listing[-300:])
+    check("a new pack reports only", "reports only" in listing, listing[-300:])
+
+    code, output = run("--packs", "add", str(pack_src), "smokepack", "--licence", "MIT")
+    check("adding the same pack again is refused", code != 0,
+          "a duplicate install must be refused, not silently overwrite")
+    check("the refusal is a message, not a traceback",
+          "Traceback" not in output and "already installed" in output,
+          output[-400:])
+
+    code, output = run("--packs", "verify")
+    check("--packs verify passes a clean pack", code == 0, output[-300:])
+
+    code, output = run("--packs", "trust", "smokepack")
+    check("--packs trust exits 0", code == 0, output[-300:])
+    code, listing = run("--packs", "list")
+    check("a trusted pack says so", "trusted : True" in listing, listing[-300:])
+
+    code, output = run("--packs", "remove", "smokepack")
+    check("--packs remove exits 0", code == 0, output[-300:])
+    code, listing = run("--packs", "list")
+    check("a removed pack is gone", "smokepack" not in listing, listing[-300:])
+
     # --- the other commands at least run ------------------------------------
     for args, label in (
         (("--reload-rules",), "--reload-rules exits 0"),
