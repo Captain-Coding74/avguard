@@ -895,17 +895,63 @@ class TestAnExceptionCanBeUndone(TempCase):
 
         digest = hashlib.sha256(SELFTEST_MARKER).hexdigest()
         self.allowlist.add(digest, "kept.bin", ["marker"])
-        # The cache does not know yet. This is why the GUI re-keys.
-        self.assertIs(self.scanner.scan(elsewhere).level, Level.MALICIOUS)
-        self.scanner.rekey_cache()
+        # Round two needed a re-key here; round three made a cache hit defer
+        # to the allowlist by digest, so the copy follows the decision at once.
         verdict = self.scanner.scan(elsewhere)
         self.assertIs(verdict.level, Level.CLEAN)
         self.assertIn("you chose to keep", verdict.reasons[0])
 
         # And undone: the copy is judged on its bytes again.
         self.assertTrue(self.allowlist.remove(digest))
-        self.scanner.rekey_cache()
         self.assertIs(self.scanner.scan(elsewhere).level, Level.MALICIOUS)
+
+
+class TestADecisionFromAnotherProcessIsSeen(TempCase):
+    """`avguard --restore` in a terminal while the GUI is running. Measured
+    before this: the running scanner kept saying MALICIOUS with the cache on,
+    with it off, and for a fresh copy of the bytes -- and with automatic
+    quarantine on it would have taken the restored file straight back."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        from avguard.allowlist import Allowlist
+        self.allow_path = self.tmp / "allow.json"
+        self.scanner = Scanner(config.Config(cloud_enabled=False),
+                               SelfProtection([self.tmp / "prot"]),
+                               rules_path=RULES,
+                               cache=ScanCache(path=self.tmp / "c.json"),
+                               packs=_empty_packs(self.tmp),
+                               allowlist=Allowlist(path=self.allow_path))
+
+    def _other_process(self):
+        """A second Allowlist on the same file, standing in for the CLI."""
+        from avguard.allowlist import Allowlist
+        return Allowlist(path=self.allow_path)
+
+    def test_a_restore_recorded_elsewhere_is_honoured_without_a_reload(self):
+        from avguard.scanner import Level, SELFTEST_MARKER
+        target = self.write("restored.bin", SELFTEST_MARKER)
+        self.assertIs(self.scanner.scan(target).level, Level.MALICIOUS)  # now cached
+
+        digest = hashlib.sha256(SELFTEST_MARKER).hexdigest()
+        self._other_process().add(digest, "restored.bin", ["marker"])
+
+        verdict = self.scanner.scan(target)  # cache on; nobody called reload
+        self.assertIs(verdict.level, Level.CLEAN)
+        self.assertIn("you chose to keep", verdict.reasons[0])
+        copy = self.write("copy.bin", SELFTEST_MARKER)
+        self.assertIs(self.scanner.scan(copy).level, Level.CLEAN)
+
+    def test_an_exception_withdrawn_elsewhere_is_honoured_too(self):
+        from avguard.scanner import Level, SELFTEST_MARKER
+        target = self.write("restored.bin", SELFTEST_MARKER)
+        digest = hashlib.sha256(SELFTEST_MARKER).hexdigest()
+        other = self._other_process()
+        other.add(digest, "restored.bin", ["marker"])
+        self.assertIs(self.scanner.scan(target).level, Level.CLEAN)  # cached, by exception
+
+        self.assertTrue(other.remove(digest))
+        self.assertIs(self.scanner.scan(target).level, Level.MALICIOUS)
 
 
 if __name__ == "__main__":

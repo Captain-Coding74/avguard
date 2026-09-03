@@ -86,6 +86,21 @@ def configure(gui_queue: queue.Queue | None = None, level: int = logging.INFO) -
     return logger
 
 
+def close_file_handlers() -> None:
+    """Close the log file.
+
+    A command-line verb that returns without doing this holds the file open
+    until the interpreter exits. test_cli left a directory behind for every
+    test that way, deletable only once the next test's configure() had
+    closed the previous handler.
+    """
+    logger = logging.getLogger("avguard")
+    for handler in list(logger.handlers):
+        if isinstance(handler, RotatingFileHandler):
+            logger.removeHandler(handler)
+            handler.close()
+
+
 def log_path() -> Path:
     return config.LOG_DIR / "avguard.log"
 

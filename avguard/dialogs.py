@@ -45,9 +45,20 @@ class SettingsDialog(tb.Toplevel):
 
         tb.Label(body, text="Settings", font=("Segoe UI", 14, "bold")).pack(anchor="w")
 
+        # Tabs, because the flat version asked for 1,438 px on a 1,080 px
+        # screen -- Save and Cancel sat below the bottom edge of a laptop
+        # display and the window was not resizable.
+        tabs = tb.Notebook(body)
+        tabs.pack(fill=BOTH, expand=True, pady=(12, 0))
+        pages: dict[str, tb.Frame] = {}
+        for name in ("Protection", "Folders", "Running by itself", "Rule packs", "Kept files"):
+            page = tb.Frame(tabs, padding=(0, 8, 0, 0))
+            tabs.add(page, text=name)
+            pages[name] = page
+
         # --- protection ---------------------------------------------------
-        block = tb.Labelframe(body, text="Protection", padding=12)
-        block.pack(fill=X, pady=(12, 8))
+        block = tb.Labelframe(pages["Protection"], text="Protection", padding=12)
+        block.pack(fill=X, pady=(0, 8))
 
         self.auto_var = tk.BooleanVar(value=cfg.auto_quarantine)
         tb.Checkbutton(block, text="Move detected files into quarantine automatically",
@@ -66,8 +77,8 @@ class SettingsDialog(tb.Toplevel):
                        variable=self.pe_var, bootstyle="round-toggle").pack(anchor="w", pady=2)
 
         # --- watched folders ----------------------------------------------
-        watch = tb.Labelframe(body, text="Folders watched in real time", padding=12)
-        watch.pack(fill=X, pady=8)
+        watch = tb.Labelframe(pages["Folders"], text="Folders watched in real time", padding=12)
+        watch.pack(fill=X, pady=(0, 8))
 
         self.watch_list = tk.Listbox(watch, height=4, bg="#12161c", fg="#cfd8dc",
                                      relief="flat", highlightthickness=0)
@@ -85,7 +96,7 @@ class SettingsDialog(tb.Toplevel):
                  text="Empty means Downloads only.").pack(anchor="w", pady=(6, 0))
 
         # --- exclusions ----------------------------------------------------
-        excl = tb.Labelframe(body, text="Never scanned", padding=12)
+        excl = tb.Labelframe(pages["Folders"], text="Never scanned", padding=12)
         excl.pack(fill=X, pady=8)
 
         self.excl_list = tk.Listbox(excl, height=5, bg="#12161c", fg="#cfd8dc",
@@ -102,8 +113,8 @@ class SettingsDialog(tb.Toplevel):
                   command=lambda: self._remove(self.excl_list)).pack(side=LEFT)
 
         # --- startup and schedule -------------------------------------------
-        auto = tb.Labelframe(body, text="Running by itself", padding=12)
-        auto.pack(fill=X, pady=8)
+        auto = tb.Labelframe(pages["Running by itself"], text="Running by itself", padding=12)
+        auto.pack(fill=X, pady=(0, 8))
 
         state = scheduling.status()
         self.startup_var = tk.BooleanVar(value=state.starts_with_windows)
@@ -124,8 +135,8 @@ class SettingsDialog(tb.Toplevel):
                  ).pack(anchor="w", pady=(6, 0))
 
         # --- rule packs ------------------------------------------------------
-        packs_frame = tb.Labelframe(body, text="Rule packs", padding=12)
-        packs_frame.pack(fill=X, pady=8)
+        packs_frame = tb.Labelframe(pages["Rule packs"], text="Rule packs", padding=12)
+        packs_frame.pack(fill=X, pady=(0, 8))
 
         # Handed the scanner's store, not a second one. A private copy
         # wrote trust changes to disk that the running scanner never saw.
@@ -155,8 +166,8 @@ class SettingsDialog(tb.Toplevel):
         # A restore is a permanent, machine-wide exception for those exact
         # bytes. Until this frame existed it could not be seen or undone: the
         # allowlist's entries() and remove() had no caller outside the tests.
-        keep_frame = tb.Labelframe(body, text="Files you chose to keep", padding=12)
-        keep_frame.pack(fill=X, pady=8)
+        keep_frame = tb.Labelframe(pages["Kept files"], text="Files you chose to keep", padding=12)
+        keep_frame.pack(fill=X, pady=(0, 8))
         # The scanner's allowlist, for the same reason as the pack store.
         self.allowlist = (allowlist if allowlist is not None
                           else allowlist_module.Allowlist())

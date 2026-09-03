@@ -548,16 +548,21 @@ class TestSharedStateHasOneOwner(TempCase):
         self.assertIs(verdict.level, Level.CLEAN)
         self.assertFalse(verdict.is_threat)
 
-    def test_a_second_allowlist_does_not_see_the_first(self):
-        """Pins why sharing is required rather than merely tidy."""
+    def test_a_second_allowlist_sees_the_first_s_decision(self):
+        """This used to pin the opposite: a separate instance could not see a
+        decision without reload(), which is why one owner per process was
+        required. Round three made every instance notice the file changing,
+        because `--restore` in a terminal is a separate process by nature.
+        Sharing within a process is now merely tidy; this pins the guarantee
+        that replaced it."""
         from avguard.allowlist import Allowlist
         shared = self.tmp / "allow.json"
         first, second = Allowlist(path=shared), Allowlist(path=shared)
         first.add("a" * 64, "thing.bin", ["reason"])
-        self.assertIsNone(second.allows("a" * 64),
-                          "a separate instance cannot see it without reload")
-        second.reload()
-        self.assertIsNotNone(second.allows("a" * 64))
+        self.assertIsNotNone(second.allows("a" * 64),
+                             "a decision on disk was not seen by another instance")
+        self.assertTrue(first.remove("a" * 64))
+        self.assertIsNone(second.allows("a" * 64), "and its withdrawal was not seen")
 
     def test_pack_store_reload_picks_up_another_owners_change(self):
         rule = self.simple_rule()

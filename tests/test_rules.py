@@ -107,14 +107,7 @@ MAX_FALSE_POSITIVE_RATE = 0.01      # 1%
 # No clean file may ever reach MALICIOUS. This one is absolute.
 MAX_MALICIOUS_RATE = 0.0
 
-CORPUS_ROOTS = [
-    Path(r"C:\Windows\System32"),
-    Path(r"C:\Windows\SysWOW64"),
-    Path(r"C:\Program Files"),
-    Path(r"C:\Program Files (x86)"),
-]
 CORPUS_SIZE = 400
-CORPUS_MAX_BYTES = 16 * 1024 * 1024
 
 
 def _rule_names(text: str) -> list[str]:
@@ -135,28 +128,14 @@ def _collect_corpus(limit: int = CORPUS_SIZE) -> list[Path]:
     Deliberately drawn from the running system rather than checked in: the
     point is to be surprised by software nobody thought to write a fixture for.
     Sampled deterministically so a failure is reproducible.
+
+    The same builder the rule packs are measured with. This module had its own
+    walk, with the skew round two fixed for packs: 217 of 400 files from
+    System32, 143 from SysWOW64, 40 from five program folders. The shipped
+    rules do not get an easier bar than a stranger's.
     """
-    found: list[Path] = []
-    for root in CORPUS_ROOTS:
-        if not root.is_dir():
-            continue
-        taken = 0
-        for dirpath, dirnames, filenames in os.walk(root):
-            for name in filenames:
-                if not name.lower().endswith((".exe", ".dll")):
-                    continue
-                path = Path(dirpath) / name
-                try:
-                    if path.stat().st_size > CORPUS_MAX_BYTES:
-                        continue
-                except OSError:
-                    continue
-                found.append(path)
-                taken += 1
-            if taken > limit:
-                break
-    random.Random(20240607).shuffle(found)
-    return found[:limit]
+    from avguard.__main__ import _clean_corpus
+    return _clean_corpus(limit=limit)
 
 
 class TestRuleContract(unittest.TestCase):

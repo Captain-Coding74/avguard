@@ -479,5 +479,49 @@ class TestTheLinuxSimulationActuallySimulates(unittest.TestCase):
                         "only find_spec is consulted by the import system")
 
 
+class TestTheSettingsWindowFitsOnAScreen(unittest.TestCase):
+    """Measured before this: 1,438 px requested on a 1,080 px screen, with
+    Save and Cancel below the bottom edge and the window not resizable."""
+
+    def test_requested_height_is_laptop_sized(self):
+        try:
+            import ttkbootstrap as tb
+            from avguard import dialogs
+        except ImportError:
+            self.skipTest("GUI dependencies are not installed")
+        import shutil
+        import tempfile
+        from pathlib import Path
+        from avguard import config
+        from avguard.allowlist import Allowlist
+        from avguard.rulepacks import Admission, PackStore
+
+        tmp = Path(tempfile.mkdtemp(prefix="avguard-dlg-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        try:
+            root = tb.Window(themename="darkly")
+        except Exception as exc:  # no display on this machine
+            self.skipTest(f"no display: {exc}")
+        root.withdraw()
+        try:
+            allow = Allowlist(path=tmp / "allow.json")
+            for index in range(3):
+                allow.add("ab" * 32 + str(index), f"kept{index}.exe", ["marker"])
+            store = PackStore(directory=tmp / "packs", index_path=tmp / "packs" / "packs.json")
+            for name in ("one", "two"):
+                rule = tmp / f"{name}.yara"
+                rule.write_text("rule R" + name + " { condition: false }", encoding="utf-8")
+                store.install(name, [rule], Admission(accepted=True, rule_count=1, corpus_size=1),
+                              licence="MIT")
+            dialog = dialogs.SettingsDialog(root, config.Config(), lambda: None,
+                                            pack_store=store, allowlist=allow)
+            dialog.update_idletasks()
+            width, height = dialog.winfo_reqwidth(), dialog.winfo_reqheight()
+            dialog.destroy()
+        finally:
+            root.destroy()
+        self.assertLess(height, 720, f"Settings asks for {width} x {height} px")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

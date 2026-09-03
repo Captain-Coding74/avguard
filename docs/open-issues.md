@@ -61,8 +61,23 @@ Ranked by the same rule as everything else in this project:
 | 37 | The clean corpus was 83% System32, across six program folders | `tests/test_cli.py` |
 | 38 | `owner_of()` was a linear scan with a path resolution on every YARA match | `tests/test_compiled_cache.py` |
 | 39 | `--no-gui-deps` proved its blocking with one name and passed vacuously without Pillow | `tools/ci_tests.py` self-check |
+| 40 | **A restore made from the command line never reached a running GUI; with auto-quarantine on it would be taken straight back** | `tests/test_durability.py` |
+| 41 | The Settings window asked for 1,438 px on a 1,080 px screen; Save and Cancel were off the bottom | `tests/test_tier3.py` |
+| 42 | The shipped rules were measured against a corpus that was 90% System32 and SysWOW64 | `tests/test_rules.py` |
+| 43 | Every CLI verb held its log file open after returning | `tests/test_cli.py` |
 
 ### Notes worth keeping
+
+**A decision is a decision in every process (40).** Row 19 gave the
+allowlist one owner per process, and the cross-process case was left to a
+`reload()` nobody called. Measured: with the GUI running, `--restore` in a
+terminal recorded the exception and the GUI's scanner went on saying
+MALICIOUS -- cache on, cache off, and for a fresh copy. Two fixes, in
+[next-3.md](next-3.md): the allowlist reloads itself when its file's size or
+mtime has changed (one stat per lookup), and a cache hit defers to the
+allowlist by the digest the entry stores, in both directions -- a cached
+MALICIOUS whose bytes are now allowed is not returned, and a cached CLEAN
+that was clean only by exception is not returned once the exception is gone.
 
 **Round two was measured first (34-39).** The plan, the numbers before, and
 the numbers after are in [next-2.md](next-2.md). Two of the audit's "leave

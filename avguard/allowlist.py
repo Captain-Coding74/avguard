@@ -70,9 +70,19 @@ class Allowlist:
         self.path = Path(path)
         self._lock = threading.Lock()
         self._entries: dict[str, AllowEntry] = {}
+        self._stamp: tuple[int, int] | None = None
         self._load()
 
+    def _disk_stamp(self) -> tuple[int, int] | None:
+        """Size and mtime of the file as it is on disk right now."""
+        try:
+            st = self.path.stat()
+        except OSError:
+            return None
+        return (st.st_size, st.st_mtime_ns)
+
     def _load(self) -> None:
+        self._stamp = self._disk_stamp()
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -103,6 +113,7 @@ class Allowlist:
             config.atomic_write_text(self.path, json.dumps(payload, indent=2))
         except OSError as exc:
             log.warning("could not save the allowlist: %s", exc)
+        self._stamp = self._disk_stamp()
 
     def reload(self) -> None:
         """Pick up decisions another AVGuard process recorded."""
@@ -111,6 +122,14 @@ class Allowlist:
 
     def allows(self, sha256: str) -> AllowEntry | None:
         with self._lock:
+            # Another AVGuard process -- `--restore` in a terminal while the
+            # GUI is running -- records its decisions in this same file.
+            # Measured before this: a running scanner kept condemning bytes
+            # the user had just restored elsewhere, and with automatic
+            # quarantine on would have taken them straight back. One stat()
+            # per lookup is nothing next to the read that precedes it.
+            if self._disk_stamp() != self._stamp:
+                self._load()
             return self._entries.get(sha256)
 
     def add(self, sha256: str, name: str = "", reasons: list[str] | None = None) -> AllowEntry:

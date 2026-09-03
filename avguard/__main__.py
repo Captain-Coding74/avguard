@@ -312,6 +312,15 @@ def _clean_corpus(limit: int = 400, roots: list[Path] | None = None,
 
 
 def main(argv: list[str] | None = None) -> int:
+    logsetup.install_excepthooks()
+    try:
+        return _main(argv)
+    finally:
+        # A command that has returned has no business holding its log open.
+        logsetup.close_file_handlers()
+
+
+def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="avguard", description="A small file scanner.")
     parser.add_argument("--scan", metavar="PATH", type=Path,
                         help="scan a file or folder in the console and exit")
@@ -346,7 +355,6 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"unexpected arguments: {' '.join(args.pack_args)} "
                      "(commands are options, e.g. --scan PATH)")
 
-    logsetup.install_excepthooks()
     config.ensure_directories()
 
     if args.list_quarantine:

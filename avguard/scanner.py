@@ -92,7 +92,7 @@ SUSPICIOUS_AT = 50
 # Learned by shipping it: the archive inspector stopped calling large resource
 # packs "hostile", and the machine kept reporting the old verdict because the
 # generation hash only covered the rule file.
-DETECTION_VERSION = 12
+DETECTION_VERSION = 13
 
 # The ruleset compiled last time, kept between runs. See _adopt_compiled_cache.
 COMPILED_RULES_PATH = config.DATA_DIR / "rules.compiled"
@@ -265,7 +265,7 @@ class ScanCache:
 
     # Bumped whenever a stored verdict would mean something different. Entries
     # written under an older schema are dropped rather than replayed.
-    SCHEMA = 2
+    SCHEMA = 3
 
     def __init__(self, path: Path = config.SCAN_CACHE_PATH, max_entries: int = 20_000,
                  generation: str = "", ttl_days: int = 30):
@@ -374,12 +374,15 @@ class ScanCache:
             return self._entries.get(self._key(path, size, mtime_ns))
 
     def put(self, path: Path, size: int, mtime_ns: int, level: Level,
-            reasons: list[str], sha256: str) -> None:
+            reasons: list[str], sha256: str, allowed: bool = False) -> None:
         with self._lock:
             self._entries[self._key(path, size, mtime_ns)] = {
                 "level": level.value,
                 "reasons": reasons,
                 "sha256": sha256,
+                # CLEAN only because the user said so. Recorded so the entry
+                # can be dropped the moment that decision is withdrawn.
+                "allowed": allowed,
                 "at": time.time(),
             }
 
@@ -1089,6 +1092,20 @@ class Scanner:
 
     # ------------------------------------------------------------- the scan
 
+    def _cache_still_applies(self, cached: dict) -> bool:
+        """A cached verdict is a conclusion; the user's exceptions outrank it.
+
+        The entry records the bytes' digest and whether it was CLEAN only by
+        exception. If the allowlist now says something different about that
+        digest -- a restore recorded, or an exception withdrawn, by another
+        process since the verdict was cached -- the file is judged afresh.
+        Measured before this: a cached MALICIOUS was returned for bytes the
+        user had restored from a terminal a moment earlier.
+        """
+        digest = str(cached.get("sha256", ""))
+        allowed_now = bool(digest) and self.allowlist.allows(digest) is not None
+        return allowed_now == bool(cached.get("allowed"))
+
     def scan(self, path: Path | str, use_cache: bool = True) -> Verdict:
         """Run every stage against one file and return a single verdict."""
         path = Path(path)
@@ -1102,7 +1119,7 @@ class Scanner:
 
         if use_cache:
             cached = self.cache.get(path, size, mtime_ns)
-            if cached:
+            if cached and self._cache_still_applies(cached):
                 return Verdict(path, Level(cached["level"]), list(cached["reasons"]))
 
         try:
@@ -1122,7 +1139,8 @@ class Scanner:
             verdict = Verdict(path, Level.CLEAN, [reason], facts,
                               [Finding("allowlist", "user-decision", 0, reason)])
             if use_cache:
-                self.cache.put(path, size, mtime_ns, Level.CLEAN, [reason], facts.sha256)
+                self.cache.put(path, size, mtime_ns, Level.CLEAN, [reason], facts.sha256,
+                               allowed=True)
             return verdict
 
         findings: list[Finding] = []

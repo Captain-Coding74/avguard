@@ -74,6 +74,10 @@ class CliCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="avguard-cli-"))
         self.addCleanup(_remove_tree, self.tmp)
+        # Cleanups run last-in first-out: the log file is closed before the
+        # directory holding it is removed, or the removal quietly fails.
+        from avguard import logsetup
+        self.addCleanup(logsetup.close_file_handlers)
 
         self._saved_data = os.environ.get("AVGUARD_DATA")
         os.environ["AVGUARD_DATA"] = str(self.tmp / "data")
@@ -283,6 +287,25 @@ class TestTheCorpusSpreadsAcrossPrograms(unittest.TestCase):
         import avguard.__main__ as cli
         alone = cli._clean_corpus(limit=120, roots=[self.system])
         self.assertEqual(len(alone), 120)
+
+
+class TestTheLogIsClosedWhenACommandReturns(unittest.TestCase):
+    """Every CLI verb left the log file open until the interpreter exited;
+    test_cli leaked a directory per test because of it."""
+
+    def test_no_file_handler_survives_main(self):
+        import logging
+        from logging.handlers import RotatingFileHandler
+        import avguard.__main__ as cli
+        tmp = Path(tempfile.mkdtemp(prefix="avguard-cli-"))
+        self.addCleanup(_remove_tree, tmp)
+        sample = tmp / "plain.txt"
+        sample.write_text("nothing to see", encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            cli.main(["--scan", str(sample)])
+        open_logs = [h for h in logging.getLogger("avguard").handlers
+                     if isinstance(h, RotatingFileHandler)]
+        self.assertEqual(open_logs, [], "main() returned with its log file still open")
 
 
 if __name__ == "__main__":
