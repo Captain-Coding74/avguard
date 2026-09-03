@@ -436,8 +436,6 @@ class TestCacheLifecycle(TempCase):
         self.assertLessEqual(len(stored["entries"]), 2)
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
 
 
 # --------------------------------------------- nesting matches its own limit
@@ -529,3 +527,7 @@ class TestEventCounting(TempCase):
         summary = store.summary()
         self.assertEqual(summary["detections"], 1)
         self.assertNotEqual(summary["last_scan"], "never")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

@@ -811,19 +811,23 @@ class AVGuardApp(tb.Window):
         self._banner("History cleared.", "inverse-secondary")
 
     def _describe_rules(self) -> str:
-        """What is actually loaded, not just the shipped file.
+        """What is actually loaded, derived from the compiled ruleset.
 
         This row said "compiled from malware.yara" while 311 files and 1,240
-        imported rules were loaded. The Health view exists to answer whether
-        detection is working, and understating what is loaded is a way of
-        answering it wrongly.
+        imported rules were loaded. Then it summed rule_count from the pack
+        index, so a pack whose directory had been deleted still reported its
+        1,240 rules as loaded. The Health view exists to answer whether
+        detection is working; both were ways of answering it wrongly.
         """
-        total = len(self.scanner.rule_sources)
-        imported = sum(p.rule_count for p in self.scanner.packs.packs())
+        rules = self.scanner.rules
+        total_rules = sum(1 for _ in rules) if rules is not None else 0
+        total_files = len(self.scanner.rule_sources)
+        counts = self.scanner.pack_rule_counts
+        imported = sum(counts.values())
         if not imported:
-            return f"{total} file(s), all shipped with AVGuard"
-        return (f"{total} file(s): the shipped ruleset plus "
-                f"{imported:,} rules from {len(self.scanner.packs.packs())} pack(s)")
+            return f"{total_rules:,} rules from {total_files} file(s), all shipped with AVGuard"
+        return (f"{total_rules:,} rules from {total_files} file(s): the shipped "
+                f"ruleset plus {imported:,} loaded from {len(counts)} pack(s)")
 
     def _describe_packs(self) -> str:
         packs = self.scanner.packs.packs()
@@ -838,9 +842,22 @@ class AVGuardApp(tb.Window):
                 # a log nobody reads. The rest of detection is unaffected.
                 parts.append(f"{pack.name}: FAILED TO COMPILE, left out - {broken[:60]}")
                 continue
+            if not self.scanner.packs.rule_files_for(pack.name):
+                parts.append(f"{pack.name}: DIRECTORY MISSING, 0 rules loaded "
+                             f"(index says {pack.rule_count:,})")
+                continue
+            loaded = self.scanner.pack_rule_counts.get(pack.name, 0)
             state = "can move files" if pack.trusted else "reports only"
-            parts.append(f"{pack.name} ({pack.rule_count:,} rules, {state})")
+            parts.append(f"{pack.name} ({loaded:,} rules loaded, {state})")
         return "; ".join(parts)
+
+    def _packs_ok(self) -> bool:
+        """Red if any pack is broken or has vanished from disk."""
+        if self.scanner.broken_packs:
+            return False
+        return all(self.scanner.packs.rule_files_for(p.name)
+                   for p in self.scanner.packs.packs())
+
     def _show_health(self) -> None:
         """Every row is something that has failed silently before."""
         rules_ok = self.scanner.rules is not None
@@ -850,7 +867,7 @@ class AVGuardApp(tb.Window):
         checks = [
             ("Detection rules", rules_ok, self._describe_rules() if rules_ok
              else "FAILED TO COMPILE - most detection is off. See the log."),
-            ("Rule packs", not self.scanner.broken_packs, self._describe_packs()),
+            ("Rule packs", self._packs_ok(), self._describe_packs()),
             ("Real-time protection", watching,
              f"watching {len(self.monitor.watched)} folder(s)" if watching
              else ("; ".join(broken) if broken else "not running")),

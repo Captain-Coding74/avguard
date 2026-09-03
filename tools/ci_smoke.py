@@ -136,7 +136,9 @@ def main() -> int:
         '    description = "smoke test rule"\n'
         '    severity = "medium"\n'
         "  strings:\n"
-        '    $a = "zz-smoke-needle-9c1e"\n'
+        # Built by concatenation: the self-match check walks tools/ and would
+        # otherwise refuse the pack for matching the script that wrote it.
+        '    $a = "' + "zz-smoke-" + "needle-9c1e" + '"\n'
         "  condition:\n"
         "    $a\n"
         "}\n", encoding="utf-8")

@@ -98,6 +98,14 @@ def _packs_command(args) -> int:
     rest = list(args.pack_args)
 
     if action == "list":
+        if rest:
+            # `--packs --licence MIT add folder` parsed as `--packs list` with
+            # "add folder" left over, and silently listed. Leftovers are an
+            # error, not a shrug.
+            print(f"--packs list takes no arguments; unexpected: {' '.join(rest)}",
+                  file=sys.stderr)
+            print("did you mean:  --packs add <folder> --licence MIT", file=sys.stderr)
+            return 2
         packs = store.packs()
         if not packs:
             print("No rule packs installed.")
@@ -174,14 +182,26 @@ def _packs_command(args) -> int:
             # and a pack's files can be edited after the fact.
             check = store.admit(pack.name, files, corpus,
                                 source=pack.source, licence=pack.licence)
-            state = "ok" if check.accepted else "OVER THE CEILING"
-            print(f"  {pack.name}: {state}  "
-                  f"({check.false_positive_rate:.2%} of {check.corpus_size} flagged, "
-                  f"was {pack.false_positive_rate:.2%} at install)")
-            for reason in check.reasons:
-                print(f"      {reason[:150]}")
-            if not check.accepted:
-                worst = 1
+            if check.accepted:
+                print(f"  {pack.name}: ok  "
+                      f"({check.false_positive_rate:.2%} of {check.corpus_size} flagged, "
+                      f"was {pack.false_positive_rate:.2%} at install)")
+                continue
+
+            worst = 1
+            # Say what actually failed. This used to print "OVER THE CEILING
+            # (0.00% of 400 flagged)" for a pack that failed to COMPILE --
+            # a rate it had never measured, attributed to the wrong check.
+            cause = check.reasons[0] if check.reasons else "failed for an unrecorded reason"
+            measured = (f" ({check.false_positive_rate:.2%} of {check.corpus_size} flagged)"
+                        if check.measured else "")
+            print(f"  {pack.name}: FAILED{measured}")
+            print(f"      {cause[:160]}")
+            if pack.trusted:
+                # A failing pack must not stay armed. The exit code now
+                # corresponds to a change of state, not just a complaint.
+                store.set_trusted(pack.name, False)
+                print(f"      {pack.name} was trusted; it is reports-only until it passes again")
         if worst:
             print("\nA pack no longer meets the bar it was admitted under.",
                   file=sys.stderr)
@@ -278,6 +298,13 @@ def main(argv: list[str] | None = None) -> int:
                         help="with --packs add: the pack's licence, e.g. MIT")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
+
+    if args.pack_args and not args.packs:
+        # `avguard scan C:/x` -- no dashes -- used to swallow both words into
+        # the pack_args catch-all and quietly launch the GUI with nothing
+        # scanned. A bare word the parser cannot place is a mistake to name.
+        parser.error(f"unexpected arguments: {' '.join(args.pack_args)} "
+                     "(commands are options, e.g. --scan PATH)")
 
     logsetup.install_excepthooks()
     config.ensure_directories()

@@ -380,8 +380,6 @@ class TestScheduling(unittest.TestCase):
         self.assertTrue(ok)
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
 
 
 class TestTheLinuxSimulationActuallySimulates(unittest.TestCase):
@@ -455,3 +453,7 @@ class TestTheLinuxSimulationActuallySimulates(unittest.TestCase):
         blocker = self._blocker({"x"})
         self.assertTrue(hasattr(blocker, "find_spec"),
                         "only find_spec is consulted by the import system")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

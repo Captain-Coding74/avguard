@@ -46,8 +46,62 @@ Ranked by the same rule as everything else in this project:
 | 22 | Two pack names that sanitise alike: the second install silently overwrote a promoted pack | `tests/test_rulepacks.py` |
 | 23 | Re-installing a pack from its own directory emptied it | `tests/test_rulepacks.py` |
 | 24 | A pack using `include` was admitted, then never compiled once installed | `tests/test_rulepacks.py` |
+| 25 | **Installing a reports-only pack silenced the VirusTotal lookup for anything it flagged** | `tests/test_rulepacks.py` |
+| 26 | A malformed `allowlist.json` or `packs.json` crashed every entry point at startup | `tests/test_rulepacks.py` |
+| 27 | A pack of narrow rules could flag every clean file and pass: the aggregate rate was computed and compared to nothing | `tests/test_rulepacks.py` |
+| 28 | `--packs verify` printed a rate it never measured, blamed the wrong check, and left a failing pack trusted | `tests/test_rulepacks.py` |
+| 29 | Pack rule counts came from a regex that counted commented-out rules and missed included ones | `tests/test_rulepacks.py` |
+| 30 | `--packs --licence MIT add <dir>` silently listed; `avguard scan X` silently launched the GUI | `tests/test_rulepacks.py` |
+| 31 | `if __name__ == "__main__":` sat above half the classes in five test files, so direct execution skipped them | `python tests/test_*.py` now runs every class |
+| 32 | The self-match check walked three directories; a pack matching `tests/`, `tools/` or another installed pack passed | `tests/test_rulepacks.py` |
+| 33 | Health summed the pack index's `rule_count`: a pack whose directory had been deleted still reported its rules as loaded | `tests/test_rulepacks.py` |
 
 ### Notes worth keeping
+
+**"Reports only" reduced detection (25).** The cloud lookup ran only when the
+local verdict was CLEAN. One capped 50-point finding from an unpromoted pack
+made a file SUSPICIOUS, so VirusTotal was never asked, and a sample it would
+have condemned was left alone. The gate is now "nothing hard has decided",
+which is what it always meant: a reports-only pack must not silence the engine
+that was going to condemn the file, and hard local evidence still saves the
+call.
+
+**The pack ceiling that was never compared (27, 28, 29).** `admit()` held each
+rule to 1% and computed the pack's aggregate rate, printed it, and compared it
+to nothing. 120 narrow rules at 0.83% each flagged every clean file on the
+machine and were admitted with "no rule over the ceiling". The per-rule check
+still runs first, because it names the culprit; a 5% pack ceiling runs after
+it for the case where no single rule is to blame. `verify` then printed "OVER
+THE CEILING (0.00% of 400 flagged)" for a pack that had failed to *compile*:
+`corpus_size` was known before compiling, so it could not tell a measured zero
+from a pack that never got that far. `Admission.measured` can. And a pack that
+failed verification stayed trusted -- exit 1 was a complaint, not a change of
+state. It is now set back to reports-only, and says so. The rule count came
+from a regex over the text; it comes from the compiled object now, which is
+exactly the set that runs.
+
+**The self-match check had the protection.py bug (32).** It walked `rules/`,
+`avguard/` and `docs/` -- the same "three directories" mistake self-protection
+made once and fixed by covering everything. It walks the whole project, the
+user's rules, and every *other* installed pack now; a pack's own directory is
+excluded on re-verification, since a pack legitimately contains the strings it
+hunts for. Widening it found four tests and the smoke check whose needles were
+literals in the files that wrote them, which is what `TRIPWIRE` was already
+built by concatenation to avoid.
+
+**Health counted the wrong thing (33).** It summed `rule_count` from the pack
+index, so a pack whose directory had been deleted reported 1,240 rules loaded.
+`yara.Rule` does not expose its namespace, so the count cannot be derived from
+the combined ruleset; `load_rules()` already compiles each pack alone, and
+records what that compile produced. That is what is running, which is the only
+number the Health view exists to report.
+
+**A bad file is an empty list (26).** A JSON array where an object was expected
+raised `AttributeError` out of `Scanner.__init__` -- so out of the GUI
+constructor and every CLI verb. Under `pythonw` the user saw nothing and the
+cure was hand-editing a file in AppData. Both loaders check the shape and drop
+malformed entries with a warning, and `AllowEntry` checks its field types,
+because `"added_at": 12345` loaded fine and crashed `scan()` on `.when`.
 
 **install() was not a transaction (22, 23, 24).** It ran `rmtree(destination)`
 before reading a single source byte. Re-installing a pack from its own
@@ -189,6 +243,19 @@ genuinely recursive now, bounded by a shared byte budget as well as by depth,
 and the tests assert the limit in **both** directions: two deep is found, three
 deep is not, and a separate test proves the payload is not visible without
 descending.
+
+### B. Seen once, not reproduced
+
+**`Fatal Python error: _PySemaphore_Wakeup: parking_lot: ReleaseSemaphore failed`**
+during `tests/test_durability.py`, in `WorkerPool.stop()` -> `Queue.put_nowait`
+-> `Condition.notify`, on Python 3.13.3 / Windows 11. One full-suite run in four
+died there; the module alone passed four times in a row, and the same suite was
+green in the two runs either side of it. The crash is inside the interpreter's
+parking lot -- a waiter whose per-thread semaphore handle is no longer valid --
+not in code this project controls; `stop()` does nothing beyond a sentinel per
+worker and a bounded `join`. `WorkerPool.stop()` also runs when settings are
+saved and on exit, so if it recurs in the application it would take the process
+with it. Worth knowing: whether it recurs on a newer 3.13.x, which CI runs on.
 
 Nothing left open loses data, lies about protection, or stops the program
 starting. That was the bar for calling the audit finished.

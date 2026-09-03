@@ -44,6 +44,17 @@ class AllowEntry:
     was_flagged_for: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        # Field types are checked, not trusted. `"added_at": 12345` loaded fine
+        # and then crashed scan() the moment `.when` sliced it.
+        if not isinstance(self.sha256, str):
+            self.sha256 = str(self.sha256)
+        if not isinstance(self.name, str):
+            self.name = str(self.name)
+        if not isinstance(self.added_at, str):
+            self.added_at = ""
+        if not isinstance(self.was_flagged_for, list):
+            self.was_flagged_for = []
+        self.was_flagged_for = [str(x) for x in self.was_flagged_for]
         if not self.added_at:
             self.added_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -67,8 +78,19 @@ class Allowlist:
         except (OSError, json.JSONDecodeError):
             self._entries = {}
             return
+        if not isinstance(raw, dict):
+            # A JSON array, number or string here raised AttributeError out of
+            # Scanner.__init__ -- so out of the GUI constructor and every CLI
+            # verb. Under pythonw the user saw nothing, and the cure was
+            # hand-editing a file in AppData. A bad file is an empty list.
+            log.warning("allowlist at %s is not a JSON object; ignoring it", self.path)
+            self._entries = {}
+            return
         entries: dict[str, AllowEntry] = {}
-        for digest, data in (raw or {}).items():
+        for digest, data in raw.items():
+            if not isinstance(data, dict):
+                log.warning("dropping a malformed allowlist entry for %s", str(digest)[:12])
+                continue
             try:
                 entries[digest] = AllowEntry(**data)
             except TypeError:

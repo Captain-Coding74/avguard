@@ -92,7 +92,7 @@ SUSPICIOUS_AT = 50
 # Learned by shipping it: the archive inspector stopped calling large resource
 # packs "hostile", and the machine kept reporting the old verdict because the
 # generation hash only covered the rule file.
-DETECTION_VERSION = 10
+DETECTION_VERSION = 11
 
 # Heuristics never add up to a condemnation, however many of them agree.
 #
@@ -419,6 +419,11 @@ class Scanner:
         self.packs = packs if packs is not None else rulepacks.PackStore()
         self._untrusted_namespaces: set[str] = set()
         self.broken_packs: dict[str, str] = {}
+        # Rules each pack contributed to the loaded ruleset, counted from its
+        # compiled object. The pack index's rule_count is what was measured at
+        # install; this is what is running now, which is the number Health
+        # exists to report.
+        self.pack_rule_counts: dict[str, int] = {}
         self._max_signature = max((len(s) for s in SIGNATURES.values()), default=0)
         self.load_rules()
         if cache is None:
@@ -543,18 +548,20 @@ class Scanner:
         # files able to do that by 310, all maintained by somebody else. A bad
         # pack costs that pack, is named in the log, and is shown in Health.
         self.broken_packs = {}
+        self.pack_rule_counts = {}
         accepted_pack_files: list[Path] = []
         for pack in self.packs.packs():
             files = self.packs.rule_files_for(pack.name)
             if not files:
                 continue
             try:
-                yara.compile(filepaths=_namespaces(files))
+                compiled_pack = yara.compile(filepaths=_namespaces(files))
             except yara.Error as exc:
                 self.broken_packs[pack.name] = str(exc)
                 log.error("rule pack %s failed to compile and is left out: %s",
                           pack.name, exc)
                 continue
+            self.pack_rule_counts[pack.name] = sum(1 for _ in compiled_pack)
             accepted_pack_files.extend(files)
 
         sources = _dedupe(own + accepted_pack_files)
@@ -970,7 +977,12 @@ class Scanner:
 
         # The cloud is asked only about files nothing local has decided on, so
         # a clean local verdict is what earns an API call, not a suspicious one.
-        if level is Level.CLEAN and self._wants_cloud_lookup(facts):
+        # Gated on "nothing hard decided", not on CLEAN. Gating on CLEAN meant
+        # one capped 50-point finding from an unpromoted pack made the file
+        # SUSPICIOUS, the cloud was never asked, and a sample VirusTotal would
+        # have condemned was left alone. "Reports only" must not mean
+        # "silences the engine that was going to condemn it".
+        if not any(f.hard for f in findings) and self._wants_cloud_lookup(facts):
             try:
                 cloud_reasons = self.cloud_lookup(facts.sha256, facts.path)
             except Exception as exc:

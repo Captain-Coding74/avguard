@@ -397,8 +397,6 @@ class TestScoring(unittest.TestCase):
         self.assertIs(decide(findings, malicious_at=50), Level.MALICIOUS)
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
 
 
 class TestInstalledPacks(unittest.TestCase):
@@ -487,3 +485,7 @@ class TestInstalledPacks(unittest.TestCase):
                 self.assertGreater(pack.corpus_size, 0,
                                    f"{pack.name} has no recorded measurement")
                 self.assertTrue(pack.licence, f"{pack.name} records no licence")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

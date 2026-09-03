@@ -65,6 +65,12 @@ PACKS_INDEX = PACKS_DIR / "packs.json"
 # rules do not get an easier bar than our own.
 MAX_FALSE_POSITIVE_RATE = 0.01
 
+# And one for the pack as a whole. The per-rule ceiling alone let 120 narrow
+# rules at 0.83% each flag every clean file on the machine and be admitted
+# with "no rule over the ceiling". The aggregate was computed, printed, and
+# compared to nothing.
+MAX_PACK_FALSE_POSITIVE_RATE = 0.05
+
 # Licences this project can redistribute alongside MIT code. A pack whose
 # licence is unknown is refused rather than quietly vendored -- anyone who
 # forks this repository inherits the problem otherwise.
@@ -124,6 +130,10 @@ class Admission:
     file_count: int = 0
     false_positive_rate: float = 0.0
     corpus_size: int = 0
+    # True once the rules were actually run over the corpus. corpus_size is
+    # known before compiling, so it cannot tell a measured 0% from a pack
+    # that never got that far -- which is what `verify` used to print.
+    measured: bool = False
     offending: list[str] = field(default_factory=list)
 
 
@@ -147,8 +157,15 @@ class PackStore:
         except (OSError, json.JSONDecodeError):
             self._packs = {}
             return
+        if not isinstance(raw, dict):
+            log.warning("pack index at %s is not a JSON object; ignoring it", self.index_path)
+            self._packs = {}
+            return
         packs: dict[str, RulePack] = {}
-        for name, data in (raw or {}).items():
+        for name, data in raw.items():
+            if not isinstance(data, dict):
+                log.warning("dropping a malformed pack record for %r", name)
+                continue
             try:
                 packs[name] = RulePack(**data)
             except TypeError:
@@ -267,13 +284,18 @@ class PackStore:
             result.reasons.append(f"does not compile: {exc}")
             return result
 
-        result.rule_count = _count_rules(rule_files)
+        # From the compiled object, not a regex over the text. The regex
+        # counted commented-out rules and could not see included ones; this
+        # is exactly the set that will actually run.
+        result.rule_count = sum(1 for _ in compiled)
         if not result.rule_count:
             result.reasons.append("compiles, but declares no rules")
             return result
 
         # It must not match us. This is the failure that ended v1.
-        for path in protected_files or _avguard_files():
+        for path in (protected_files if protected_files is not None
+                     else _avguard_files(packs_dir=self.directory,
+                                         exclude=self.pack_dir(name))):
             try:
                 data = path.read_bytes()
             except OSError:
@@ -306,6 +328,7 @@ class PackStore:
         result.corpus_size = examined
         if examined:
             result.false_positive_rate = flagged / examined
+            result.measured = True
 
         if not examined:
             result.reasons.append(
@@ -322,6 +345,18 @@ class PackStore:
                 f"{len(over)} rule(s) exceed the {MAX_FALSE_POSITIVE_RATE:.0%} "
                 f"false-positive ceiling on {examined} clean files: "
                 + ", ".join(f"{r} ({c / examined:.1%})" for r, c in worst))
+            return result
+
+        # Every rule is under its own ceiling; now the pack as a whole. Second
+        # because the per-rule reason names the culprit, and this one only
+        # applies when no single rule is to blame.
+        if result.false_positive_rate > MAX_PACK_FALSE_POSITIVE_RATE:
+            result.reasons.append(
+                f"the pack as a whole flags {result.false_positive_rate:.1%} of "
+                f"{examined} clean files, above the "
+                f"{MAX_PACK_FALSE_POSITIVE_RATE:.0%} ceiling for a pack")
+            worst = sorted(per_rule.items(), key=lambda kv: -kv[1])[:5]
+            result.offending = [r for r, _ in worst]
             return result
 
         result.accepted = True
@@ -477,26 +512,35 @@ def _safe_name(name: str) -> str:
     return cleaned[:64] or "pack"
 
 
-def _count_rules(paths: list[Path]) -> int:
-    import re
-    total = 0
-    for path in paths:
-        try:
-            text = path.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-        total += len(re.findall(r"^\s*(?:private\s+|global\s+)*rule\s+\w+", text, re.M))
-    return total
+def _avguard_files(packs_dir: Path = PACKS_DIR,
+                   exclude: Path | None = None) -> list[Path]:
+    """The files a pack must not match, for the reason v1 demonstrated.
 
-
-def _avguard_files() -> list[Path]:
-    """The files a pack must not match, for the reason v1 demonstrated."""
+    The whole project, the user's own rules, and every OTHER installed pack.
+    It used to walk three directories; protection.py records the same mistake
+    being made once for self-protection and fixed by covering everything.
+    `exclude` is the candidate pack's own directory during a re-verification,
+    since a pack legitimately contains the strings it hunts for.
+    """
+    skip_dirs = {".git", "__pycache__", "build", "dist", ".venv", "node_modules"}
     found: list[Path] = []
-    for folder in ("rules", "avguard", "docs"):
-        directory = config.PROJECT_ROOT / folder
+
+    def walk(directory: Path) -> None:
         if not directory.is_dir():
-            continue
+            return
         for path in directory.rglob("*"):
-            if path.is_file() and "__pycache__" not in path.parts:
-                found.append(path)
+            if not path.is_file():
+                continue
+            if any(part in skip_dirs for part in path.parts):
+                continue
+            # Positive fixtures are supposed to match rules.
+            if "must_match" in path.parts:
+                continue
+            if exclude is not None and path_within(path, exclude):
+                continue
+            found.append(path)
+
+    walk(config.PROJECT_ROOT)
+    walk(config.USER_RULES_DIR)
+    walk(packs_dir)
     return found

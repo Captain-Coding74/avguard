@@ -303,8 +303,6 @@ class TestRealtimeHonesty(TempCase):
         self.assertEqual(monitor.running, not monitor.broken_links())
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
 
 
 # ------------------------------------------------- a restore is a decision
@@ -787,3 +785,7 @@ class TestGuardsSurviveTwoSpellings(TempCase):
         """A comparison that says yes to everything guards nothing."""
         real, _link = self._linked()
         self.assertFalse(SelfProtection([real]).is_protected(self.tmp / "elsewhere.txt"))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

@@ -53,6 +53,13 @@ logging.getLogger("avguard").propagate = False
 TRIPWIRE = "TRIPWIRE-" + "7f3a2c9e"
 
 
+# Needles are built by concatenation, like TRIPWIRE. The self-match check now
+# walks the whole project including this file, so a literal here would be
+# refused for matching the test that wrote it.
+def _needle(tag: str) -> str:
+    return "zz-" + tag + "-needle"
+
+
 class TempCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="avguard-packs-"))
@@ -129,8 +136,11 @@ class TestPackRefusals(TempCase):
             "    $a",
             "}",
         ]))
+        # protected_files=[]: a rule this broad also matches the project, and
+        # this test is about the corpus measurement, not the self-match.
         admission = self.store.admit("broad", [self.source / "broad.yara"],
-                                     self.clean_corpus(20), licence="MIT")
+                                     self.clean_corpus(20), licence="MIT",
+                                     protected_files=[])
         self.assertFalse(admission.accepted)
         self.assertIn("false-positive ceiling", " ".join(admission.reasons))
         self.assertIn("Fires_On_Everything", admission.offending)
@@ -323,8 +333,6 @@ class TestImportedRulesCannotCondemn(TempCase):
         self.assertNotEqual(before, scanner.detection_generation())
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
 
 
 class TestPackReporting(TempCase):
@@ -544,14 +552,20 @@ class TestSharedStateHasOneOwner(TempCase):
     def test_a_mutation_does_not_clobber_another_owners_write(self):
         """set_trusted and remove read before they write."""
         rule = self.simple_rule()
-        admission = self.store.admit("one", [rule], self.clean_corpus(), licence="MIT")
+        # protected_files=[]: both packs carry the same needle, so the second
+        # would match the first's installed file. That refusal is right and is
+        # tested in TestSelfMatchCoversTheWholeProject; this test is about the
+        # index.
+        admission = self.store.admit("one", [rule], self.clean_corpus(), licence="MIT",
+                                     protected_files=[])
         self.store.install("one", [rule], admission, licence="MIT")
 
         other = PackStore(directory=self.store.directory,
                           index_path=self.store.index_path)
         two = self.rule_file("two.yara", (self.source / "pack.yara").read_text())
         other.install("two", [two],
-                      other.admit("two", [two], self.clean_corpus(), licence="MIT"),
+                      other.admit("two", [two], self.clean_corpus(), licence="MIT",
+                                  protected_files=[]),
                       licence="MIT")
 
         # self.store has never seen "two". Mutating it must not erase it.
@@ -759,12 +773,13 @@ class TestInstallIsTransactional(TempCase):
         """Admitted in its source folder, it would never compile once copied."""
         (self.source / "lib").mkdir()
         (self.source / "lib" / "base.yar").write_text(
-            'rule Base { meta: description="d" strings: $a="zz-base" condition: $a }',
+            'rule Base { meta: description="d" strings: $a="' + _needle("base")
+            + '" condition: $a }',
             encoding="utf-8")
         main = self.source / "main.yara"
         main.write_text('include "./lib/base.yar"\n'
-                        'rule Main { meta: description="d" strings: $a="zz-main" '
-                        'condition: $a }', encoding="utf-8")
+                        'rule Main { meta: description="d" strings: $a="'
+                        + _needle("main") + '" condition: $a }', encoding="utf-8")
 
         admission = self.store.admit("inc", [main], self.clean_corpus(), licence="MIT")
         self.assertTrue(admission.accepted, "it does compile where it lives")
@@ -814,3 +829,301 @@ class TestInstallIsTransactional(TempCase):
                      if d.name.startswith(".")]
         self.assertEqual(leftovers, [])
 
+
+# --------------------------------------------- the cheap fixes from the audit
+
+class TestCloudIsAskedUnlessSomethingHardDecided(TempCase):
+    """The VirusTotal lookup ran only when the local verdict was CLEAN.
+
+    One capped 50-point finding from an unpromoted pack made a file
+    SUSPICIOUS, so the cloud was never asked, and a sample VirusTotal would
+    have condemned was left alone. Installing a reports-only pack REDUCED
+    detection. "Reports only" must not mean "silences the engine that was
+    going to condemn it".
+    """
+
+    def _scanner(self, trusted: bool, cloud_calls: list) -> Scanner:
+        rule = self.rule_file("pack.yara", "\n".join([
+            "rule Imported {",
+            "  meta:",
+            '    description = "d"',
+            '    severity = "critical"',
+            "  strings:",
+            f'    $a = "{TRIPWIRE}"',
+            "  condition:",
+            "    $a",
+            "}",
+        ]))
+        self.store.install("stranger", [rule],
+                           Admission(accepted=True, rule_count=1, corpus_size=1),
+                           licence="MIT")
+        if trusted:
+            self.store.set_trusted("stranger", True)
+
+        def cloud(sha256: str, path: Path) -> list[str]:
+            cloud_calls.append(sha256)
+            return ["VirusTotal: 9 of 70 engines flagged this file"]
+
+        cfg = config.Config(cloud_enabled=True, cloud_extensions=[".exe"])
+        return Scanner(cfg, SelfProtection([self.tmp / "nothing"]),
+                       cache=ScanCache(path=self.tmp / "c.json"),
+                       packs=self.store,
+                       allowlist=Allowlist(path=self.tmp / "allow.json"),
+                       cloud_lookup=cloud)
+
+    def test_a_reports_only_hit_does_not_silence_the_cloud(self):
+        calls: list = []
+        scanner = self._scanner(trusted=False, cloud_calls=calls)
+        target = self.tmp / "sample.exe"
+        target.write_bytes(TRIPWIRE.encode() + b" " * 64)
+        verdict = scanner.scan(target, use_cache=False)
+        self.assertEqual(len(calls), 1, "the cloud was never asked")
+        self.assertIs(verdict.level, Level.MALICIOUS,
+                      "cloud consensus is hard evidence and must still condemn")
+
+    def test_hard_local_evidence_does_not_waste_a_cloud_call(self):
+        calls: list = []
+        scanner = self._scanner(trusted=True, cloud_calls=calls)
+        target = self.tmp / "sample.exe"
+        target.write_bytes(TRIPWIRE.encode() + b" " * 64)
+        scanner.scan(target, use_cache=False)
+        self.assertEqual(calls, [], "already decided locally; the budget is finite")
+
+
+class TestMalformedDataFilesDoNotKillStartup(TempCase):
+    """A JSON array where an object was expected raised AttributeError out of
+    Scanner.__init__ -- so out of the GUI constructor and every CLI verb.
+    Under pythonw the user saw nothing. A bad file is an empty list."""
+
+    def test_an_allowlist_that_is_a_list_loads_empty(self):
+        path = self.tmp / "allow.json"
+        path.write_text("[1, 2, 3]", encoding="utf-8")
+        self.assertEqual(len(Allowlist(path=path)), 0)
+
+    def test_a_pack_index_that_is_a_number_loads_empty(self):
+        index = self.tmp / "p" / "packs.json"
+        index.parent.mkdir()
+        index.write_text("42", encoding="utf-8")
+        self.assertEqual(PackStore(directory=self.tmp / "p", index_path=index).packs(), [])
+
+    def test_a_non_object_entry_is_dropped_not_fatal(self):
+        path = self.tmp / "allow.json"
+        path.write_text('{"a": [1], "b": {"sha256": "b", "name": "ok"}}', encoding="utf-8")
+        allow = Allowlist(path=path)
+        self.assertIsNone(allow.allows("a"))
+        self.assertIsNotNone(allow.allows("b"))
+
+    def test_a_wrongly_typed_field_does_not_crash_scan(self):
+        """`"added_at": 12345` loaded fine and crashed scan() on `.when`."""
+        path = self.tmp / "allow.json"
+        path.write_text('{"h": {"sha256": "h", "name": "x", "added_at": 12345, '
+                        '"was_flagged_for": "not-a-list"}}', encoding="utf-8")
+        entry = Allowlist(path=path).allows("h")
+        self.assertIsNotNone(entry)
+        self.assertIsInstance(entry.when, str)
+        self.assertEqual(entry.was_flagged_for, [])
+
+
+class TestThePackAsAWholeHasACeiling(TempCase):
+    """120 narrow rules at 0.83% each flagged every clean file and were
+    admitted with "no rule over the ceiling". The aggregate was computed,
+    printed, and compared to nothing."""
+
+    def test_many_narrow_rules_that_together_flag_everything_are_refused(self):
+        corpus = []
+        body = []
+        for index in range(120):
+            needle = _needle(f"clean{index}")
+            path = self.tmp / f"clean{index}.bin"
+            path.write_bytes(f"ordinary content {needle} ".encode() * 40)
+            corpus.append(path)
+            body.append(f"rule Narrow_{index} {{ meta: description = \"d\" "
+                        f"strings: $a = \"{needle}\" condition: $a }}")
+        pack = self.rule_file("narrow.yara", "\n".join(body))
+        admission = self.store.admit("narrow", [pack], corpus, licence="MIT")
+        self.assertFalse(admission.accepted)
+        self.assertIn("pack as a whole", " ".join(admission.reasons))
+        # Every single rule is under the per-rule ceiling; that is the point.
+        self.assertLess(1 / 120, rulepacks.MAX_FALSE_POSITIVE_RATE)
+
+
+class TestRuleCountComesFromTheCompiler(TempCase):
+    def test_a_commented_out_rule_is_not_counted(self):
+        pack = self.rule_file("pack.yara", "\n".join([
+            "/* rule Fake_One { condition: true } */",
+            "// rule Fake_Two { condition: true }",
+            f"rule Real {{ meta: description = \"d\" strings: $a = \"{_needle('real')}\" "
+            "condition: $a }",
+        ]))
+        admission = self.store.admit("counted", [pack], self.clean_corpus(), licence="MIT")
+        self.assertTrue(admission.accepted, admission.reasons)
+        self.assertEqual(admission.rule_count, 1)
+
+
+class TestSelfMatchCoversTheWholeProject(TempCase):
+    """The check walked rules/, avguard/ and docs/ only."""
+
+    def test_a_rule_matching_a_file_outside_those_three_dirs_is_refused(self):
+        # This very test file lives in tests/, which the old walk never saw.
+        pack = self.rule_file("pack.yara",
+                              "rule Hits_Tests { meta: description = \"d\" "
+                              "strings: $a = \"class TestSelfMatchCoversTheWholeProject\" "
+                              "condition: $a }")
+        admission = self.store.admit("tests", [pack], self.clean_corpus(), licence="MIT")
+        self.assertFalse(admission.accepted)
+        self.assertIn("matches AVGuard", " ".join(admission.reasons))
+
+    def test_a_rule_matching_another_installed_pack_is_refused(self):
+        first = self.rule_file("first.yara",
+                               "rule First { meta: description = \"d\" "
+                               f"strings: $a = \"{_needle('first')}\" condition: $a }}")
+        self.store.install("first", [first],
+                           Admission(accepted=True, rule_count=1, corpus_size=1),
+                           licence="MIT")
+        # The second pack's rule matches text that appears in the first pack's
+        # rule FILE. Loading both would make the first pack a detection.
+        second = self.rule_file("second.yara",
+                                "rule Second { meta: description = \"d\" "
+                                f"strings: $a = \"{_needle('first')[:-3]}\" condition: $a }}")
+        admission = self.store.admit("second", [second], self.clean_corpus(), licence="MIT")
+        self.assertFalse(admission.accepted)
+        self.assertIn("first.yara", " ".join(admission.reasons))
+
+    def test_a_pack_is_not_refused_for_matching_its_own_files_on_verify(self):
+        """A pack legitimately contains the strings it hunts for."""
+        rule = self.rule_file("own.yara",
+                              "rule Own { meta: description = \"d\" "
+                              f"strings: $a = \"{_needle('own')}\" condition: $a }}")
+        self.store.install("own", [rule],
+                           Admission(accepted=True, rule_count=1, corpus_size=1),
+                           licence="MIT")
+        files = rulepacks._avguard_files(packs_dir=self.store.directory,
+                                         exclude=self.store.pack_dir("own"))
+        self.assertTrue(files, "the walk found nothing at all")
+        self.assertFalse(any(self.store.pack_dir("own") in f.parents for f in files))
+        # And re-admission of the installed copy passes for the same reason.
+        again = self.store.admit("own", self.store.rule_files_for("own"),
+                                 self.clean_corpus(), licence="MIT")
+        self.assertTrue(again.accepted, again.reasons)
+
+
+class TestStrayArgumentsAreRefused(unittest.TestCase):
+    """`--packs --licence MIT add folder` listed packs and exited 0. `scan C:/x`
+    launched the GUI with nothing scanned. A word the parser cannot place is
+    a mistake to name, not to swallow."""
+
+    def test_a_bare_command_word_is_an_error(self):
+        import avguard.__main__ as cli
+        with self.assertRaises(SystemExit) as caught:
+            cli.main(["scan", "C:/nowhere"])
+        self.assertEqual(caught.exception.code, 2)
+
+    def test_list_with_leftovers_is_an_error(self):
+        import io
+        import contextlib
+        import avguard.__main__ as cli
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = cli.main(["--packs", "--licence", "MIT", "add", "somewhere"])
+        self.assertEqual(code, 2)
+        self.assertIn("unexpected", err.getvalue())
+
+
+class TestHealthCountsWhatLoaded(TempCase):
+    """The GUI summed rule_count from the index. A pack whose directory had been
+    deleted still reported its rules as loaded. The facts the Health view now
+    derives from are checked here, where tkinter is not needed."""
+
+    def _scanner(self) -> Scanner:
+        return Scanner(config.Config(cloud_enabled=False),
+                       SelfProtection([self.tmp / "nothing"]),
+                       cache=ScanCache(path=self.tmp / "c.json"),
+                       packs=self.store,
+                       allowlist=Allowlist(path=self.tmp / "allow.json"))
+
+    def test_loaded_count_matches_the_compiled_ruleset(self):
+        rule = self.simple_rule()
+        self.store.install("vendor", [rule],
+                           Admission(accepted=True, rule_count=1, corpus_size=1),
+                           licence="MIT")
+        scanner = self._scanner()
+        self.assertEqual(scanner.pack_rule_counts.get("vendor"), 1)
+        self.assertNotIn("vendor", scanner.broken_packs)
+
+    def test_a_vanished_pack_directory_loads_nothing(self):
+        import shutil
+        rule = self.simple_rule()
+        self.store.install("vendor", [rule],
+                           Admission(accepted=True, rule_count=1, corpus_size=1),
+                           licence="MIT")
+        shutil.rmtree(self.store.pack_dir("vendor"))
+        scanner = self._scanner()
+        self.assertEqual(self.store.rule_files_for("vendor"), [])
+        self.assertNotIn("vendor", scanner.pack_rule_counts)
+        self.assertIsNotNone(scanner.rules, "the shipped rules must still load")
+        self.assertEqual(self.store.get("vendor").rule_count, 1,
+                         "the index still claims a rule; Health must not repeat it")
+
+
+class TestVerifyReportsWhatItMeasured(unittest.TestCase):
+    """`--packs verify` printed "OVER THE CEILING (0.00% of 400 flagged)" for
+    a pack that had failed to COMPILE -- a rate it never measured, blamed on
+    the wrong check -- and left the pack trusted. Exit 1 with no change of
+    state is a complaint; a failing pack must be disarmed."""
+
+    def setUp(self):
+        import shutil
+        import tempfile
+        self.tmp = Path(tempfile.mkdtemp(prefix="avguard-verify-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        # The CLI builds its own PackStore on the per-process test data dir.
+        self.store = rulepacks.PackStore()
+        self.addCleanup(self._remove_pack)
+
+    def _remove_pack(self):
+        store = rulepacks.PackStore()
+        if store.get("verifyme") is not None:
+            store.remove("verifyme")
+
+    def _corpus(self) -> list[Path]:
+        files = []
+        for index in range(3):
+            path = self.tmp / f"clean{index}.bin"
+            path.write_bytes(b"ordinary content " * 50)
+            files.append(path)
+        return files
+
+    def test_a_pack_that_no_longer_compiles_is_named_and_disarmed(self):
+        import contextlib
+        import io
+        from unittest import mock
+        import avguard.__main__ as cli
+
+        rule = self.tmp / "v.yara"
+        rule.write_text('rule V { meta: description="d" strings: $a="'
+                        + _needle("verify") + '" condition: $a }', encoding="utf-8")
+        admission = self.store.admit("verifyme", [rule], self._corpus(), licence="MIT")
+        self.assertTrue(admission.accepted, admission.reasons)
+        self.store.install("verifyme", [rule], admission, licence="MIT")
+        self.store.set_trusted("verifyme", True)
+
+        installed = self.store.rule_files_for("verifyme")[0]
+        installed.write_text(installed.read_text(encoding="utf-8")
+                             + "\nrule Broken { condition: ", encoding="utf-8")
+
+        out = io.StringIO()
+        with mock.patch.object(cli, "_clean_corpus", return_value=self._corpus()), \
+                contextlib.redirect_stdout(out):
+            code = cli.main(["--packs", "verify"])
+        text = out.getvalue()
+
+        self.assertEqual(code, 1)
+        self.assertIn("FAILED", text)
+        self.assertIn("does not compile", text, "the real cause is named")
+        self.assertNotIn("0.00%", text, "no rate was measured, so none is printed")
+        self.assertFalse(rulepacks.PackStore().get("verifyme").trusted,
+                         "a failing pack must not stay armed")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
