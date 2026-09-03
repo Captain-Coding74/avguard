@@ -77,16 +77,28 @@ class _HideModules:
 
 
 def _prove_blocking_works(names: set[str]) -> None:
-    """Refuse to run rather than report a result the blocker did not produce."""
-    probe = sorted(names)[0]
-    try:
-        __import__(probe)
-    except ImportError:
+    """Refuse to run rather than report a result the blocker did not produce.
+
+    Every name, not `sorted(names)[0]`: that probed PIL alone, and on a box
+    without Pillow it passed vacuously while the other three went unproven.
+    find_spec through our finder raises ImportError for a hidden name and
+    returns None for one that is merely absent, so the two are told apart.
+    """
+    import importlib.util
+    unproven = []
+    for name in sorted(names):
+        try:
+            importlib.util.find_spec(name)
+        except ImportError:
+            continue  # hidden, as intended
+        unproven.append(name)
+    if not unproven:
         return
-    print(f"::error title=--no-gui-deps is not working::{probe} imported despite "
-          "being hidden; the check would report a pass it did not earn"
+    listed = ", ".join(unproven)
+    print(f"::error title=--no-gui-deps is not working::{listed} not hidden; "
+          "the check would report a pass it did not earn"
           if os.getenv("GITHUB_ACTIONS") else
-          f"--no-gui-deps is not working: {probe} imported despite being hidden.")
+          f"--no-gui-deps is not working: {listed} not hidden.")
     raise SystemExit(2)
 
 

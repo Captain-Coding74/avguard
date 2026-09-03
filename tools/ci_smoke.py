@@ -23,6 +23,7 @@ had not looked at anything.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -62,6 +63,15 @@ def run(*args: str) -> tuple[int, str]:
 
 def main() -> int:
     work = Path(tempfile.mkdtemp(prefix="avguard-smoke-"))
+    try:
+        return _run(work)
+    finally:
+        # Every run left its work directory behind; hundreds of them made
+        # the whole machine slow to test on.
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _run(work: Path) -> int:
     os.environ["AVGUARD_DATA"] = str(work / "data")
     print(f"working in {work}")
 

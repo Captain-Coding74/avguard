@@ -16,7 +16,7 @@ import ttkbootstrap as tb
 from ttkbootstrap.constants import BOTH, END, LEFT, RIGHT, VERTICAL, X, Y
 from ttkbootstrap.dialogs import Messagebox
 
-from . import config, rulepacks, scheduling
+from . import allowlist as allowlist_module, config, rulepacks, scheduling
 
 log = logging.getLogger("avguard.dialogs")
 
@@ -32,11 +32,13 @@ class SettingsDialog(tb.Toplevel):
     """
 
     def __init__(self, parent, cfg: config.Config, on_saved,
-                 pack_store=None, on_packs_changed=None) -> None:
+                 pack_store=None, on_packs_changed=None,
+                 allowlist=None, on_allowlist_changed=None) -> None:
         super().__init__(title="Settings", transient=parent, resizable=(False, False))
         self.cfg = cfg
         self._on_saved = on_saved
         self._on_packs_changed = on_packs_changed
+        self._on_allowlist_changed = on_allowlist_changed
 
         body = tb.Frame(self, padding=18)
         body.pack(fill=BOTH, expand=True)
@@ -149,6 +151,30 @@ class SettingsDialog(tb.Toplevel):
                        + "    python -m avguard --packs add <folder> --licence MIT")
                  ).pack(anchor="w", pady=(6, 0))
 
+        # --- files the user chose to keep -----------------------------------
+        # A restore is a permanent, machine-wide exception for those exact
+        # bytes. Until this frame existed it could not be seen or undone: the
+        # allowlist's entries() and remove() had no caller outside the tests.
+        keep_frame = tb.Labelframe(body, text="Files you chose to keep", padding=12)
+        keep_frame.pack(fill=X, pady=8)
+        # The scanner's allowlist, for the same reason as the pack store.
+        self.allowlist = (allowlist if allowlist is not None
+                          else allowlist_module.Allowlist())
+        self.keep_list = tk.Listbox(keep_frame, height=3, bg="#12161c", fg="#cfd8dc",
+                                    relief="flat", highlightthickness=0)
+        self.keep_list.pack(fill=X)
+        self._refresh_allowlist()
+        row = tb.Frame(keep_frame, padding=(0, 6, 0, 0))
+        row.pack(fill=X)
+        tb.Button(row, text="Stop keeping", bootstyle="danger-outline",
+                  command=self._stop_keeping).pack(side=LEFT)
+        tb.Label(keep_frame, bootstyle="secondary", wraplength=520, justify="left",
+                 text=("Restoring a file from quarantine records a decision about "
+                       "those exact bytes: they are not flagged again, anywhere on "
+                       "this PC, until the entry is removed here. Editing the file "
+                       "changes its bytes and ends the exception by itself.")
+                 ).pack(anchor="w", pady=(6, 0))
+
         # --- buttons -------------------------------------------------------
         actions = tb.Frame(body, padding=(0, 14, 0, 0))
         actions.pack(fill=X)
@@ -213,6 +239,37 @@ class SettingsDialog(tb.Toplevel):
         if self._on_packs_changed:
             self._on_packs_changed()
         self._refresh_packs()
+
+    def _refresh_allowlist(self) -> None:
+        self.keep_list.delete(0, END)
+        self.allowlist.reload()
+        entries = self.allowlist.entries()
+        if not entries:
+            self.keep_list.insert(END, "  (none - nothing has been restored)")
+            return
+        for entry in entries:
+            flagged = "; ".join(entry.was_flagged_for)[:60] or "no reason recorded"
+            self.keep_list.insert(
+                END, f"{entry.name or entry.sha256[:12]}  -  kept {entry.when}, "
+                     f"was flagged for: {flagged}")
+
+    def _stop_keeping(self) -> None:
+        selection = self.keep_list.curselection()
+        entries = self.allowlist.entries()
+        if not selection or not entries or selection[0] >= len(entries):
+            Messagebox.show_info("Select a kept file first.", "AVGuard", parent=self)
+            return
+        entry = entries[selection[0]]
+        if Messagebox.yesno(
+                f"Stop keeping '{entry.name or entry.sha256[:12]}'?" + CHR_NL + CHR_NL
+                + "If a file with these exact bytes is found again it will be "
+                  "flagged, and moved if the evidence is hard enough.",
+                "Remove this exception?", parent=self) != "Yes":
+            return
+        self.allowlist.remove(entry.sha256)
+        if self._on_allowlist_changed:
+            self._on_allowlist_changed()
+        self._refresh_allowlist()
 
     def _add_watch(self) -> None:
         chosen = filedialog.askdirectory(title="Watch this folder", parent=self)

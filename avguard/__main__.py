@@ -239,36 +239,76 @@ def unknown_text() -> str:
     return "unknown"
 
 
-def _clean_corpus(limit: int = 400) -> list[Path]:
+def _clean_corpus(limit: int = 400, roots: list[Path] | None = None,
+                  per_directory: int = 6) -> list[Path]:
     """Real binaries off this machine, to measure a candidate pack against.
 
     The same corpus idea the rule tests use: a pack is judged on the software
     actually installed here, not on a fixture somebody chose.
+
+    Spread across programs, not piled in one folder. Measured before this:
+    400 files, 331 of them from System32, the rest from six program
+    directories -- the walk stopped at the first directory that filled the
+    quota, and System32's root alone has thousands. A 5% pack ceiling
+    measured against one vendor's binaries is weaker than it reads; what
+    people download is Electron apps, Go binaries and installers. So: a few
+    files per directory, the per-user Programs folder included, and System32
+    held to a third while other software exists to fill the rest.
     """
     import random
-    roots = [Path(r"C:/Windows/System32"), Path(r"C:/Program Files"),
-             Path(r"C:/Program Files (x86)")]
-    found: list[Path] = []
+    if roots is None:
+        roots = [Path(r"C:/Program Files"), Path(r"C:/Program Files (x86)"),
+                 Path(os.environ.get("LOCALAPPDATA", r"C:/nowhere")) / "Programs",
+                 Path(r"C:/Windows/System32")]
+    system_share = max(1, limit // 3)
+    buckets: list[list[Path]] = []
+    system_spare: list[Path] = []
     for root in roots:
         if not root.is_dir():
             continue
-        taken = 0
-        for dirpath, _dirnames, filenames in os.walk(root):
-            for filename in filenames:
-                if not filename.lower().endswith((".exe", ".dll")):
-                    continue
+        is_system = "system32" in str(root).lower()
+        # System32 is one vendor in one folder: it may fill the corpus alone
+        # on a bare machine, but its bucket is capped below so that it does
+        # not when other software exists. Everyone else gives a few per folder.
+        cap_here = limit if is_system else per_directory
+        rng = random.Random(20240607)
+        taken: list[Path] = []
+        visited = 0
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames.sort()
+            visited += 1
+            eligible = sorted(f for f in filenames if f.lower().endswith((".exe", ".dll")))
+            rng.shuffle(eligible)  # not the alphabetical first few
+            here = 0
+            for filename in eligible:
                 path = Path(dirpath) / filename
                 try:
                     if path.stat().st_size > 16 * 1024 * 1024:
                         continue
                 except OSError:
                     continue
-                found.append(path)
-                taken += 1
-            if taken > limit:
+                taken.append(path)
+                here += 1
+                if here >= cap_here:
+                    break
+            if len(taken) >= limit or visited >= 4000:
                 break
-    random.Random(20240607).shuffle(found)
-    return found[:limit]
+        rng.shuffle(taken)
+        if is_system:
+            system_spare = taken[system_share:]
+            taken = taken[:system_share]
+        buckets.append(taken)
+
+    # Round-robin across roots so no single one dominates, then top up from
+    # whatever is left, System32 last.
+    corpus: list[Path] = []
+    while len(corpus) < limit and any(buckets):
+        for bucket in buckets:
+            if bucket and len(corpus) < limit:
+                corpus.append(bucket.pop())
+    while len(corpus) < limit and system_spare:
+        corpus.append(system_spare.pop())
+    return corpus
 
 
 def main(argv: list[str] | None = None) -> int:

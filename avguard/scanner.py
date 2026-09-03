@@ -92,7 +92,15 @@ SUSPICIOUS_AT = 50
 # Learned by shipping it: the archive inspector stopped calling large resource
 # packs "hostile", and the machine kept reporting the old verdict because the
 # generation hash only covered the rule file.
-DETECTION_VERSION = 11
+DETECTION_VERSION = 12
+
+# The ruleset compiled last time, kept between runs. See _adopt_compiled_cache.
+COMPILED_RULES_PATH = config.DATA_DIR / "rules.compiled"
+COMPILED_MANIFEST_PATH = config.DATA_DIR / "rules.compiled.json"
+# A rule file written this close to the moment its hash or the cache was
+# recorded is never trusted from its stat alone: two writes inside one
+# timestamp tick look identical to stat(), and CI has produced exactly that.
+RECENT_WRITE_NS = 2 * 10**9
 
 # Heuristics never add up to a condemnation, however many of them agree.
 #
@@ -424,6 +432,13 @@ class Scanner:
         # install; this is what is running now, which is the number Health
         # exists to report.
         self.pack_rule_counts: dict[str, int] = {}
+        # Which pack each namespace came from, built once per load. It was a
+        # linear scan with a path resolution per YARA match, on the real-time
+        # worker threads, for an answer that only changes with the ruleset.
+        self._pack_by_namespace: dict[str, str] = {}
+        # sha256 of each rule file keyed on its stat, so the generation can be
+        # computed without re-reading 3 MB of rules on every start.
+        self._file_hashes: dict[str, tuple[int, int, str]] = {}
         self._max_signature = max((len(s) for s in SIGNATURES.values()), default=0)
         self.load_rules()
         if cache is None:
@@ -479,19 +494,39 @@ class Scanner:
         # the new rules while the generation stayed bit-identical, so every
         # verdict cached under the old rules was replayed forever. Reading
         # 3 MB of rules costs a few milliseconds; a stale cache costs trust.
+        # The user's exceptions decide verdicts too: a restore makes these
+        # bytes CLEAN everywhere, and undoing it must make them MALICIOUS
+        # again everywhere, including in every copy a cache remembers.
+        for sha in sorted(entry.sha256 for entry in self.allowlist.entries()):
+            digest.update(f"allow={sha}".encode())
         for path in self.rule_files():
-            # Contents, not (name, size, mtime). An earlier version used the
-            # stat, and CI caught two genuinely different rulesets hashing
-            # identically: same filename, same size, and -- on a fast
-            # filesystem -- the same mtime to the nanosecond. That would replay
-            # every cached verdict from a ruleset no longer in use, which is
-            # the exact failure DETECTION_VERSION exists to prevent.
+            # The sha256 of the contents, not (name, size, mtime). An earlier
+            # version hashed the stat, and CI caught two genuinely different
+            # rulesets hashing identically: same filename, same size, and --
+            # on a fast filesystem -- the same mtime to the nanosecond. The
+            # per-file hash IS memoised on the stat, but never for a file
+            # written in the last two seconds, which is where that race lives.
             digest.update(path.name.encode())
-            try:
-                digest.update(path.read_bytes())
-            except OSError:
-                digest.update(b"<unreadable>")
+            digest.update(self._content_hash(path).encode())
         return digest.hexdigest()[:16]
+
+    def _content_hash(self, path: Path) -> str:
+        """sha256 of a rule file, remembered against its size and mtime."""
+        try:
+            st = path.stat()
+        except OSError:
+            return "<unreadable>"
+        key = str(path)
+        known = self._file_hashes.get(key)
+        fresh = st.st_mtime_ns > time.time_ns() - RECENT_WRITE_NS
+        if known and not fresh and known[0] == st.st_size and known[1] == st.st_mtime_ns:
+            return known[2]
+        try:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            return "<unreadable>"
+        self._file_hashes[key] = (st.st_size, st.st_mtime_ns, digest)
+        return digest
 
     def rule_files(self) -> list[Path]:
         """Shipped rules first, then the user's own.
@@ -511,7 +546,7 @@ class Scanner:
             found.extend(sorted(directory.glob("*.yar")))
         return _dedupe(found)
 
-    def load_rules(self) -> bool:
+    def load_rules(self, allow_cached: bool = True) -> bool:
         """Compile every ruleset, validate it, and only then adopt it.
 
         Three things this must not do, all of them learned from v1:
@@ -533,6 +568,9 @@ class Scanner:
                       self.rules_path.parent, config.USER_RULES_DIR)
             return False
 
+        if allow_cached and self._adopt_compiled_cache():
+            return True
+
         # Stage one: the rules this program answers for. If THESE do not
         # compile, that is the loud failure it has always been.
         try:
@@ -550,18 +588,22 @@ class Scanner:
         self.broken_packs = {}
         self.pack_rule_counts = {}
         accepted_pack_files: list[Path] = []
+        pack_of: dict[str, str] = {}
         for pack in self.packs.packs():
             files = self.packs.rule_files_for(pack.name)
             if not files:
                 continue
+            pack_namespaces = _namespaces(files)
             try:
-                compiled_pack = yara.compile(filepaths=_namespaces(files))
+                compiled_pack = yara.compile(filepaths=pack_namespaces)
             except yara.Error as exc:
                 self.broken_packs[pack.name] = str(exc)
                 log.error("rule pack %s failed to compile and is left out: %s",
                           pack.name, exc)
                 continue
             self.pack_rule_counts[pack.name] = sum(1 for _ in compiled_pack)
+            for namespace in pack_namespaces:
+                pack_of[namespace] = pack.name
             accepted_pack_files.extend(files)
 
         sources = _dedupe(own + accepted_pack_files)
@@ -587,6 +629,7 @@ class Scanner:
         # Ruleset and cap are adopted in the same breath, so a failed load can
         # never leave new namespaces paired with an old compiled ruleset.
         self._untrusted_namespaces = untrusted
+        self._pack_by_namespace = pack_of
         self.rules = candidate
         self.rule_sources = sources
         shipped = [p.name for p in sources if str(p.resolve()) not in self._untrusted_namespaces]
@@ -597,7 +640,152 @@ class Scanner:
                  len(sources), ", ".join(shipped[:4])
                  + ("..." if len(shipped) > 4 else ""),
                  f" plus {imported} from rule packs" if imported else "")
+        self._write_compiled_cache(candidate, sources)
         return True
+
+    # ------------------------------------------------- the compiled cache
+
+    def _manifest_entries(self) -> dict[str, dict] | None:
+        """stat() of every candidate rule file: own, and every pack's, broken or not."""
+        entries: dict[str, dict] = {}
+        for path in self.rule_files():
+            try:
+                st = path.stat()
+            except OSError:
+                return None
+            entries[str(path)] = {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+        return entries
+
+    def _adopt_compiled_cache(self) -> bool:
+        """Load the ruleset compiled last time, if nothing it came from changed.
+
+        Measured before this: with one real pack (311 files) the first launch
+        of the day took 10 s, a warm one 1.1 s, and the compile itself 0.17 s.
+        The cost was the first touch of 310 small files -- on Windows that is
+        the on-access scanner looking at each one -- not anything this program
+        did with them. A saved ruleset is one file, and loads in 0.02 s.
+
+        The cache is trusted only when the set of rule files that exist now is
+        exactly the set recorded, each with the recorded size and mtime, and
+        none was written within two seconds of the cache -- the window in
+        which stat() cannot tell two writes apart. Validation ran when the
+        cache was written; unchanged inputs give the same answer. The trust
+        state comes from the pack store, not the cache. reload_rules() never
+        takes this path, so an edit that preserves size and mtime is one
+        keypress from being seen.
+        """
+        try:
+            manifest = json.loads(COMPILED_MANIFEST_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        if not isinstance(manifest, dict):
+            return False
+        if (manifest.get("yara") != getattr(yara, "__version__", "")
+                or manifest.get("detection") != DETECTION_VERSION):
+            return False
+        current = self._manifest_entries()
+        recorded = manifest.get("files")
+        if current is None or not isinstance(recorded, dict) or set(current) != set(recorded):
+            return False
+        saved_at = int(manifest.get("saved_at_ns", 0))
+        for key, st in current.items():
+            known = recorded[key]
+            if (not isinstance(known, dict) or st["size"] != known.get("size")
+                    or st["mtime_ns"] != known.get("mtime_ns")):
+                return False
+            if saved_at - st["mtime_ns"] < RECENT_WRITE_NS:
+                return False
+        sources = [Path(text) for text in manifest.get("sources", [])]
+        if not sources:
+            return False
+        # The manifest names the exact compiled file it describes. Two
+        # processes starting at once could otherwise pair one's manifest with
+        # the other's blob; one read of a 4 MB file is cheap insurance.
+        try:
+            blob = COMPILED_RULES_PATH.read_bytes()
+        except OSError:
+            return False
+        if hashlib.sha256(blob).hexdigest() != manifest.get("compiled_sha256"):
+            return False
+        try:
+            rules = yara.load(str(COMPILED_RULES_PATH))
+        except Exception as exc:  # yara.Error, OSError, a different yara build
+            log.info("compiled rule cache not usable (%s); compiling instead", exc)
+            return False
+
+        self._untrusted_namespaces = self.packs.untrusted_namespaces()
+        self._pack_by_namespace = {str(k): str(v) for k, v in
+                                   dict(manifest.get("pack_by_namespace", {})).items()}
+        self.broken_packs = {str(k): str(v) for k, v in
+                             dict(manifest.get("broken_packs", {})).items()}
+        self.pack_rule_counts = {str(k): int(v) for k, v in
+                                 dict(manifest.get("pack_rule_counts", {})).items()}
+        for key, known in recorded.items():
+            if isinstance(known.get("sha256"), str):
+                self._file_hashes[key] = (known["size"], known["mtime_ns"], known["sha256"])
+        self.rules = rules
+        self.rule_sources = sources
+        log.info("loaded the ruleset compiled last time (%d file(s), all unchanged)",
+                 len(sources))
+        return True
+
+    def _compiled_cache_is_current(self, manifest: dict) -> bool:
+        """Does the blob on disk already come from exactly these inputs?
+
+        Fills in the blob's hash from the previous manifest when it does, so
+        the caller can save the manifest alone.
+        """
+        try:
+            previous = json.loads(COMPILED_MANIFEST_PATH.read_text(encoding="utf-8"))
+            blob = COMPILED_RULES_PATH.read_bytes()
+        except (OSError, ValueError):
+            return False
+        if not isinstance(previous, dict):
+            return False
+        for key in ("yara", "detection", "files", "sources"):
+            if previous.get(key) != manifest[key]:
+                return False
+        recorded = previous.get("compiled_sha256")
+        if not isinstance(recorded, str) or hashlib.sha256(blob).hexdigest() != recorded:
+            return False
+        manifest["compiled_sha256"] = recorded
+        return True
+
+    def _write_compiled_cache(self, rules, sources: list[Path]) -> None:
+        """Save what was just compiled, with enough to tell when it goes stale."""
+        entries = self._manifest_entries()
+        if entries is None:
+            return
+        for key, st in entries.items():
+            st["sha256"] = self._content_hash(Path(key))
+        manifest = {
+            "yara": getattr(yara, "__version__", ""),
+            "detection": DETECTION_VERSION,
+            "saved_at_ns": time.time_ns(),
+            "files": entries,
+            "sources": [str(path) for path in sources],
+            "pack_by_namespace": self._pack_by_namespace,
+            "broken_packs": self.broken_packs,
+            "pack_rule_counts": self.pack_rule_counts,
+        }
+        try:
+            COMPILED_RULES_PATH.parent.mkdir(parents=True, exist_ok=True)
+            # Same inputs, same blob: only the clock moves. Rewriting an
+            # identical binary file on every start made the on-access scanner
+            # look at it every time, and a compile that was refused only by
+            # the two-second rule still gets a fresh saved_at so the next
+            # start can trust it.
+            if self._compiled_cache_is_current(manifest):
+                config.atomic_write_text(COMPILED_MANIFEST_PATH, json.dumps(manifest))
+                return
+            staging = COMPILED_RULES_PATH.with_suffix(".tmp")
+            rules.save(str(staging))
+            os.replace(staging, COMPILED_RULES_PATH)
+            manifest["compiled_sha256"] = hashlib.sha256(
+                COMPILED_RULES_PATH.read_bytes()).hexdigest()
+            config.atomic_write_text(COMPILED_MANIFEST_PATH, json.dumps(manifest))
+        except Exception as exc:  # a convenience; losing it costs one compile
+            log.warning("could not write the compiled rule cache: %s", exc)
 
     def _validate_rules(self, candidate) -> str:
         """Check a candidate ruleset before adopting it.
@@ -649,7 +837,7 @@ class Scanner:
     def reload_rules(self) -> bool:
         """Recompile from disk. Used by the Reload button and after an update."""
         previous = self.rules
-        ok = self.load_rules()
+        ok = self.load_rules(allow_cached=False)
         if not ok and previous is not None:
             self.rules = previous
         if ok:
@@ -783,7 +971,7 @@ class Scanner:
 
         description = str(meta.get("description", "")).strip()
         detail = description or f"matched rule {match.rule}"
-        origin = self.packs.owner_of(namespace) if namespace else ""
+        origin = self._pack_by_namespace.get(namespace, "") if namespace else ""
         attribution = f", from the {origin} pack" if origin else ""
         location = f" inside {inside}" if inside else ""
 

@@ -34,9 +34,33 @@ import tempfile as _tempfile
 # Isolate the data directory before avguard is imported. See test_avguard.py
 # for why: objects built with default paths otherwise reach into the user's
 # real %LOCALAPPDATA%/AVGuard.
-_os.environ.setdefault(
-    "AVGUARD_DATA",
-    _os.path.join(_tempfile.gettempdir(), f"avguard-test-data-{_os.getpid()}"))
+_test_data = _os.path.join(_tempfile.gettempdir(), f"avguard-test-data-{_os.getpid()}")
+_os.environ.setdefault("AVGUARD_DATA", _test_data)
+def _remove_tree(path) -> None:
+    """rmtree that copes with read-only files.
+
+    Some tests make one on purpose, and rmtree(ignore_errors=True) then left
+    the whole directory behind without a word: 122 of them in TEMP.
+    """
+    import shutil as _shutil
+    import stat as _stat
+
+    def writable_then(func, target, _exc):
+        try:
+            _os.chmod(target, _stat.S_IWRITE)
+            func(target)
+        except OSError:
+            pass
+
+    _shutil.rmtree(path, onexc=writable_then)
+
+
+if _os.environ["AVGUARD_DATA"] == _test_data:
+    # This process made it, so this process removes it. 766 of these had
+    # piled up in TEMP before this line existed, and the whole suite ran
+    # three times slower for it.
+    import atexit as _atexit
+    _atexit.register(_remove_tree, _test_data)
 
 
 
@@ -49,7 +73,7 @@ class CliCase(unittest.TestCase):
 
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="avguard-cli-"))
-        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.addCleanup(_remove_tree, self.tmp)
 
         self._saved_data = os.environ.get("AVGUARD_DATA")
         os.environ["AVGUARD_DATA"] = str(self.tmp / "data")
@@ -215,6 +239,50 @@ class TestOutputSanity(CliCase):
                 _, output = self.run_cli(*command)
                 found = placeholder.findall(output)
                 self.assertEqual(found, [], f"unsubstituted placeholder in output: {found}")
+
+
+class TestTheCorpusSpreadsAcrossPrograms(unittest.TestCase):
+    """Measured before this: 400 files, 331 from System32, six program
+    directories. A pack ceiling measured against one vendor's folder is
+    weaker than it reads."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="avguard-corpus-"))
+        self.addCleanup(_remove_tree, self.tmp)
+        self.system = self.tmp / "System32"
+        self.system.mkdir()
+        for index in range(300):
+            (self.system / f"s{index}.dll").write_bytes(b"MZ" + bytes([index % 251]) * 64)
+        self.programs = self.tmp / "Program Files"
+        for app in range(40):
+            folder = self.programs / f"app{app}"
+            folder.mkdir(parents=True)
+            for index in range(12):
+                (folder / f"a{index}.exe").write_bytes(b"MZ" * 40)
+
+    def corpus(self):
+        import avguard.__main__ as cli
+        return cli._clean_corpus(limit=120, roots=[self.programs, self.system])
+
+    def test_no_directory_dominates(self):
+        from collections import Counter
+        corpus = self.corpus()
+        self.assertEqual(len(corpus), 120)
+        by_dir = Counter(path.parent for path in corpus)
+        self.assertLessEqual(by_dir[self.system], 40, "System32 is held to a third")
+        program_dirs = {d for d in by_dir if d != self.system}
+        self.assertLessEqual(max(by_dir[d] for d in program_dirs), 6)
+        self.assertGreaterEqual(len(program_dirs), 13)
+
+    def test_it_is_repeatable(self):
+        """verify compares today's rate with the one at install; the sample
+        must not drift between the two."""
+        self.assertEqual(self.corpus(), self.corpus())
+
+    def test_system32_fills_in_when_nothing_else_is_installed(self):
+        import avguard.__main__ as cli
+        alone = cli._clean_corpus(limit=120, roots=[self.system])
+        self.assertEqual(len(alone), 120)
 
 
 if __name__ == "__main__":

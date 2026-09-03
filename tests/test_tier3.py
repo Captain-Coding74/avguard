@@ -31,9 +31,33 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import os as _os
 import tempfile as _tempfile
 
-_os.environ.setdefault(
-    "AVGUARD_DATA",
-    _os.path.join(_tempfile.gettempdir(), f"avguard-test-data-{_os.getpid()}"))
+_test_data = _os.path.join(_tempfile.gettempdir(), f"avguard-test-data-{_os.getpid()}")
+_os.environ.setdefault("AVGUARD_DATA", _test_data)
+def _remove_tree(path) -> None:
+    """rmtree that copes with read-only files.
+
+    Some tests make one on purpose, and rmtree(ignore_errors=True) then left
+    the whole directory behind without a word: 122 of them in TEMP.
+    """
+    import shutil as _shutil
+    import stat as _stat
+
+    def writable_then(func, target, _exc):
+        try:
+            _os.chmod(target, _stat.S_IWRITE)
+            func(target)
+        except OSError:
+            pass
+
+    _shutil.rmtree(path, onexc=writable_then)
+
+
+if _os.environ["AVGUARD_DATA"] == _test_data:
+    # This process made it, so this process removes it. 766 of these had
+    # piled up in TEMP before this line existed, and the whole suite ran
+    # three times slower for it.
+    import atexit as _atexit
+    _atexit.register(_remove_tree, _test_data)
 
 
 
@@ -67,7 +91,7 @@ def _empty_packs(tmp: Path) -> PackStore:
 class TempCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="avguard-t3-"))
-        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.addCleanup(_remove_tree, self.tmp)
 
     def write(self, name: str, data: bytes | str) -> Path:
         path = self.tmp / name

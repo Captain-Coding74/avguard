@@ -50,9 +50,33 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import os as _os
 import tempfile as _tempfile
 
-_os.environ.setdefault(
-    "AVGUARD_DATA",
-    _os.path.join(_tempfile.gettempdir(), f"avguard-test-data-{_os.getpid()}"))
+_test_data = _os.path.join(_tempfile.gettempdir(), f"avguard-test-data-{_os.getpid()}")
+_os.environ.setdefault("AVGUARD_DATA", _test_data)
+def _remove_tree(path) -> None:
+    """rmtree that copes with read-only files.
+
+    Some tests make one on purpose, and rmtree(ignore_errors=True) then left
+    the whole directory behind without a word: 122 of them in TEMP.
+    """
+    import shutil as _shutil
+    import stat as _stat
+
+    def writable_then(func, target, _exc):
+        try:
+            _os.chmod(target, _stat.S_IWRITE)
+            func(target)
+        except OSError:
+            pass
+
+    _shutil.rmtree(path, onexc=writable_then)
+
+
+if _os.environ["AVGUARD_DATA"] == _test_data:
+    # This process made it, so this process removes it. 766 of these had
+    # piled up in TEMP before this line existed, and the whole suite ran
+    # three times slower for it.
+    import atexit as _atexit
+    _atexit.register(_remove_tree, _test_data)
 
 
 
@@ -85,7 +109,7 @@ def _empty_packs(tmp: Path) -> PackStore:
 class TempCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="avguard-dur-"))
-        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.addCleanup(_remove_tree, self.tmp)
         (self.tmp / "prot").mkdir()
 
     def write(self, name: str, data: bytes) -> Path:
@@ -785,6 +809,103 @@ class TestGuardsSurviveTwoSpellings(TempCase):
         """A comparison that says yes to everything guards nothing."""
         real, _link = self._linked()
         self.assertFalse(SelfProtection([real]).is_protected(self.tmp / "elsewhere.txt"))
+
+
+# --------------------------------------------- round two: measured, then fixed
+
+class TestExtendedLengthPrefix(TempCase):
+    """`\\\\?\\C:\\x` and `C:\\x` are the same file. Measured before the fix:
+    is_protected(), path_within() and same_path() all said False for a
+    protected file spelled with the prefix -- a guard that a prefix defeats."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.root = self.tmp / "prot"
+        (self.root / "rules").mkdir(parents=True, exist_ok=True)
+        self.target = self.root / "rules" / "x.yara"
+        self.target.write_text("x", encoding="utf-8")
+        self.prefixed = Path(chr(92) * 2 + "?" + chr(92) + str(self.target))
+
+    @unittest.skipUnless(sys.platform == "win32", "a Windows spelling")
+    def test_the_prefixed_spelling_is_still_ours(self):
+        from avguard.protection import path_within, same_path
+        prot = SelfProtection([self.root])
+        self.assertTrue(prot.is_protected(self.prefixed))
+        self.assertTrue(path_within(self.prefixed, self.root))
+        self.assertTrue(same_path(self.prefixed, self.target))
+
+    def test_a_sibling_that_merely_starts_with_our_name_is_outside(self):
+        from avguard.protection import path_within
+        prot = SelfProtection([self.root])
+        sibling = self.tmp / "prot2" / "rules" / "x.yara"
+        sibling.parent.mkdir(parents=True)
+        sibling.write_text("x", encoding="utf-8")
+        self.assertFalse(prot.is_protected(sibling))
+        self.assertFalse(path_within(sibling, self.root))
+
+    def test_lookalike_spellings_are_judged_by_what_the_os_opens(self):
+        """The audit's two cases: `<dir>..` and `<dir> ` as a component.
+
+        The guard may err towards protection: Windows opens the directory
+        `prot..` as `prot` when it is the last component, so resolve() lands
+        inside our tree for a full path that opens nothing, and saying
+        "protected" about a file that does not exist costs nobody anything.
+        It must never err the other way: a spelling the OS maps onto our
+        file has to be ours.
+        """
+        from avguard.protection import same_path
+        prot = SelfProtection([self.root])
+        for spelling in (self.tmp / "prot.." / "rules" / "x.yara",
+                         self.tmp / "prot " / "rules" / "x.yara"):
+            opens_ours = spelling.exists() and same_path(spelling.resolve(), self.target)
+            if opens_ours:
+                self.assertTrue(prot.is_protected(spelling),
+                                f"{spelling} opens our file and is not protected")
+
+
+class TestAnExceptionCanBeUndone(TempCase):
+    """A restore is a permanent, machine-wide exception. Before this it could
+    not be seen or removed, the cache generation did not know about it, and a
+    second copy of restored bytes kept whatever verdict the cache held."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        from avguard.allowlist import Allowlist
+        self.allowlist = Allowlist(path=self.tmp / "allow.json")
+        self.scanner = Scanner(config.Config(cloud_enabled=False),
+                               SelfProtection([self.tmp / "prot"]),
+                               rules_path=RULES,
+                               cache=ScanCache(path=self.tmp / "c.json"),
+                               packs=_empty_packs(self.tmp),
+                               allowlist=self.allowlist)
+
+    def test_the_generation_knows_about_exceptions(self):
+        from avguard.scanner import SELFTEST_MARKER
+        before = self.scanner.detection_generation()
+        digest = hashlib.sha256(SELFTEST_MARKER).hexdigest()
+        self.allowlist.add(digest, "kept.bin", ["marker"])
+        self.assertNotEqual(before, self.scanner.detection_generation())
+        self.allowlist.remove(digest)
+        self.assertEqual(before, self.scanner.detection_generation())
+
+    def test_a_second_copy_follows_the_decision_both_ways(self):
+        from avguard.scanner import Level, SELFTEST_MARKER
+        elsewhere = self.write("elsewhere.bin", SELFTEST_MARKER)
+        self.assertIs(self.scanner.scan(elsewhere).level, Level.MALICIOUS)
+
+        digest = hashlib.sha256(SELFTEST_MARKER).hexdigest()
+        self.allowlist.add(digest, "kept.bin", ["marker"])
+        # The cache does not know yet. This is why the GUI re-keys.
+        self.assertIs(self.scanner.scan(elsewhere).level, Level.MALICIOUS)
+        self.scanner.rekey_cache()
+        verdict = self.scanner.scan(elsewhere)
+        self.assertIs(verdict.level, Level.CLEAN)
+        self.assertIn("you chose to keep", verdict.reasons[0])
+
+        # And undone: the copy is judged on its bytes again.
+        self.assertTrue(self.allowlist.remove(digest))
+        self.scanner.rekey_cache()
+        self.assertIs(self.scanner.scan(elsewhere).level, Level.MALICIOUS)
 
 
 if __name__ == "__main__":

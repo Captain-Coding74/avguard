@@ -74,6 +74,7 @@ class SelfProtection:
     @staticmethod
     def _forms(path: Path) -> set[Path]:
         """Every spelling of a path this platform might hand us."""
+        path = _strip_extended_prefix(path)
         forms: set[Path] = set()
         try:
             forms.add(Path(os.path.abspath(path)))
@@ -138,6 +139,23 @@ def path_within(candidate: Path | str, root: Path | str) -> bool:
             if _same(form, base) or _within(form, base):
                 return True
     return False
+
+
+def _strip_extended_prefix(path: Path) -> Path:
+    """`\\\\?\\C:\\x` and `C:\\x` name the same file. Compare the same text.
+
+    The extended-length prefix is a legal spelling of any Windows path, and
+    `--scan` accepts whatever is typed. Measured before this: is_protected(),
+    path_within() and same_path() all said False for a protected file spelled
+    with the prefix -- a guard that a prefix defeats has a hole in it.
+    """
+    text = str(path)
+    for prefix in ("\\\\?\\", "\\\\.\\"):
+        if text.startswith(prefix + "UNC\\"):
+            return Path("\\\\" + text[len(prefix) + 4:])
+        if text.startswith(prefix):
+            return Path(text[len(prefix):])
+    return path
 
 
 def _normalise(path: Path) -> str:

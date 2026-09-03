@@ -35,9 +35,33 @@ import tempfile as _tempfile
 
 # Per run, not a fixed path: a shared directory accumulates state between
 # runs, and a stale allowlist entry from one run silently broke the next.
-_os.environ.setdefault(
-    "AVGUARD_DATA",
-    _os.path.join(_tempfile.gettempdir(), f"avguard-test-data-{_os.getpid()}"))
+_test_data = _os.path.join(_tempfile.gettempdir(), f"avguard-test-data-{_os.getpid()}")
+_os.environ.setdefault("AVGUARD_DATA", _test_data)
+def _remove_tree(path) -> None:
+    """rmtree that copes with read-only files.
+
+    Some tests make one on purpose, and rmtree(ignore_errors=True) then left
+    the whole directory behind without a word: 122 of them in TEMP.
+    """
+    import shutil as _shutil
+    import stat as _stat
+
+    def writable_then(func, target, _exc):
+        try:
+            _os.chmod(target, _stat.S_IWRITE)
+            func(target)
+        except OSError:
+            pass
+
+    _shutil.rmtree(path, onexc=writable_then)
+
+
+if _os.environ["AVGUARD_DATA"] == _test_data:
+    # This process made it, so this process removes it. 766 of these had
+    # piled up in TEMP before this line existed, and the whole suite ran
+    # three times slower for it.
+    import atexit as _atexit
+    _atexit.register(_remove_tree, _test_data)
 
 
 
@@ -57,7 +81,7 @@ RULES = Path(__file__).resolve().parent.parent / "rules" / "malware.yara"
 class TempCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="avguard-t2-"))
-        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.addCleanup(_remove_tree, self.tmp)
 
     def scanner(self, **overrides) -> Scanner:
         cfg = config.Config(cloud_enabled=False, **overrides)

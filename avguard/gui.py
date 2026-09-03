@@ -636,7 +636,9 @@ class AVGuardApp(tb.Window):
         record = self.quarantine.get(entry_id)
         confirm = Messagebox.yesno(
             f"Put '{record.original_name}' back at:\n{record.original_path}\n\n"
-            f"It was quarantined for: {'; '.join(record.reasons) or 'no reason given'}",
+            f"It was quarantined for: {'; '.join(record.reasons) or 'no reason given'}\n\n"
+            "AVGuard will not flag this file again, anywhere on this PC, until you "
+            "remove it under Settings > Files you chose to keep.",
             "Restore this file?", parent=self,
         )
         if confirm != "Yes":
@@ -647,7 +649,9 @@ class AVGuardApp(tb.Window):
             Messagebox.show_error(str(exc), "Restore failed", parent=self)
             log.error("restore failed: %s", exc)
         else:
-            self.cache.invalidate(target)
+            # restore() recorded an exception for these bytes. Re-key rather
+            # than invalidate one path: every copy anywhere is judged afresh.
+            self._allowlist_changed()
             log.info("restored %s", target)
         self._refresh_quarantine()
 
@@ -767,7 +771,9 @@ class AVGuardApp(tb.Window):
     def _show_settings(self) -> None:
         dialogs.SettingsDialog(self, self.cfg, self._settings_saved,
                                pack_store=self.scanner.packs,
-                               on_packs_changed=self._packs_changed)
+                               on_packs_changed=self._packs_changed,
+                               allowlist=self.scanner.allowlist,
+                               on_allowlist_changed=self._allowlist_changed)
 
     def _packs_changed(self) -> None:
         """A pack was trusted, untrusted or removed. Adopt it now.
@@ -782,6 +788,18 @@ class AVGuardApp(tb.Window):
         self.scanner.rekey_cache()
         self.cache = self.scanner.cache
         log.info("rule packs changed; ruleset and cache rebuilt")
+
+    def _allowlist_changed(self) -> None:
+        """An exception was added or removed. Every cached verdict goes.
+
+        The generation includes the exception digests, so re-keying discards
+        every verdict that could have depended on one -- a second copy of
+        restored bytes elsewhere, a copy that was CLEAN only by exception.
+        Invalidating the one path a restore put back was not enough.
+        """
+        discarded = self.scanner.rekey_cache()
+        self.cache = self.scanner.cache
+        log.info("kept-files list changed; %d cached verdict(s) discarded", discarded)
 
     def _settings_saved(self) -> None:
         """Apply what can be applied live, and say what cannot."""

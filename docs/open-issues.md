@@ -55,8 +55,27 @@ Ranked by the same rule as everything else in this project:
 | 31 | `if __name__ == "__main__":` sat above half the classes in five test files, so direct execution skipped them | `python tests/test_*.py` now runs every class |
 | 32 | The self-match check walked three directories; a pack matching `tests/`, `tools/` or another installed pack passed | `tests/test_rulepacks.py` |
 | 33 | Health summed the pack index's `rule_count`: a pack whose directory had been deleted still reported its rules as loaded | `tests/test_rulepacks.py` |
+| 34 | **`\\?\`-prefixed paths walked straight past self-protection** | `tests/test_durability.py` |
+| 35 | A restore was a permanent, machine-wide exception nobody could see or undo, and the cache did not know it existed | `tests/test_durability.py` |
+| 36 | The first launch of the day took ten seconds before the window appeared | `tests/test_compiled_cache.py` |
+| 37 | The clean corpus was 83% System32, across six program folders | `tests/test_cli.py` |
+| 38 | `owner_of()` was a linear scan with a path resolution on every YARA match | `tests/test_compiled_cache.py` |
+| 39 | `--no-gui-deps` proved its blocking with one name and passed vacuously without Pillow | `tools/ci_tests.py` self-check |
 
 ### Notes worth keeping
+
+**Round two was measured first (34-39).** The plan, the numbers before, and
+the numbers after are in [next-2.md](next-2.md). Two of the audit's "leave
+alone" calls were wrong once measured: the `\\?\` prefix is a legal spelling
+of any path, not an index attack, and it defeated every guard in
+protection.py; and the ten-second first launch was never the compile (0.17 s)
+but the first touch of 310 small files, which a compiled-ruleset cache
+replaces with one -- 8.24 s became 0.27 s. The cache is trusted only when
+every rule file's size and mtime match what was recorded, none was written
+within two seconds of the cache, and the blob's own hash matches the
+manifest; reload never uses it. A restore can now be seen and undone under
+Settings, and the exception digests are part of the detection generation, so
+undoing one reaches every cached copy, not only the path that was put back.
 
 **"Reports only" reduced detection (25).** The cloud lookup ran only when the
 local verdict was CLEAN. One capped 50-point finding from an unpromoted pack

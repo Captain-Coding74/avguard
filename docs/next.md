@@ -83,6 +83,8 @@ afterwards, so a number recorded months ago is not evidence about today.
 
 ---
 
+> Round two, written after this was all done and measured: [next-2.md](next-2.md).
+
 ## Part 3 — still not doing
 
 Unchanged from [open-issues.md](open-issues.md), and worth restating so the
