@@ -229,6 +229,15 @@ cache that cannot name its own generation neither reads nor writes — the GUI
 used to build one, which meant it replayed verdicts from any ruleset for the
 full 30-day TTL and then erased the CLI's cache by saving an empty one over it.
 
+**The compiled ruleset is kept between runs.** With a real pack installed the
+first launch of the day took ten seconds before the window appeared -- not the
+compile, which is 0.17 s, but the first touch of 310 small rule files. The
+compiled rules are saved beside a manifest of every source file's size, mtime
+and hash, and loaded in a quarter of a second when every file is exactly as
+recorded. Any difference, a corrupt cache, a different yara build, or a file
+written within two seconds of the cache falls back to compiling; Reload never
+uses it. Measured in [docs/next-2.md](docs/next-2.md).
+
 **Restoring something is a decision the scanner remembers.** It used to teach
 it nothing: with automatic quarantine on, a restored file was detected again
 and taken away about a second later, and the only escape was excluding its
@@ -237,7 +246,12 @@ whole folder. A restore now records the SHA-256 of those exact bytes in
 a publisher — so editing the file changes its hash and the decision expires by
 itself. It overrides a detection, including a signature match, because you
 looked at that file and said keep it; the verdict always says so, and an
-allowed file never merely looks clean.
+allowed file never merely looks clean. Every such decision is listed under
+Settings > Files you chose to keep, where it can be withdrawn, and withdrawing
+it reaches every cached copy of those bytes, not only the path that was put
+back. A decision recorded by one AVGuard process -- `--restore` in a terminal
+while the window is open -- is seen by the other without a restart: the
+allowlist notices its file changing, and a cached verdict defers to it.
 
 **One writer at a time.** Both entry points take an exclusive lock on
 `data/avguard.lock`. Two AVGuard processes sharing the quarantine store used to
@@ -286,12 +300,15 @@ python -m avguard --packs list
 ```
 
 A pack is not trusted because of where it came from. It is admitted only if it
-compiles, declares descriptions, matches none of AVGuard's own files, and —
-the check that matters — stays under a 1% false-positive rate when measured
-against 400 real binaries **from your machine**. Fail any of those and the pack
-is refused with the measurement printed, and nothing on disk changes. That is
-the same bar the shipped rules face in `tests/test_rules.py`; a stranger's
-rules do not get an easier one.
+compiles, declares descriptions, matches none of AVGuard's own files or of
+any other installed pack, and — the check that matters — stays under a 1%
+false-positive rate per rule and 5% for the pack as a whole when measured
+against 400 real binaries **from your machine**: a few files from each of
+many folders under Program Files, the per-user Programs folder and System32,
+so no single vendor's binaries dominate the sample. Fail any of those and the
+pack is refused with the reason printed, and nothing on disk changes. That is
+the same bar, on the same corpus, the shipped rules face in
+`tests/test_rules.py`; a stranger's rules do not get an easier one.
 
 An imported rule **cannot move a file**, whatever severity it claims. Somebody
 else's `critical` follows conventions this program knows nothing about, so it
@@ -310,6 +327,10 @@ the same check yourself:
 ```bash
 python -m avguard --packs verify
 ```
+
+A pack that no longer passes is set back to reports-only, and the output
+names what failed -- a compile error, a rule over the ceiling -- rather than a
+rate it never measured.
 
 Nothing is ever fetched on its own. No auto-update, no check on startup. A
 scanner that changes its own detection logic overnight is one that can start
