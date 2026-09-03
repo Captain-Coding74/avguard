@@ -559,3 +559,123 @@ class TestSharedStateHasOneOwner(TempCase):
         final = PackStore(directory=self.store.directory,
                           index_path=self.store.index_path)
         self.assertEqual({p.name for p in final.packs()}, {"one", "two"})
+
+
+class TestABadPackCostsOnlyThatPack(TempCase):
+    """load_rules() promised "a bad rule should cost you that rule, not all
+    detection", and did not keep it.
+
+    Every rule file was compiled in one yara.compile call, so a single
+    unparsable pack file -- a truncated download, an upstream edit, a disk
+    error -- aborted the whole thing. self.rules stayed None and every rule
+    including the shipped EICAR rule went dark for the session, with only the
+    hardcoded byte signatures still firing. Importing one real pack multiplied
+    the files able to do that by 310, all maintained by somebody else.
+
+    Verified: with one broken pack file, the shipped EICAR rule stopped
+    matching. Compilation is staged now: our own rules first, then each pack
+    on its own, and a pack that fails is left out, named, and shown in Health.
+    """
+
+    def _install(self, name: str, needle: str) -> None:
+        rule = self.rule_file(f"{name}.yara", "\n".join([
+            f"rule {name.title()}_Rule {{",
+            "  meta:",
+            '    description = "d"',
+            '    severity = "medium"',
+            "  strings:",
+            f'    $a = "{needle}"',
+            "  condition:",
+            "    $a",
+            "}",
+        ]))
+        self.store.install(name, [rule],
+                           Admission(accepted=True, rule_count=1, corpus_size=1),
+                           licence="MIT")
+
+    def _scanner(self, tag: str) -> Scanner:
+        return Scanner(config.Config(cloud_enabled=False),
+                       SelfProtection([self.tmp / "nothing"]),
+                       cache=ScanCache(path=self.tmp / f"{tag}.json"),
+                       packs=self.store,
+                       allowlist=Allowlist(path=self.tmp / "allow.json"))
+
+    def _break(self, name: str) -> None:
+        (self.store.pack_dir(name) / f"{name}.yara").write_text(
+            "rule Broken { this is not yara", encoding="utf-8")
+
+    def test_the_shipped_rules_survive_a_broken_pack(self):
+        """The case that was actually broken."""
+        from avguard.scanner import EICAR
+        self._install("vendor", "zz-vendor-needle")
+        self._break("vendor")
+        scanner = self._scanner("a")
+        self.assertIsNotNone(scanner.rules, "all detection went dark")
+        self.assertTrue(scanner.rules.match(data=EICAR),
+                        "the shipped EICAR rule must keep firing")
+
+    def test_a_healthy_pack_survives_a_broken_sibling(self):
+        self._install("good", "zz-good-needle")
+        self._install("bad", "zz-bad-needle")
+        self._break("bad")
+        scanner = self._scanner("b")
+        self.assertTrue(scanner.rules.match(data=b"xx zz-good-needle xx"))
+
+    def test_the_broken_pack_is_named_not_hidden(self):
+        """A failure nobody can see is the v1 failure."""
+        self._install("vendor", "zz-vendor-needle")
+        self._break("vendor")
+        scanner = self._scanner("c")
+        self.assertIn("vendor", scanner.broken_packs)
+        self.assertIn("syntax error", scanner.broken_packs["vendor"])
+
+    def test_the_broken_pack_contributes_no_rules(self):
+        self._install("vendor", "zz-vendor-needle")
+        self._break("vendor")
+        scanner = self._scanner("d")
+        self.assertFalse(scanner.rules.match(data=b"xx zz-vendor-needle xx"))
+
+    def test_a_healthy_load_reports_nothing_broken(self):
+        self._install("vendor", "zz-vendor-needle")
+        self.assertEqual(self._scanner("e").broken_packs, {})
+
+    def test_our_own_rules_failing_is_still_loud(self):
+        """Staging must not turn a real failure of OUR rules into a quiet one."""
+        bad_rules = self.rule_file("own.yara", "rule Broken { this is not yara")
+        scanner = Scanner(config.Config(cloud_enabled=False),
+                          SelfProtection([self.tmp / "nothing"]),
+                          rules_path=bad_rules,
+                          cache=ScanCache(path=self.tmp / "f.json"),
+                          packs=self.store,
+                          allowlist=Allowlist(path=self.tmp / "allow.json"))
+        self.assertIsNone(scanner.rules)
+
+
+class TestEditingAnInstalledPackIsNoticed(TempCase):
+    """detection_generation() skipped pack files in favour of the sha256
+    recorded at install, which is never re-measured. Edit an installed pack's
+    .yara and the scanner compiled the new rules while the generation stayed
+    bit-identical -- so every verdict cached under the old rules was replayed
+    for the full TTL. That is exactly the failure DETECTION_VERSION exists to
+    prevent, reintroduced by a performance tweak.
+    """
+
+    def test_an_edited_pack_file_changes_the_generation(self):
+        rule = self.simple_rule(needle="zz-original")
+        self.store.install("vendor", [rule],
+                           Admission(accepted=True, rule_count=1, corpus_size=1),
+                           licence="MIT")
+        scanner = Scanner(config.Config(cloud_enabled=False),
+                          SelfProtection([self.tmp / "nothing"]),
+                          cache=ScanCache(path=self.tmp / "g.json"),
+                          packs=self.store,
+                          allowlist=Allowlist(path=self.tmp / "allow.json"))
+        before = scanner.detection_generation()
+
+        installed = self.store.pack_dir("vendor") / "pack.yara"
+        installed.write_text(installed.read_text(encoding="utf-8")
+                             .replace("zz-original", "zz-edited"), encoding="utf-8")
+
+        self.assertNotEqual(before, scanner.detection_generation(),
+                            "an edited pack must invalidate the cache")
+

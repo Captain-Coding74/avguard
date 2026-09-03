@@ -41,8 +41,25 @@ Ranked by the same rule as everything else in this project:
 | 17 | A restore was recorded in one Allowlist and read from another, so it never took effect | `tests/test_rulepacks.py` |
 | 18 | Settings wrote pack trust changes the running scanner never saw | `tests/test_rulepacks.py` |
 | 19 | **The test suite wrote into the user's real allowlist** | every test module isolates `AVGUARD_DATA` |
+| 20 | **One broken pack file switched off every rule, the shipped ones included** | `tests/test_rulepacks.py` |
+| 21 | Editing an installed pack left the cache generation unchanged | `tests/test_rulepacks.py` |
 
 ### Notes worth keeping
+
+**One compile for everything (20, 21).** `load_rules()` promised "a bad rule
+should cost you that rule, not all detection" and compiled every file in one
+`yara.compile` call, so a single unparsable pack file -- a truncated download,
+an upstream edit, a disk error -- aborted the lot. Verified: with one broken
+pack file the shipped EICAR rule stopped matching, and only the hardcoded byte
+signatures still fired. Importing a real pack multiplied the files able to do
+that by 310, all maintained by somebody else.
+
+Compilation is staged now: our own rules first, then each pack on its own, and
+a pack that fails is left out, named in the log, and shown red in Health. The
+generation hash also skipped pack files in favour of the sha256 recorded at
+install -- so an edited pack compiled new rules under a bit-identical
+generation and every cached verdict was replayed. It hashes the contents again;
+3 MB of rules costs milliseconds, a stale cache costs trust.
 
 **Shared state with two owners (17, 18, 19).** Three faults, one shape: an
 object that backs a file on disk was constructed twice.

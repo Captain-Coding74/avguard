@@ -189,6 +189,13 @@ class PackStore:
             found.extend(sorted(directory.glob("*.yar")))
         return found
 
+    def rule_files_for(self, name: str) -> list[Path]:
+        """One pack's rule files, so the scanner can compile it on its own."""
+        directory = self.pack_dir(name)
+        if not directory.is_dir():
+            return []
+        return sorted(directory.glob("*.yara")) + sorted(directory.glob("*.yar"))
+
     def untrusted_namespaces(self) -> set[str]:
         """Resolved paths whose rules must be capped to medium.
 

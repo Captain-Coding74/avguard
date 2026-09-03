@@ -92,7 +92,7 @@ SUSPICIOUS_AT = 50
 # Learned by shipping it: the archive inspector stopped calling large resource
 # packs "hostile", and the machine kept reporting the old verdict because the
 # generation hash only covered the rule file.
-DETECTION_VERSION = 9
+DETECTION_VERSION = 10
 
 # Heuristics never add up to a condemnation, however many of them agree.
 #
@@ -198,6 +198,20 @@ def decide(findings: Sequence[Finding], malicious_at: int = MALICIOUS_AT) -> Lev
     if hard + soft >= SUSPICIOUS_AT:
         return Level.SUSPICIOUS
     return Level.CLEAN
+
+
+def _namespaces(paths: list[Path]) -> dict[str, str]:
+    """Keyed on the resolved path, never the stem -- see load_rules."""
+    return {str(p.resolve()): str(p) for p in paths}
+
+
+def _dedupe(paths: list[Path]) -> list[Path]:
+    """Resolved-path dedupe, so a pack nested under a rules directory is not
+    compiled twice under two namespaces."""
+    unique: dict[str, Path] = {}
+    for path in paths:
+        unique.setdefault(str(path.resolve()), path)
+    return list(unique.values())
 
 
 def _is_junction(path: Path) -> bool:
@@ -404,6 +418,7 @@ class Scanner:
         # three tests fail the moment a real pack was added.
         self.packs = packs if packs is not None else rulepacks.PackStore()
         self._untrusted_namespaces: set[str] = set()
+        self.broken_packs: dict[str, str] = {}
         self._max_signature = max((len(s) for s in SIGNATURES.values()), default=0)
         self.load_rules()
         if cache is None:
@@ -453,15 +468,13 @@ class Scanner:
             digest.update(f"pack={pack.name}|{pack.sha256}|{pack.trusted}".encode())
         digest.update(f"sig={WEIGHT_SIGNATURE}|ent={WEIGHT_ENTROPY}"
                       f"|pe={WEIGHT_PE_STRUCTURE}|arc={WEIGHT_ARCHIVE_PROBLEM}".encode())
-        # Pack files are covered by pack.sha256 above -- a real content hash,
-        # recorded once at install time -- so they are skipped here. That is
-        # where the volume is: 310 files in the pack measured against 1 shipped
-        # rule file, which is what made reading everything expensive.
-        pack_files = {str(p.resolve()) for p in self.packs.rule_files()}
+        # Every rule file, packs included. An earlier version skipped pack
+        # files in favour of the sha256 recorded at install, which is never
+        # re-measured: edit an installed pack's .yara and the scanner compiled
+        # the new rules while the generation stayed bit-identical, so every
+        # verdict cached under the old rules was replayed forever. Reading
+        # 3 MB of rules costs a few milliseconds; a stale cache costs trust.
         for path in self.rule_files():
-            resolved = str(path.resolve())
-            if resolved in pack_files:
-                continue
             # Contents, not (name, size, mtime). An earlier version used the
             # stat, and CI caught two genuinely different rulesets hashing
             # identically: same filename, same size, and -- on a fast
@@ -481,20 +494,17 @@ class Scanner:
         The user's rules live in their data directory, so updating AVGuard
         replaces `rules/` without touching anything they wrote.
         """
+        return _dedupe(self.own_rule_files() + self.packs.rule_files())
+
+    def own_rule_files(self) -> list[Path]:
+        """Shipped and user rules only -- the ones this program answers for."""
         found: list[Path] = []
         for directory in (self.rules_path.parent, config.USER_RULES_DIR):
             if not directory.is_dir():
                 continue
             found.extend(sorted(directory.glob("*.yara")))
             found.extend(sorted(directory.glob("*.yar")))
-        found.extend(self.packs.rule_files())
-
-        # Resolved-path dedupe: a pack directory nested under one of the above
-        # would otherwise be compiled twice under two namespaces.
-        unique: dict[str, Path] = {}
-        for path in found:
-            unique.setdefault(str(path.resolve()), path)
-        return list(unique.values())
+        return _dedupe(found)
 
     def load_rules(self) -> bool:
         """Compile every ruleset, validate it, and only then adopt it.
@@ -512,40 +522,64 @@ class Scanner:
             log.error("yara-python is not installed; rule matching is unavailable")
             return False
 
-        sources = self.rule_files()
-        if not sources:
+        own = self.own_rule_files()
+        if not own:
             log.error("no rule files found in %s or %s; rule matching is unavailable",
                       self.rules_path.parent, config.USER_RULES_DIR)
             return False
 
-        namespaces = {}
-        for path in sources:
-            # Keyed on the resolved path, never the stem. The old key compared
-            # path.name against a dict keyed by path.stem, so the collision
-            # guard never fired: a user rule file named malware.yara -- the
-            # documented way to add rules, and the obvious name to choose --
-            # silently replaced the entire shipped ruleset. EICAR stopped
-            # matching while the log still said two files had compiled and the
-            # Health view still listed both.
-            namespaces[str(path.resolve())] = str(path)
-
+        # Stage one: the rules this program answers for. If THESE do not
+        # compile, that is the loud failure it has always been.
         try:
-            if len(namespaces) != len(sources):
-                log.error("two rule files resolved to the same namespace; "
-                          "refusing to load rather than silently dropping one")
-                return False
-            candidate = yara.compile(filepaths=namespaces)
+            yara.compile(filepaths=_namespaces(own))
         except yara.Error as exc:
             self._report_rule_failure(f"rules failed to compile: {exc}")
             return False
 
-        self._untrusted_namespaces = self.packs.untrusted_namespaces()
+        # Stage two: each pack on its own. One unparsable file -- a truncated
+        # download, an upstream edit, a disk error -- used to abort the single
+        # combined compile, and every rule including the shipped EICAR rule
+        # went dark for the session. Importing a real pack multiplied the
+        # files able to do that by 310, all maintained by somebody else. A bad
+        # pack costs that pack, is named in the log, and is shown in Health.
+        self.broken_packs = {}
+        accepted_pack_files: list[Path] = []
+        for pack in self.packs.packs():
+            files = self.packs.rule_files_for(pack.name)
+            if not files:
+                continue
+            try:
+                yara.compile(filepaths=_namespaces(files))
+            except yara.Error as exc:
+                self.broken_packs[pack.name] = str(exc)
+                log.error("rule pack %s failed to compile and is left out: %s",
+                          pack.name, exc)
+                continue
+            accepted_pack_files.extend(files)
+
+        sources = _dedupe(own + accepted_pack_files)
+        namespaces = _namespaces(sources)
+        if len(namespaces) != len(sources):
+            log.error("two rule files resolved to the same namespace; "
+                      "refusing to load rather than silently dropping one")
+            return False
+
+        try:
+            candidate = yara.compile(filepaths=namespaces)
+        except yara.Error as exc:
+            self._report_rule_failure(f"rules failed to compile together: {exc}")
+            return False
+
+        untrusted = self.packs.untrusted_namespaces()
 
         problem = self._validate_rules(candidate)
         if problem:
             self._report_rule_failure(problem)
             return False
 
+        # Ruleset and cap are adopted in the same breath, so a failed load can
+        # never leave new namespaces paired with an old compiled ruleset.
+        self._untrusted_namespaces = untrusted
         self.rules = candidate
         self.rule_sources = sources
         shipped = [p.name for p in sources if str(p.resolve()) not in self._untrusted_namespaces]

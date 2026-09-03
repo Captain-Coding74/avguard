@@ -832,6 +832,12 @@ class AVGuardApp(tb.Window):
                     "catch. Add one with: avguard --packs add <folder>")
         parts = []
         for pack in packs:
+            broken = self.scanner.broken_packs.get(pack.name)
+            if broken:
+                # Left out of the ruleset, and said so here rather than only in
+                # a log nobody reads. The rest of detection is unaffected.
+                parts.append(f"{pack.name}: FAILED TO COMPILE, left out - {broken[:60]}")
+                continue
             state = "can move files" if pack.trusted else "reports only"
             parts.append(f"{pack.name} ({pack.rule_count:,} rules, {state})")
         return "; ".join(parts)
@@ -844,7 +850,7 @@ class AVGuardApp(tb.Window):
         checks = [
             ("Detection rules", rules_ok, self._describe_rules() if rules_ok
              else "FAILED TO COMPILE - most detection is off. See the log."),
-            ("Rule packs", True, self._describe_packs()),
+            ("Rule packs", not self.scanner.broken_packs, self._describe_packs()),
             ("Real-time protection", watching,
              f"watching {len(self.monitor.watched)} folder(s)" if watching
              else ("; ".join(broken) if broken else "not running")),
