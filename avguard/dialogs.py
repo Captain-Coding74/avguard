@@ -255,6 +255,13 @@ class SettingsDialog(tb.Toplevel):
         self.keep_list.delete(0, END)
         self.allowlist.reload()
         entries = self.allowlist.entries()
+        # Each row remembers its digest. The button used to index a FRESH
+        # entries() with the row number, and the allowlist is the scanner's
+        # shared object under a dialog that is not modal: a restore from the
+        # main window, or a real-time scan picking up another process's
+        # decision, put a newer entry on top and every row shifted down. The
+        # user confirmed "stop keeping v1" and v2 was removed.
+        self._keep_shas = [entry.sha256 for entry in entries]
         if not entries:
             self.keep_list.insert(END, "  (none - nothing has been restored)")
             return
@@ -266,18 +273,27 @@ class SettingsDialog(tb.Toplevel):
 
     def _stop_keeping(self) -> None:
         selection = self.keep_list.curselection()
-        entries = self.allowlist.entries()
-        if not selection or not entries or selection[0] >= len(entries):
+        shas = getattr(self, "_keep_shas", [])
+        if not selection or not shas or selection[0] >= len(shas):
             Messagebox.show_info("Select a kept file first.", "AVGuard", parent=self)
             return
-        entry = entries[selection[0]]
+        sha = shas[selection[0]]
+        entry = next((e for e in self.allowlist.entries() if e.sha256 == sha), None)
+        if entry is None:
+            Messagebox.show_info("That entry is already gone; the list has changed.",
+                                 "AVGuard", parent=self)
+            self._refresh_allowlist()
+            return
         if Messagebox.yesno(
                 f"Stop keeping '{entry.name or entry.sha256[:12]}'?" + CHR_NL + CHR_NL
                 + "If a file with these exact bytes is found again it will be "
                   "flagged, and moved if the evidence is hard enough.",
                 "Remove this exception?", parent=self) != "Yes":
             return
-        self.allowlist.remove(entry.sha256)
+        try:
+            self.allowlist.remove(sha)
+        except OSError as exc:
+            Messagebox.show_error(f"Could not record the change: {exc}", "AVGuard", parent=self)
         if self._on_allowlist_changed:
             self._on_allowlist_changed()
         self._refresh_allowlist()

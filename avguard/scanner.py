@@ -101,6 +101,9 @@ COMPILED_MANIFEST_PATH = config.DATA_DIR / "rules.compiled.json"
 # recorded is never trusted from its stat alone: two writes inside one
 # timestamp tick look identical to stat(), and CI has produced exactly that.
 RECENT_WRITE_NS = 2 * 10**9
+# How often a scanning process looks at packs.json for another process's
+# change of mind. One stat, and only when a scan happens.
+PACKS_CHECK_INTERVAL = 2.0
 
 # Heuristics never add up to a condemnation, however many of them agree.
 #
@@ -442,6 +445,8 @@ class Scanner:
         # sha256 of each rule file keyed on its stat, so the generation can be
         # computed without re-reading 3 MB of rules on every start.
         self._file_hashes: dict[str, tuple[int, int, str]] = {}
+        self._packs_checked_at = 0.0
+        self._packs_sync_lock = threading.Lock()
         self._max_signature = max((len(s) for s in SIGNATURES.values()), default=0)
         self.load_rules()
         if cache is None:
@@ -573,6 +578,16 @@ class Scanner:
 
         if allow_cached and self._adopt_compiled_cache():
             return True
+        if not allow_cached:
+            # Reload means "look again". The memo answered from its stat key,
+            # so an edit that kept size and mtime was compiled but neither
+            # the generation nor the saved blob changed.
+            self._file_hashes.clear()
+
+        # The stat witnesses for the cache are taken BEFORE compiling. Taken
+        # after, a rule file rewritten during the compile gave a manifest
+        # describing the new content beside a blob compiled from the old one.
+        witnesses = self._manifest_entries()
 
         # Stage one: the rules this program answers for. If THESE do not
         # compile, that is the loud failure it has always been.
@@ -588,8 +603,12 @@ class Scanner:
         # went dark for the session. Importing a real pack multiplied the
         # files able to do that by 310, all maintained by somebody else. A bad
         # pack costs that pack, is named in the log, and is shown in Health.
-        self.broken_packs = {}
-        self.pack_rule_counts = {}
+        # Accumulated here and committed with the ruleset. Assigning to self
+        # as we went meant a refused load -- a bad combined compile, a failed
+        # validation -- left Health describing an attempt that was never
+        # adopted, FAILED states cleared and all.
+        broken: dict[str, str] = {}
+        counts: dict[str, int] = {}
         accepted_pack_files: list[Path] = []
         pack_of: dict[str, str] = {}
         for pack in self.packs.packs():
@@ -600,11 +619,11 @@ class Scanner:
             try:
                 compiled_pack = yara.compile(filepaths=pack_namespaces)
             except yara.Error as exc:
-                self.broken_packs[pack.name] = str(exc)
+                broken[pack.name] = str(exc)
                 log.error("rule pack %s failed to compile and is left out: %s",
                           pack.name, exc)
                 continue
-            self.pack_rule_counts[pack.name] = sum(1 for _ in compiled_pack)
+            counts[pack.name] = sum(1 for _ in compiled_pack)
             for namespace in pack_namespaces:
                 pack_of[namespace] = pack.name
             accepted_pack_files.extend(files)
@@ -633,6 +652,8 @@ class Scanner:
         # never leave new namespaces paired with an old compiled ruleset.
         self._untrusted_namespaces = untrusted
         self._pack_by_namespace = pack_of
+        self.broken_packs = broken
+        self.pack_rule_counts = counts
         self.rules = candidate
         self.rule_sources = sources
         shipped = [p.name for p in sources if str(p.resolve()) not in self._untrusted_namespaces]
@@ -643,7 +664,7 @@ class Scanner:
                  len(sources), ", ".join(shipped[:4])
                  + ("..." if len(shipped) > 4 else ""),
                  f" plus {imported} from rule packs" if imported else "")
-        self._write_compiled_cache(candidate, sources)
+        self._write_compiled_cache(candidate, sources, witnesses)
         return True
 
     # ------------------------------------------------- the compiled cache
@@ -690,7 +711,20 @@ class Scanner:
         recorded = manifest.get("files")
         if current is None or not isinstance(recorded, dict) or set(current) != set(recorded):
             return False
-        saved_at = int(manifest.get("saved_at_ns", 0))
+        try:
+            saved_at = int(manifest.get("saved_at_ns", 0))
+            sources = [Path(str(text)) for text in list(manifest.get("sources") or [])]
+            pack_by_namespace = {str(k): str(v) for k, v in
+                                 dict(manifest.get("pack_by_namespace") or {}).items()}
+            broken = {str(k): str(v) for k, v in
+                      dict(manifest.get("broken_packs") or {}).items()}
+            counts = {str(k): int(v) for k, v in
+                      dict(manifest.get("pack_rule_counts") or {}).items()}
+        except (TypeError, ValueError):
+            # A hand-edited or half-written manifest is a reason to compile,
+            # not a reason for Scanner.__init__ -- so the GUI and every CLI
+            # verb -- to raise.
+            return False
         for key, st in current.items():
             known = recorded[key]
             if (not isinstance(known, dict) or st["size"] != known.get("size")
@@ -698,7 +732,6 @@ class Scanner:
                 return False
             if saved_at - st["mtime_ns"] < RECENT_WRITE_NS:
                 return False
-        sources = [Path(text) for text in manifest.get("sources", [])]
         if not sources:
             return False
         # The manifest names the exact compiled file it describes. Two
@@ -717,12 +750,9 @@ class Scanner:
             return False
 
         self._untrusted_namespaces = self.packs.untrusted_namespaces()
-        self._pack_by_namespace = {str(k): str(v) for k, v in
-                                   dict(manifest.get("pack_by_namespace", {})).items()}
-        self.broken_packs = {str(k): str(v) for k, v in
-                             dict(manifest.get("broken_packs", {})).items()}
-        self.pack_rule_counts = {str(k): int(v) for k, v in
-                                 dict(manifest.get("pack_rule_counts", {})).items()}
+        self._pack_by_namespace = pack_by_namespace
+        self.broken_packs = broken
+        self.pack_rule_counts = counts
         for key, known in recorded.items():
             if isinstance(known.get("sha256"), str):
                 self._file_hashes[key] = (known["size"], known["mtime_ns"], known["sha256"])
@@ -748,15 +778,32 @@ class Scanner:
         for key in ("yara", "detection", "files", "sources"):
             if previous.get(key) != manifest[key]:
                 return False
+        # A manifest that itself fails the two-second rule cannot vouch for
+        # its blob: that blob may have been compiled from content written
+        # inside the tick. Reproduced: a compile refused for exactly that
+        # reason recompiled correctly, saw a manifest identical to the one
+        # on disk, and kept the OLD blob -- every later start loaded rules
+        # that no longer existed. The witness rule applies both ways.
+        saved_at = previous.get("saved_at_ns")
+        files = previous.get("files")
+        if not isinstance(saved_at, int) or not isinstance(files, dict):
+            return False
+        for st in files.values():
+            if not isinstance(st, dict) or not isinstance(st.get("mtime_ns"), int):
+                return False
+            if saved_at - st["mtime_ns"] < RECENT_WRITE_NS:
+                return False
         recorded = previous.get("compiled_sha256")
         if not isinstance(recorded, str) or hashlib.sha256(blob).hexdigest() != recorded:
             return False
         manifest["compiled_sha256"] = recorded
         return True
 
-    def _write_compiled_cache(self, rules, sources: list[Path]) -> None:
+    def _write_compiled_cache(self, rules, sources: list[Path],
+                              entries: dict[str, dict] | None = None) -> None:
         """Save what was just compiled, with enough to tell when it goes stale."""
-        entries = self._manifest_entries()
+        if entries is None:
+            entries = self._manifest_entries()
         if entries is None:
             return
         for key, st in entries.items():
@@ -781,11 +828,13 @@ class Scanner:
             if self._compiled_cache_is_current(manifest):
                 config.atomic_write_text(COMPILED_MANIFEST_PATH, json.dumps(manifest))
                 return
-            staging = COMPILED_RULES_PATH.with_suffix(".tmp")
+            staging = COMPILED_RULES_PATH.with_suffix(f".{os.getpid()}.tmp")
             rules.save(str(staging))
+            # The bytes THIS process wrote, hashed before the swap. Hashing
+            # the shared file afterwards let another process's replace land
+            # in between and bind this manifest to that process's blob.
+            manifest["compiled_sha256"] = hashlib.sha256(staging.read_bytes()).hexdigest()
             os.replace(staging, COMPILED_RULES_PATH)
-            manifest["compiled_sha256"] = hashlib.sha256(
-                COMPILED_RULES_PATH.read_bytes()).hexdigest()
             config.atomic_write_text(COMPILED_MANIFEST_PATH, json.dumps(manifest))
         except Exception as exc:  # a convenience; losing it costs one compile
             log.warning("could not write the compiled rule cache: %s", exc)
@@ -847,6 +896,36 @@ class Scanner:
             self.cache = ScanCache(path=self.cache._path,
                                    generation=self.detection_generation())
         return ok
+
+    def _sync_packs(self, force: bool = False) -> None:
+        """Adopt a change another process made to the pack index.
+
+        `--packs verify` in a terminal disarms a failing pack by writing
+        trusted=false. A running GUI held its own PackStore in memory and
+        kept scoring by the old trust state -- the same failure round three
+        fixed for the allowlist. A trust change re-derives the cap and
+        re-keys the cache (the generation includes trust). A pack added or
+        removed is a reload: a removed reports-only pack's rules would
+        otherwise go on running with nothing capping them.
+        """
+        now = time.monotonic()
+        if not force and now - self._packs_checked_at < PACKS_CHECK_INTERVAL:
+            return
+        with self._packs_sync_lock:
+            self._packs_checked_at = now
+            if not self.packs.changed_on_disk():
+                return
+            before = {p.name for p in self.packs.packs()}
+            self.packs.reload()
+            after = {p.name for p in self.packs.packs()}
+            if before != after:
+                log.info("rule packs changed on disk (%s); reloading rules",
+                         ", ".join(sorted(before ^ after)))
+                self.reload_rules()
+                return
+            self._untrusted_namespaces = self.packs.untrusted_namespaces()
+            self.rekey_cache()
+            log.info("rule pack trust changed on disk; cap and cache rebuilt")
 
     # ---------------------------------------------------------------- guards
 
@@ -1114,6 +1193,7 @@ class Scanner:
         if guard is not None:
             return guard
 
+        self._sync_packs()
         stat = path.stat()
         size, mtime_ns = stat.st_size, stat.st_mtime_ns
 

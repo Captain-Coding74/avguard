@@ -65,8 +65,34 @@ Ranked by the same rule as everything else in this project:
 | 41 | The Settings window asked for 1,438 px on a 1,080 px screen; Save and Cancel were off the bottom | `tests/test_tier3.py` |
 | 42 | The shipped rules were measured against a corpus that was 90% System32 and SysWOW64 | `tests/test_rules.py` |
 | 43 | Every CLI verb held its log file open after returning | `tests/test_cli.py` |
+| 44 | **A crash under the windowed build left a 0-byte log: the handler was closed in a `finally` before `sys.excepthook` ran** | `tests/test_cli.py` |
+| 45 | **A compile refused only by the two-second rule kept the stale blob forever** | `tests/test_compiled_cache.py` |
+| 46 | `\\?\unc\` and `\\?\Volume{GUID}\` spellings were stripped to cwd-relative paths and walked past self-protection | `tests/test_durability.py` |
+| 47 | A pack added from inside the checkout was refused for matching its own source files | `tests/test_rulepacks.py` |
+| 48 | The cross-pack self-match ran one way, so `verify` disarmed a trusted pack for a string a later pack quoted | `tests/test_rulepacks.py` |
+| 49 | A refused reload left Health describing the attempt; a deleted pack directory read as "0 rules loaded" while its rules still matched | `tests/test_compiled_cache.py` |
+| 50 | A trust change written by `--packs verify` in another process never reached a running scanner | `tests/test_durability.py` |
+| 51 | "Stop keeping" indexed a fresh list with a stale row number and could remove the wrong exception | `tests/test_tier3.py` |
+| 52 | A failed allowlist save left a phantom decision; a non-UTF-8 file crashed startup; `"trusted": "false"` armed a pack | `tests/test_durability.py`, `tests/test_rulepacks.py` |
 
 ### Notes worth keeping
+
+**Rounds two and three, reviewed (44-52).** Six reviewers over the diff
+since `050dd94`, two refuters per finding told to prove it wrong: fifteen
+verdicts, none refuted. Two matter most. Round three's fix for a leaked log
+file closed the handler in a `finally`, which runs before `sys.excepthook`,
+so a crash under the windowed build -- the case the hook exists for -- left
+an empty log (44). And the compiled-rule cache took its stat witnesses after
+the compile; a file rewritten in that window produced a manifest for the new
+content beside a blob of the old, and the recovery path then trusted the
+matching manifest and kept the old blob on every later start (45): the
+stale-rules failure this project exists to not have, introduced by the
+change that made startup fast. Witnesses are taken before the compile, and a
+manifest that itself fails the two-second rule cannot vouch for a blob.
+The rest is the pack machinery lying in small ways, and a decision
+(trust, or an exception) made in one process not reaching another -- the
+same class as row 40, fixed the same way. Plan and measurements in
+[next-4.md](next-4.md).
 
 **A decision is a decision in every process (40).** Row 19 gave the
 allowlist one owner per process, and the cross-process case was left to a
@@ -277,6 +303,13 @@ genuinely recursive now, bounded by a shared byte budget as well as by depth,
 and the tests assert the limit in **both** directions: two deep is found, three
 deep is not, and a separate test proves the payload is not visible without
 descending.
+
+### C. Known limits
+
+**Rule files pulled in by `include`** are neither in the compiled-rule
+manifest nor in the detection generation: yara-python does not report what a
+rule file included. An edit to an included file is compiled on the next
+Reload, not the next start. A rule file itself edited is always noticed.
 
 ### B. Seen once, not reproduced
 

@@ -380,7 +380,16 @@ class QuarantineStore:
             self._save()
 
         # Remember the decision, or the next scan takes it straight back.
-        self.allowlist.add(record.sha256, record.original_name, record.reasons)
+        try:
+            self.allowlist.add(record.sha256, record.original_name, record.reasons)
+        except OSError as exc:
+            # The file IS back. Saying so, and that the decision was not
+            # recorded, beats a restore that reports success and a file that
+            # is flagged again within the second.
+            log.error("restored %s to %s, but %s", record.original_name, target, exc)
+            raise QuarantineError(
+                f"restored to {target}, but the decision to keep it was not recorded "
+                f"({exc}); it may be flagged again") from exc
 
         log.info("restored %s to %s", record.original_name, target)
         return target

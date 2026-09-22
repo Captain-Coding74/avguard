@@ -308,5 +308,61 @@ class TestTheLogIsClosedWhenACommandReturns(unittest.TestCase):
         self.assertEqual(open_logs, [], "main() returned with its log file still open")
 
 
+
+class TestACrashInsideMainReachesTheLog(unittest.TestCase):
+    """main() closed the log in a finally, which ran before sys.excepthook;
+    under the windowed build a crash then left a 0-byte log. Measured: 0
+    bytes, against 1,316 with the close out of the way. The existing hook
+    test never went through main() and could not see it."""
+
+    def test_the_hook_still_finds_the_file_handler(self):
+        import subprocess
+        import textwrap
+        tmp = Path(tempfile.mkdtemp(prefix="avguard-cli-"))
+        self.addCleanup(_remove_tree, tmp)
+        child = textwrap.dedent("""
+            import avguard.__main__ as m
+            from avguard import config, logsetup
+
+            def boom(argv=None):
+                config.ensure_directories()
+                logsetup.configure()
+                raise ValueError("boom-from-main")
+
+            m._main = boom
+            raise SystemExit(m.main([]))
+        """)
+        env = dict(os.environ, AVGUARD_DATA=str(tmp))
+        proc = subprocess.run([sys.executable, "-c", child], env=env,
+                              capture_output=True, text=True,
+                              cwd=str(Path(__file__).resolve().parent.parent))
+        self.assertNotEqual(proc.returncode, 0)
+        log_file = tmp / "logs" / "avguard.log"
+        self.assertTrue(log_file.exists(), proc.stderr[-500:])
+        self.assertIn("boom-from-main", log_file.read_text(encoding="utf-8", errors="replace"),
+                      "the crash never reached the log")
+
+
+class TestTheCorpusWalkIsNotStarvedByEmptyDirectories(unittest.TestCase):
+    """The 4,000-directory cap counted directories with nothing in them; a
+    per-user Python install burned the budget before any program was seen."""
+
+    def test_binaries_past_thousands_of_empty_directories_are_found(self):
+        import avguard.__main__ as cli
+        tmp = Path(tempfile.mkdtemp(prefix="avguard-corpus-"))
+        self.addCleanup(_remove_tree, tmp)
+        root = tmp / "Programs"
+        python = root / "Python" / "Lib"
+        python.mkdir(parents=True)
+        for index in range(4100):
+            (python / f"m{index:04d}").mkdir()
+        for app in range(20):
+            folder = root / "zapps" / f"app{app}"
+            folder.mkdir(parents=True)
+            (folder / "a.exe").write_bytes(b"MZ" * 40)
+        corpus = cli._clean_corpus(limit=120, roots=[root])
+        self.assertGreaterEqual(len(corpus), 20, "the walk gave up before the programs")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

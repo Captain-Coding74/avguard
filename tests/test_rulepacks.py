@@ -555,9 +555,13 @@ class TestSharedStateHasOneOwner(TempCase):
         because `--restore` in a terminal is a separate process by nature.
         Sharing within a process is now merely tidy; this pins the guarantee
         that replaced it."""
+        from unittest import mock
         from avguard.allowlist import Allowlist
         shared = self.tmp / "allow.json"
         first, second = Allowlist(path=shared), Allowlist(path=shared)
+        patcher = mock.patch.object(Allowlist, "CHECK_INTERVAL", 0.0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         first.add("a" * 64, "thing.bin", ["reason"])
         self.assertIsNotNone(second.allows("a" * 64),
                              "a decision on disk was not seen by another instance")
@@ -1152,6 +1156,117 @@ class TestVerifyReportsWhatItMeasured(unittest.TestCase):
         self.assertNotIn("0.00%", text, "no rate was measured, so none is printed")
         self.assertFalse(rulepacks.PackStore().get("verifyme").trusted,
                          "a failing pack must not stay armed")
+
+
+
+class TestTheSelfMatchCheckIsHonest(TempCase):
+    """Round two widened the check to the whole checkout and excluded only
+    the destination. The review found what that did to honest packs."""
+
+    def _fake_checkout(self) -> Path:
+        from unittest import mock
+        checkout = self.tmp / "checkout"
+        (checkout / "avguard").mkdir(parents=True)
+        (checkout / "README.md").write_text("# a project\n", encoding="utf-8")
+        patcher = mock.patch.object(rulepacks.config, "PROJECT_ROOT", checkout)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return checkout
+
+    def test_a_pack_added_from_inside_the_checkout_is_admitted(self):
+        """`python -m avguard --packs add vendor-rules --licence MIT`, run from
+        the checkout as the README says: refused for matching its own files."""
+        checkout = self._fake_checkout()
+        source = checkout / "vendor-rules"
+        source.mkdir()
+        rule = source / "v.yara"
+        rule.write_text("rule V { meta: description = \"d\" strings: $a = \""
+                        + _needle("inside") + "\" condition: $a }", encoding="utf-8")
+        admission = self.store.admit("vendor", [rule], self.clean_corpus(), licence="MIT")
+        self.assertTrue(admission.accepted, admission.reasons)
+
+    def test_adding_the_checkout_root_itself_does_not_switch_the_check_off(self):
+        checkout = self._fake_checkout()
+        rule = checkout / "root.yara"
+        rule.write_text("rule R { meta: description = \"d\" strings: $a = \"# a project\" "
+                        "condition: $a }", encoding="utf-8")
+        admission = self.store.admit("root", [rule], self.clean_corpus(), licence="MIT")
+        self.assertFalse(admission.accepted)
+
+    def test_a_pair_that_verify_would_break_is_refused_when_formed(self):
+        """beta's rules matched nothing of alpha's, so beta was admitted;
+        alpha's rule matched beta's file text. The next verify re-admitted
+        alpha against a set holding beta's file and disarmed alpha."""
+        alpha = self.rule_file("alpha.yara",
+                               "rule Alpha { meta: description = \"d\" strings: $a = \""
+                               + _needle("alpha") + "\" condition: $a }")
+        admission = self.store.admit("alpha", [alpha], self.clean_corpus(), licence="MIT")
+        self.assertTrue(admission.accepted, admission.reasons)
+        self.store.install("alpha", [alpha], admission, licence="MIT")
+        self.store.set_trusted("alpha", True)
+
+        beta = self.rule_file("beta.yara",
+                              "rule Beta { meta: description = \"seen with "
+                              + _needle("alpha") + "\" strings: $a = \""
+                              + _needle("beta") + "\" condition: $a }")
+        admission = self.store.admit("beta", [beta], self.clean_corpus(), licence="MIT")
+        self.assertFalse(admission.accepted)
+        self.assertIn("would be matched by installed pack alpha", " ".join(admission.reasons))
+        # And alpha still passes its own re-admission, trusted.
+        again = self.store.admit("alpha", self.store.rule_files_for("alpha"),
+                                 self.clean_corpus(), licence="MIT")
+        self.assertTrue(again.accepted, again.reasons)
+        self.assertTrue(self.store.get("alpha").trusted)
+
+    def test_leftover_staging_directories_are_not_protected_files(self):
+        """The CLI admits before install() clears them."""
+        leftover = self.store.directory / ".own.previous"
+        leftover.mkdir(parents=True)
+        (leftover / "old.yara").write_text("rule Old { strings: $a = \""
+                                           + _needle("own") + "\" condition: $a }",
+                                           encoding="utf-8")
+        rule = self.rule_file("own.yara",
+                              "rule Own { meta: description = \"d\" strings: $a = \""
+                              + _needle("own") + "\" condition: $a }")
+        admission = self.store.admit("own", [rule], self.clean_corpus(), licence="MIT")
+        self.assertTrue(admission.accepted, admission.reasons)
+
+
+class TestThePackIndexIsTypedAndStamped(TempCase):
+    def test_a_hand_edited_string_false_does_not_arm_a_pack(self):
+        """'false' is a truthy string; the pack ran uncapped while --packs
+        list printed trusted : false."""
+        import json
+        rule = self.simple_rule()
+        self.store.install("vendor", [rule],
+                           Admission(accepted=True, rule_count=1, corpus_size=1), licence="MIT")
+        raw = json.loads(self.store.index_path.read_text(encoding="utf-8"))
+        raw["vendor"]["trusted"] = "false"
+        raw["vendor"]["rule_count"] = "3"
+        raw["vendor"]["false_positive_rate"] = "0.0"
+        self.store.index_path.write_text(json.dumps(raw), encoding="utf-8")
+        reopened = PackStore(directory=self.store.directory, index_path=self.store.index_path)
+        pack = reopened.get("vendor")
+        self.assertIs(pack.trusted, False)
+        self.assertEqual(pack.rule_count, 3)
+        self.assertEqual(pack.false_positive_rate, 0.0)
+        self.assertTrue(reopened.untrusted_namespaces(), "the pack must be capped")
+        raw["vendor"]["trusted"] = "true"
+        self.store.index_path.write_text(json.dumps(raw), encoding="utf-8")
+        self.assertIs(PackStore(directory=self.store.directory,
+                                index_path=self.store.index_path).get("vendor").trusted, True)
+
+    def test_another_owners_write_is_visible_as_a_stamp_change(self):
+        rule = self.simple_rule()
+        self.store.install("vendor", [rule],
+                           Admission(accepted=True, rule_count=1, corpus_size=1), licence="MIT")
+        self.assertFalse(self.store.changed_on_disk())
+        other = PackStore(directory=self.store.directory, index_path=self.store.index_path)
+        other.set_trusted("vendor", True)
+        self.assertTrue(self.store.changed_on_disk())
+        self.store.reload()
+        self.assertFalse(self.store.changed_on_disk())
+        self.assertTrue(self.store.get("vendor").trusted)
 
 
 if __name__ == "__main__":

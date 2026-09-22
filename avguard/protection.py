@@ -76,14 +76,15 @@ class SelfProtection:
         """Every spelling of a path this platform might hand us."""
         path = _strip_extended_prefix(path)
         forms: set[Path] = set()
-        try:
-            forms.add(Path(os.path.abspath(path)))
-        except (OSError, ValueError):
-            pass
-        try:
-            forms.add(path.resolve())
-        except (OSError, ValueError):
-            pass
+        for spell in (lambda p: Path(os.path.abspath(p)), Path.resolve):
+            try:
+                form = spell(path)
+            except (OSError, ValueError):
+                continue
+            # realpath answers with the extended-length prefix for a volume
+            # GUID spelling, or for anything over 260 characters. Compare the
+            # same text on the way out as on the way in.
+            forms.add(_strip_extended_prefix(form))
         return forms
 
     @property
@@ -151,10 +152,23 @@ def _strip_extended_prefix(path: Path) -> Path:
     """
     text = str(path)
     for prefix in ("\\\\?\\", "\\\\.\\"):
-        if text.startswith(prefix + "UNC\\"):
-            return Path("\\\\" + text[len(prefix) + 4:])
-        if text.startswith(prefix):
-            return Path(text[len(prefix):])
+        if not text.startswith(prefix):
+            continue
+        rest = text[len(prefix):]
+        # Windows compares the marker case-insensitively, as ntpath.splitroot
+        # does; measured, all six spellings of \\?\UNC\srv\share stat to the
+        # same inode. `\\?\unc\` used to miss this branch and come back as
+        # the RELATIVE path `unc\srv\share`, anchored at the cwd -- so a
+        # protected file was not, and an unrelated one under the cwd was.
+        if rest[:4].upper() == "UNC\\":
+            return Path("\\\\" + rest[4:])
+        if len(rest) >= 2 and rest[1] == ":" and rest[0].isalpha():
+            return Path(rest)
+        # \\?\Volume{GUID}\..., \\?\GLOBALROOT\..., \\.\PhysicalDrive0: not a
+        # drive spelling, and stripping the prefix made these cwd-relative
+        # too. Left whole; resolve() turns a volume path into the drive one,
+        # and _forms strips again afterwards.
+        return path
     return path
 
 

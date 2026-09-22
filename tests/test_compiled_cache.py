@@ -74,12 +74,12 @@ TRIPWIRE = "TRIPWIRE-" + "7f3a2c9e"
 OTHER = "TRIPWIRE-" + "b4e1d0a7"  # the same length, so an edit keeps the size
 
 
-def rule_text(needle: str) -> str:
+def rule_text(needle: str, severity: str = "medium") -> str:
     return "\n".join([
         "rule Imported {",
         "  meta:",
         '    description = "from somebody else"',
-        '    severity = "medium"',
+        f'    severity = "{severity}"',
         "  strings:",
         f'    $a = "{needle}"',
         "  condition:",
@@ -176,19 +176,28 @@ class TestTheFastPath(CompiledCacheCase):
         self.assertEqual(second.detection_generation(), first.detection_generation())
 
     def test_the_loaded_rules_still_score_by_the_store_s_trust_state(self):
-        self.scanner()
+        """A critical rule, or the test proves nothing: a medium one scores
+        SUSPICIOUS capped or not, and the review found this test could not
+        tell a fast path that dropped the cap from one that kept it."""
+        rule = self.store.rule_files_for("vendor")[0]
+        rule.write_text(rule_text(TRIPWIRE, "critical"), encoding="utf-8")
+        self.backdate()
+        self.scanner()  # compiles, writes the cache
+        outcomes = self.spy_on_fast_path()
+
         second = self.scanner()
+        self.assertEqual(outcomes, [True], "not the fast path; the test is moot")
         verdict = second.scan(self.sample(TRIPWIRE), use_cache=False)
         self.assertIs(verdict.level, Level.SUSPICIOUS, "an unpromoted pack is capped")
+        self.assertFalse(verdict.is_threat)
         self.assertIn("from the vendor pack", " ".join(verdict.reasons))
 
         self.store.set_trusted("vendor", True)
         third = self.scanner()
+        self.assertEqual(outcomes, [True, True], "trust does not need a recompile")
         verdict = third.scan(self.sample(TRIPWIRE), use_cache=False)
-        self.assertIs(verdict.level, Level.SUSPICIOUS,
-                      "medium stays medium; trust changes hard, not weight")
-        self.assertFalse(third._untrusted_namespaces & set(third._pack_by_namespace),
-                         "trust came from the cache, not the store")
+        self.assertIs(verdict.level, Level.MALICIOUS, "trusted: the cap is off")
+        self.assertTrue(verdict.is_threat)
 
 
 class TestEveryWayItCouldBeStale(CompiledCacheCase):
@@ -229,9 +238,11 @@ class TestEveryWayItCouldBeStale(CompiledCacheCase):
         manifest = json.loads(scanner_module.COMPILED_MANIFEST_PATH.read_text(encoding="utf-8"))
         manifest["yara"] = "0.0.0"
         scanner_module.COMPILED_MANIFEST_PATH.write_text(json.dumps(manifest), encoding="utf-8")
-        with mock.patch.object(scanner_module.yara, "load",
-                               side_effect=AssertionError("must not be loaded")):
+        # The code under test swallows every exception from yara.load, so a
+        # raising mock proved nothing: the count is the assertion.
+        with mock.patch.object(scanner_module.yara, "load") as load_mock:
             second = self.scanner()
+        load_mock.assert_not_called()
         self.assertIsNotNone(second.rules)
         rewritten = json.loads(scanner_module.COMPILED_MANIFEST_PATH.read_text(encoding="utf-8"))
         self.assertEqual(rewritten["yara"], scanner_module.yara.__version__)
@@ -253,6 +264,83 @@ class TestEveryWayItCouldBeStale(CompiledCacheCase):
         outcomes = self.spy_on_fast_path()
         self.assertTrue(scanner.reload_rules())
         self.assertEqual(outcomes, [], "reload took the fast path")
+
+
+
+class TestTheCacheCannotKeepAStaleBlob(CompiledCacheCase):
+    """The manifest's witnesses were taken after the compile. A file rewritten
+    in that window produced a manifest describing the NEW content beside a
+    blob compiled from the OLD. The next start refused it (two-second rule),
+    recompiled correctly, saw a manifest identical to the one on disk, and
+    kept the old blob. Reproduced by both refuters; here the bad state is
+    built directly and the third start must load the new rules."""
+
+    def _bad_state(self) -> Path:
+        self.scanner()  # old blob + manifest, consistent
+        rule = self.store.rule_files_for("vendor")[0]
+        rule.write_text(rule_text(OTHER), encoding="utf-8")  # same size
+        self.backdate(seconds=30)
+        mtime_ns = rule.stat().st_mtime_ns
+        manifest = json.loads(scanner_module.COMPILED_MANIFEST_PATH.read_text(encoding="utf-8"))
+        entry = manifest["files"][str(rule)]
+        entry["mtime_ns"] = mtime_ns
+        entry["sha256"] = __import__("hashlib").sha256(rule.read_bytes()).hexdigest()
+        manifest["saved_at_ns"] = mtime_ns + 30_000_000  # 30 ms after the write
+        scanner_module.COMPILED_MANIFEST_PATH.write_text(json.dumps(manifest), encoding="utf-8")
+        return rule
+
+    def test_the_start_after_a_refused_one_loads_the_new_rules(self):
+        self._bad_state()
+        outcomes = self.spy_on_fast_path()
+        self.scanner()                       # refused, recompiles, must REWRITE
+        third = self.scanner()               # adopts what the second wrote
+        self.assertEqual(outcomes, [False, True])
+        self.assertIs(third.scan(self.sample(OTHER), use_cache=False).level, Level.SUSPICIOUS,
+                      "the third start loaded the blob compiled from the old content")
+        self.assertIs(third.scan(self.sample(TRIPWIRE), use_cache=False).level, Level.CLEAN)
+
+    def test_a_malformed_manifest_field_compiles_instead_of_crashing(self):
+        self.scanner()
+        manifest = json.loads(scanner_module.COMPILED_MANIFEST_PATH.read_text(encoding="utf-8"))
+        manifest["saved_at_ns"] = None
+        manifest["pack_rule_counts"] = "three"
+        scanner_module.COMPILED_MANIFEST_PATH.write_text(json.dumps(manifest), encoding="utf-8")
+        outcomes = self.spy_on_fast_path()
+        second = self.scanner()
+        self.assertEqual(outcomes, [False])
+        self.assertIsNotNone(second.rules)
+        self.assertEqual(second.pack_rule_counts.get("vendor"), 1)
+
+    def test_reload_sees_an_edit_that_kept_size_and_mtime(self):
+        """The hash memo answered from its stat key and survived Reload."""
+        first = self.scanner()
+        before = first.detection_generation()
+        rule = self.store.rule_files_for("vendor")[0]
+        stamp = rule.stat().st_mtime
+        rule.write_text(rule_text(OTHER), encoding="utf-8")
+        os.utime(rule, (stamp, stamp))       # a copy can do this
+        self.assertTrue(first.reload_rules())
+        self.assertNotEqual(before, first.detection_generation(),
+                            "Reload compiled the edit but the generation did not move")
+        self.assertIs(first.scan(self.sample(OTHER), use_cache=False).level, Level.SUSPICIOUS)
+
+
+class TestARefusedReloadKeepsTheAdoptedState(CompiledCacheCase):
+    """load_rules() reset the per-pack dicts on self before the combined
+    compile and validation could still refuse. Health then described the
+    attempt, FAILED states cleared and all."""
+
+    def test_pack_counts_describe_the_loaded_ruleset_not_the_attempt(self):
+        scanner = self.scanner()
+        self.assertEqual(scanner.pack_rule_counts, {"vendor": 1})
+        rule = self.store.rule_files_for("vendor")[0]
+        rule.write_text(rule_text(TRIPWIRE) + "\n"
+                        + rule_text(OTHER).replace("Imported", "Second"), encoding="utf-8")
+        with mock.patch.object(Scanner, "_validate_rules", return_value="refused for the test"):
+            self.assertFalse(scanner.reload_rules())
+        self.assertEqual(scanner.pack_rule_counts, {"vendor": 1},
+                         "the refused attempt's count was adopted")
+        self.assertEqual(scanner.broken_packs, {})
 
 
 if __name__ == "__main__":

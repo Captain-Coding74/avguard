@@ -860,12 +860,23 @@ class AVGuardApp(tb.Window):
                 # a log nobody reads. The rest of detection is unaffected.
                 parts.append(f"{pack.name}: FAILED TO COMPILE, left out - {broken[:60]}")
                 continue
-            if not self.scanner.packs.rule_files_for(pack.name):
-                parts.append(f"{pack.name}: DIRECTORY MISSING, 0 rules loaded "
-                             f"(index says {pack.rule_count:,})")
-                continue
             loaded = self.scanner.pack_rule_counts.get(pack.name, 0)
             state = "can move files" if pack.trusted else "reports only"
+            if not self.scanner.packs.rule_files_for(pack.name):
+                # The disk and the loaded ruleset disagree. Deleting a pack's
+                # directory unloads nothing; this row used to say "0 rules
+                # loaded" while those rules were still matching -- and, if
+                # trusted, still moving files.
+                where = ("DIRECTORY MISSING"
+                         if not self.scanner.packs.pack_dir(pack.name).is_dir()
+                         else "NO RULE FILES on disk")
+                if loaded:
+                    parts.append(f"{pack.name}: {where}, but {loaded:,} rules are still "
+                                 f"loaded ({state}) until Reload rules")
+                else:
+                    parts.append(f"{pack.name}: {where}, 0 rules loaded "
+                                 f"(index says {pack.rule_count:,})")
+                continue
             parts.append(f"{pack.name} ({loaded:,} rules loaded, {state})")
         return "; ".join(parts)
 

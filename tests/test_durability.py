@@ -843,24 +843,54 @@ class TestExtendedLengthPrefix(TempCase):
         self.assertFalse(prot.is_protected(sibling))
         self.assertFalse(path_within(sibling, self.root))
 
-    def test_lookalike_spellings_are_judged_by_what_the_os_opens(self):
-        """The audit's two cases: `<dir>..` and `<dir> ` as a component.
+    @unittest.skipUnless(sys.platform == "win32", "a Windows spelling")
+    def test_the_unc_marker_is_not_case_sensitive(self):
+        """Windows accepts unc, Unc and UNC alike: measured, all six prefixed
+        spellings of a UNC share stat to the same inode. The lowercase form
+        used to miss the UNC branch and come back as a RELATIVE path (the
+        marker and the share as ordinary components), anchored at the cwd."""
+        from avguard.protection import _strip_extended_prefix
+        expected = Path(chr(92) * 2 + "srv" + chr(92) + "sh" + chr(92) + "f.txt")
+        for prefix in (chr(92) * 2 + "?" + chr(92), chr(92) * 2 + "." + chr(92)):
+            for marker in ("UNC", "unc", "Unc"):
+                spelling = Path(prefix + marker + chr(92) + "srv" + chr(92) + "sh"
+                                + chr(92) + "f.txt")
+                with self.subTest(spelling=str(spelling)):
+                    stripped = _strip_extended_prefix(spelling)
+                    self.assertEqual(stripped, expected)
+                    self.assertTrue(stripped.is_absolute())
 
-        The guard may err towards protection: Windows opens the directory
-        `prot..` as `prot` when it is the last component, so resolve() lands
-        inside our tree for a full path that opens nothing, and saying
-        "protected" about a file that does not exist costs nobody anything.
-        It must never err the other way: a spelling the OS maps onto our
-        file has to be ours.
-        """
-        from avguard.protection import same_path
+    def test_a_volume_or_device_spelling_is_not_made_relative(self):
+        from avguard.protection import _strip_extended_prefix
+        for text in (chr(92) * 2 + "?" + chr(92) + "Volume{0a1b}" + chr(92) + "x" + chr(92) + "y",
+                     chr(92) * 2 + "?" + chr(92) + "GLOBALROOT" + chr(92) + "Device" + chr(92) + "z",
+                     chr(92) * 2 + "." + chr(92) + "PhysicalDrive0"):
+            with self.subTest(text=text):
+                self.assertEqual(_strip_extended_prefix(Path(text)), Path(text))
+
+    @unittest.skipUnless(sys.platform == "win32", "needs the volume API")
+    def test_a_volume_guid_spelling_of_our_file_is_ours(self):
+        """A legal name for every local file that skipped the guard entirely."""
+        import ctypes
+        drive = str(self.target)[:3]
+        buffer = ctypes.create_unicode_buffer(64)
+        ok = ctypes.windll.kernel32.GetVolumeNameForVolumeMountPointW(drive, buffer, 64)
+        if not ok:
+            self.skipTest("GetVolumeNameForVolumeMountPointW failed")
+        guid_spelling = Path(buffer.value + str(self.target)[3:])
+        self.assertTrue(guid_spelling.exists(), "the spelling should open our file")
         prot = SelfProtection([self.root])
-        for spelling in (self.tmp / "prot.." / "rules" / "x.yara",
-                         self.tmp / "prot " / "rules" / "x.yara"):
-            opens_ours = spelling.exists() and same_path(spelling.resolve(), self.target)
-            if opens_ours:
-                self.assertTrue(prot.is_protected(spelling),
-                                f"{spelling} opens our file and is not protected")
+        self.assertTrue(prot.is_protected(guid_spelling))
+        # And with the cwd inside the root, an unrelated volume spelling is
+        # not swept in: it used to become <cwd>\Volume{...}\... and match.
+        previous = os.getcwd()
+        os.chdir(self.root)
+        try:
+            other = Path(buffer.value + "Windows" + chr(92) + "explorer.exe")
+            self.assertFalse(prot.is_protected(other))
+        finally:
+            os.chdir(previous)
+
 
 
 class TestAnExceptionCanBeUndone(TempCase):
@@ -914,7 +944,12 @@ class TestADecisionFromAnotherProcessIsSeen(TempCase):
 
     def setUp(self) -> None:
         super().setUp()
+        from unittest import mock
         from avguard.allowlist import Allowlist
+        # The lookup throttles its stat; these tests act within a millisecond.
+        patcher = mock.patch.object(Allowlist, "CHECK_INTERVAL", 0.0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.allow_path = self.tmp / "allow.json"
         self.scanner = Scanner(config.Config(cloud_enabled=False),
                                SelfProtection([self.tmp / "prot"]),
@@ -952,6 +987,116 @@ class TestADecisionFromAnotherProcessIsSeen(TempCase):
 
         self.assertTrue(other.remove(digest))
         self.assertIs(self.scanner.scan(target).level, Level.MALICIOUS)
+
+
+
+class TestAPackDecisionFromAnotherProcessIsSeen(TempCase):
+    """`--packs verify` in a terminal disarms a failing pack by writing
+    trusted=false. A running GUI held its own PackStore in memory and kept
+    condemning -- the failure round three fixed for the allowlist, one
+    store over."""
+
+    NEEDLE = "TRIPWIRE-" + "c0ffee11"
+
+    def setUp(self) -> None:
+        super().setUp()
+        from unittest import mock
+        from avguard import scanner as scanner_module
+        from avguard.allowlist import Allowlist
+        from avguard.rulepacks import Admission, PackStore
+        self.store = PackStore(directory=self.tmp / "packs",
+                               index_path=self.tmp / "packs" / "packs.json")
+        rule = self.tmp / "pack.yara"
+        rule.write_text("rule Stranger { meta: description = \"d\" severity = \"critical\" "
+                        f"strings: $a = \"{self.NEEDLE}\" condition: $a }}", encoding="utf-8")
+        self.store.install("stranger", [rule],
+                           Admission(accepted=True, rule_count=1, corpus_size=1), licence="MIT")
+        self.store.set_trusted("stranger", True)
+        patcher = mock.patch.object(scanner_module, "PACKS_CHECK_INTERVAL", 0.0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.scanner = Scanner(config.Config(cloud_enabled=False),
+                               SelfProtection([self.tmp / "prot"]),
+                               rules_path=RULES,
+                               cache=ScanCache(path=self.tmp / "c.json"),
+                               packs=self.store,
+                               allowlist=Allowlist(path=self.tmp / "allow.json"))
+        self.sample = self.write("sample.bin", self.NEEDLE.encode() + b" " * 32)
+
+    def _other_process(self):
+        from avguard.rulepacks import PackStore
+        return PackStore(directory=self.store.directory, index_path=self.store.index_path)
+
+    def test_a_disarm_written_elsewhere_stops_the_running_scanner_condemning(self):
+        from avguard.scanner import Level
+        self.assertIs(self.scanner.scan(self.sample).level, Level.MALICIOUS)
+        self._other_process().set_trusted("stranger", False)
+        verdict = self.scanner.scan(self.sample)      # cache on, nobody reloaded
+        self.assertIs(verdict.level, Level.SUSPICIOUS)
+        self.assertFalse(verdict.is_threat)
+        self._other_process().set_trusted("stranger", True)
+        self.assertIs(self.scanner.scan(self.sample).level, Level.MALICIOUS)
+
+    def test_a_pack_removed_elsewhere_does_not_go_on_running_uncapped(self):
+        from avguard.scanner import Level
+        self.assertIs(self.scanner.scan(self.sample).level, Level.MALICIOUS)
+        self._other_process().remove("stranger")
+        self.assertIs(self.scanner.scan(self.sample).level, Level.CLEAN,
+                      "the removed pack's rules were still loaded")
+        self.assertNotIn("stranger", self.scanner.pack_rule_counts)
+
+
+class TestAllowlistFilesAndSaves(TempCase):
+    def test_a_non_utf8_file_is_an_empty_list(self):
+        """UnicodeDecodeError is a ValueError, not a JSONDecodeError."""
+        from avguard.allowlist import Allowlist
+        path = self.tmp / "allow.json"
+        path.write_bytes(b'{"\xff\xfe": {}}')
+        self.assertEqual(len(Allowlist(path=path)), 0)
+
+    def test_a_failed_save_leaves_no_phantom_decision(self):
+        """add() used to log a warning, re-sync the stamp to the file it had
+        not replaced, and serve the entry from memory until the next reload."""
+        from unittest import mock
+        from avguard import allowlist as allowlist_module
+        from avguard.allowlist import Allowlist
+        allow = Allowlist(path=self.tmp / "allow.json")
+        with mock.patch.object(allowlist_module.config, "atomic_write_text",
+                               side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                allow.add("a" * 64, "thing.bin", ["reason"])
+        self.assertIsNone(allow.allows("a" * 64), "a decision that is not on disk was not made")
+        self.assertEqual(allow.entries(), [])
+
+    def test_a_restore_whose_decision_was_not_recorded_says_so(self):
+        from unittest import mock
+        from avguard.allowlist import Allowlist
+        from avguard.quarantine import QuarantineError, QuarantineStore
+        from avguard.scanner import SELFTEST_MARKER
+        allow = Allowlist(path=self.tmp / "allow.json")
+        store = QuarantineStore(directory=self.tmp / "store",
+                                index_path=self.tmp / "store" / "index.json",
+                                protection=SelfProtection([self.tmp / "prot"]),
+                                allowlist=allow)
+        target = self.write("kept.bin", SELFTEST_MARKER)
+        record = store.quarantine(target, ["marker"])
+        with mock.patch.object(Allowlist, "_save", return_value=False):
+            with self.assertRaises(QuarantineError) as caught:
+                store.restore(record.entry_id)
+        self.assertIn("not recorded", str(caught.exception))
+        self.assertTrue(target.exists(), "the file itself must still be back")
+
+    def test_the_stat_is_throttled(self):
+        """Measured before: one stat per lookup, under the lock, 125 us of a
+        739 us cache hit, serialised across the worker threads."""
+        from unittest import mock
+        from avguard.allowlist import Allowlist
+        allow = Allowlist(path=self.tmp / "allow.json")
+        real = allow._disk_stamp
+        with mock.patch.object(allow, "_disk_stamp", wraps=real) as stamp:
+            for _ in range(200):
+                allow.allows("b" * 64)
+        self.assertLessEqual(stamp.call_count, 2, "a stat on every lookup")
 
 
 if __name__ == "__main__":

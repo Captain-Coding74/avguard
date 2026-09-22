@@ -47,6 +47,7 @@ import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterable
 
 from . import config
 from .protection import path_within, same_path
@@ -107,6 +108,28 @@ class RulePack:
     notes: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        # Checked, not trusted, the way AllowEntry does it. `"trusted":
+        # "false"` in a hand-edited index -- the case row 26 was about --
+        # loaded as the truthy string: the pack's rules ran uncapped while
+        # `--packs list` printed "trusted : false".
+        for name in ("name", "source", "licence", "sha256", "added_at", "display_name"):
+            value = getattr(self, name)
+            if not isinstance(value, str):
+                setattr(self, name, "" if value is None else str(value))
+        for name in ("rule_count", "file_count", "corpus_size"):
+            try:
+                setattr(self, name, int(getattr(self, name)))
+            except (TypeError, ValueError):
+                setattr(self, name, 0)
+        try:
+            self.false_positive_rate = float(self.false_positive_rate)
+        except (TypeError, ValueError):
+            self.false_positive_rate = 0.0
+        if not isinstance(self.trusted, bool):
+            self.trusted = str(self.trusted).strip().lower() == "true"
+        if not isinstance(self.notes, list):
+            self.notes = []
+        self.notes = [str(note) for note in self.notes]
         if not self.added_at:
             self.added_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -144,6 +167,7 @@ class PackStore:
                  index_path: Path = PACKS_INDEX) -> None:
         self.directory = Path(directory)
         self.index_path = Path(index_path)
+        self._stamp: tuple[int, int] | None = None
         self._lock = threading.RLock()
         self.directory.mkdir(parents=True, exist_ok=True)
         self._packs: dict[str, RulePack] = {}
@@ -151,10 +175,23 @@ class PackStore:
 
     # ---------------------------------------------------------------- index
 
+    def _disk_stamp(self) -> tuple[int, int] | None:
+        """Size and mtime of the index as it is on disk right now."""
+        try:
+            st = self.index_path.stat()
+        except OSError:
+            return None
+        return (st.st_size, st.st_mtime_ns)
+
+    def changed_on_disk(self) -> bool:
+        """Has another process written the index since this one read it?"""
+        return self._disk_stamp() != self._stamp
+
     def _load(self) -> None:
+        self._stamp = self._disk_stamp()
         try:
             raw = json.loads(self.index_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError):
             self._packs = {}
             return
         if not isinstance(raw, dict):
@@ -175,6 +212,7 @@ class PackStore:
     def _save(self) -> None:
         payload = {k: asdict(v) for k, v in self._packs.items()}
         config.atomic_write_text(self.index_path, json.dumps(payload, indent=2))
+        self._stamp = self._disk_stamp()
 
     def reload(self) -> None:
         """Re-read the index, so another owner's change is visible.
@@ -293,9 +331,18 @@ class PackStore:
             return result
 
         # It must not match us. This is the failure that ended v1.
+        # The candidate's own source folder is excluded like its destination:
+        # a pack unzipped anywhere under the checkout was refused for matching
+        # its own files, since a plain text rule trivially matches the file
+        # that declares it. Not when that folder contains the project or the
+        # pack directory itself -- `--packs add .` must not switch the check
+        # off.
+        anchors = (config.PROJECT_ROOT, config.USER_RULES_DIR, self.directory)
+        own_dirs = [d for d in {p.parent for p in rule_files}
+                    if not any(path_within(anchor, d) for anchor in anchors)]
         for path in (protected_files if protected_files is not None
                      else _avguard_files(packs_dir=self.directory,
-                                         exclude=self.pack_dir(name))):
+                                         exclude=[self.pack_dir(name), *own_dirs])):
             try:
                 data = path.read_bytes()
             except OSError:
@@ -308,6 +355,19 @@ class PackStore:
                 result.reasons.append(
                     f"matches AVGuard's own {path.name}: {', '.join(hits[:3])}")
                 result.offending.extend(hits[:3])
+                return result
+
+        # And the other direction. Pack beta was admitted because ITS rules
+        # matched nothing of alpha's, while alpha's rules matched beta's file
+        # text -- a description quoting the same string. The next verify
+        # re-admitted alpha against a set that now held beta's file, and
+        # disarmed alpha for something beta did. The pair is refused when it
+        # is formed. Skipped when the caller supplies the protected set,
+        # which is the tests' way of saying "not this check".
+        if protected_files is None:
+            reason = self._matched_by_installed_pack(name, rule_files)
+            if reason:
+                result.reasons.append(reason)
                 return result
 
         # The measurement that decides it.
@@ -364,6 +424,33 @@ class PackStore:
             f"{result.rule_count} rules, {result.false_positive_rate:.2%} of "
             f"{examined} clean files flagged, no rule over the ceiling")
         return result
+
+    def _matched_by_installed_pack(self, name: str, rule_files: list[Path]) -> str:
+        """Would an already-installed pack's rules fire on this candidate's files?"""
+        candidate_dir = _safe_name(name)
+        for other in self.packs():
+            if other.name == candidate_dir:
+                continue
+            other_files = self.rule_files_for(other.name)
+            if not other_files:
+                continue
+            try:
+                other_rules = yara.compile(filepaths={str(f): str(f) for f in other_files})
+            except yara.Error:
+                continue  # a broken pack matches nothing; load_rules() names it
+            for path in rule_files:
+                try:
+                    data = path.read_bytes()
+                except OSError:
+                    continue
+                try:
+                    hits = [m.rule for m in other_rules.match(data=data)]
+                except Exception:
+                    continue
+                if hits:
+                    return (f"would be matched by installed pack {other.name}'s rule "
+                            f"{hits[0]}: {path.name}")
+        return ""
 
     def install(self, name: str, rule_files: list[Path], admission: Admission,
                 source: str = "", licence: str = "", replace: bool = False) -> RulePack:
@@ -513,16 +600,18 @@ def _safe_name(name: str) -> str:
 
 
 def _avguard_files(packs_dir: Path = PACKS_DIR,
-                   exclude: Path | None = None) -> list[Path]:
+                   exclude: Iterable[Path] = ()) -> list[Path]:
     """The files a pack must not match, for the reason v1 demonstrated.
 
     The whole project, the user's own rules, and every OTHER installed pack.
     It used to walk three directories; protection.py records the same mistake
     being made once for self-protection and fixed by covering everything.
-    `exclude` is the candidate pack's own directory during a re-verification,
-    since a pack legitimately contains the strings it hunts for.
+    `exclude` holds the candidate pack's own directories -- its destination,
+    and where it is being added from -- since a pack legitimately contains
+    the strings it hunts for.
     """
-    skip_dirs = {".git", "__pycache__", "build", "dist", ".venv", "node_modules"}
+    skip_dirs = {"__pycache__", "build", "dist", "node_modules"}
+    excluded = [exclude] if isinstance(exclude, (str, Path)) else list(exclude)
     found: list[Path] = []
 
     def walk(directory: Path) -> None:
@@ -531,12 +620,18 @@ def _avguard_files(packs_dir: Path = PACKS_DIR,
         for path in directory.rglob("*"):
             if not path.is_file():
                 continue
-            if any(part in skip_dirs for part in path.parts):
+            relative = path.relative_to(directory).parts
+            if any(part in skip_dirs for part in relative):
+                continue
+            # .git, .venv, and a pack's own `.name.staging` / `.name.previous`
+            # leftovers: the last two blocked re-adding a pack, since the
+            # CLI admits before install() clears them.
+            if any(part.startswith(".") for part in relative):
                 continue
             # Positive fixtures are supposed to match rules.
-            if "must_match" in path.parts:
+            if "must_match" in relative:
                 continue
-            if exclude is not None and path_within(path, exclude):
+            if any(path_within(path, ex) for ex in excluded):
                 continue
             found.append(path)
 

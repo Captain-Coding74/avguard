@@ -453,7 +453,7 @@ class TestTheLinuxSimulationActuallySimulates(unittest.TestCase):
             def load_module(self, name):
                 raise ImportError("blocked")
 
-        self.assertNotIn("colorsys", sys.modules)
+        sys.modules.pop("colorsys", None)   # another test may have imported it
         sys.meta_path.insert(0, OldStyle())
         try:
             importlib.invalidate_caches()
@@ -479,6 +479,32 @@ class TestTheLinuxSimulationActuallySimulates(unittest.TestCase):
                         "only find_spec is consulted by the import system")
 
 
+_GUI_ROOT = None
+
+
+def _gui_root():
+    """One withdrawn ttkbootstrap Window for the whole module.
+
+    ttkbootstrap's Style is a singleton that remembers the interpreter it
+    registered its layouts with; a second Window in the same process raised
+    "Layout Round.Toggle not found". Created on first use, destroyed at exit.
+    """
+    global _GUI_ROOT
+    if _GUI_ROOT is None:
+        import atexit
+        import ttkbootstrap as tb
+        _GUI_ROOT = tb.Window(themename="darkly")
+        _GUI_ROOT.withdraw()
+
+        def _close() -> None:
+            try:
+                _GUI_ROOT.destroy()
+            except Exception:
+                pass
+        atexit.register(_close)
+    return _GUI_ROOT
+
+
 class TestTheSettingsWindowFitsOnAScreen(unittest.TestCase):
     """Measured before this: 1,438 px requested on a 1,080 px screen, with
     Save and Cancel below the bottom edge and the window not resizable."""
@@ -499,11 +525,10 @@ class TestTheSettingsWindowFitsOnAScreen(unittest.TestCase):
         tmp = Path(tempfile.mkdtemp(prefix="avguard-dlg-"))
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         try:
-            root = tb.Window(themename="darkly")
+            root = _gui_root()
         except Exception as exc:  # no display on this machine
             self.skipTest(f"no display: {exc}")
-        root.withdraw()
-        try:
+        if True:
             allow = Allowlist(path=tmp / "allow.json")
             for index in range(3):
                 allow.add("ab" * 32 + str(index), f"kept{index}.exe", ["marker"])
@@ -518,9 +543,53 @@ class TestTheSettingsWindowFitsOnAScreen(unittest.TestCase):
             dialog.update_idletasks()
             width, height = dialog.winfo_reqwidth(), dialog.winfo_reqheight()
             dialog.destroy()
-        finally:
-            root.destroy()
         self.assertLess(height, 720, f"Settings asks for {width} x {height} px")
+
+
+
+class TestStopKeepingRemovesWhatWasSelected(unittest.TestCase):
+    """The listbox was filled from one snapshot and the button indexed a fresh
+    entries() with the row number. A newer entry arriving underneath the open
+    dialog shifted every row, and the user's confirmed removal hit the wrong
+    file."""
+
+    def test_a_newer_entry_underneath_the_dialog_does_not_shift_the_target(self):
+        try:
+            import ttkbootstrap as tb
+            from avguard import dialogs
+        except ImportError:
+            self.skipTest("GUI dependencies are not installed")
+        from unittest import mock
+        from avguard import config
+        from avguard.allowlist import Allowlist
+        from avguard.rulepacks import PackStore
+
+        tmp = Path(tempfile.mkdtemp(prefix="avguard-dlg-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        try:
+            root = _gui_root()
+        except Exception as exc:  # no display on this machine
+            self.skipTest(f"no display: {exc}")
+        allow = Allowlist(path=tmp / "allow.json")
+        allow.add("a" * 64, "v1.exe", ["older"])
+        allow.add("b" * 64, "v2.exe", ["newer"])
+        store = PackStore(directory=tmp / "packs", index_path=tmp / "packs" / "packs.json")
+        dialog = dialogs.SettingsDialog(root, config.Config(), lambda: None,
+                                        pack_store=store, allowlist=allow)
+        dialog.update_idletasks()
+        # Two entries added in the same second sort as a tie, so the row
+        # showing v1 is found by its digest rather than assumed.
+        row = dialog._keep_shas.index("a" * 64)
+        dialog.keep_list.selection_clear(0, "end")
+        dialog.keep_list.selection_set(row)
+        # A restore lands underneath the open dialog.
+        allow.add("c" * 64, "v3.exe", ["newest"])
+        with mock.patch.object(dialogs.Messagebox, "yesno", return_value="Yes"):
+            dialog._stop_keeping()
+        dialog.destroy()
+        self.assertIsNone(allow.allows("a" * 64), "v1 was selected and must be gone")
+        self.assertIsNotNone(allow.allows("b" * 64), "v2 was removed instead of v1")
+        self.assertIsNotNone(allow.allows("c" * 64))
 
 
 if __name__ == "__main__":

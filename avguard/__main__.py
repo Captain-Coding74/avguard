@@ -273,11 +273,24 @@ def _clean_corpus(limit: int = 400, roots: list[Path] | None = None,
         cap_here = limit if is_system else per_directory
         rng = random.Random(20240607)
         taken: list[Path] = []
+        productive = 0
         visited = 0
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames.sort()
+            # __pycache__ never holds a binary, and a per-user Python install
+            # has thousands of them.
+            dirnames[:] = sorted(d for d in dirnames if d != "__pycache__")
             visited += 1
             eligible = sorted(f for f in filenames if f.lower().endswith((".exe", ".dll")))
+            if not eligible:
+                # The cap counted these. %LOCALAPPDATA%\Programs holds a
+                # Python install -- thousands of directories with no .exe or
+                # .dll in them -- and the walk burned its budget there before
+                # reaching a single program, so the corpus was refilled from
+                # System32: the skew this walk exists to remove.
+                if visited >= 50_000:
+                    break
+                continue
+            productive += 1
             rng.shuffle(eligible)  # not the alphabetical first few
             here = 0
             for filename in eligible:
@@ -291,7 +304,7 @@ def _clean_corpus(limit: int = 400, roots: list[Path] | None = None,
                 here += 1
                 if here >= cap_here:
                     break
-            if len(taken) >= limit or visited >= 4000:
+            if len(taken) >= limit or productive >= 4000 or visited >= 50_000:
                 break
         rng.shuffle(taken)
         if is_system:
@@ -313,11 +326,15 @@ def _clean_corpus(limit: int = 400, roots: list[Path] | None = None,
 
 def main(argv: list[str] | None = None) -> int:
     logsetup.install_excepthooks()
-    try:
-        return _main(argv)
-    finally:
-        # A command that has returned has no business holding its log open.
-        logsetup.close_file_handlers()
+    result = _main(argv)
+    # A command that has RETURNED has no business holding its log open. Not in
+    # a finally: that ran before sys.excepthook, which then found the avguard
+    # logger with no file handler, and a crash under the windowed build --
+    # the case the hooks exist for -- left a 0-byte log. Measured: 0 bytes
+    # versus 1,316 with the close out of the way. On the exception path the
+    # interpreter's logging.shutdown() closes the handler after the hook.
+    logsetup.close_file_handlers()
+    return result
 
 
 def _main(argv: list[str] | None = None) -> int:

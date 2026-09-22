@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,11 +67,17 @@ class AllowEntry:
 class Allowlist:
     """Hashes the user has decided to keep."""
 
+    # How often allows() looks at the file for another process's decision.
+    # Measured before the throttle: one stat per lookup, under the lock, was
+    # 125 us of a 739 us cache hit and serialised the worker threads for it.
+    CHECK_INTERVAL = 0.1
+
     def __init__(self, path: Path = ALLOWLIST_PATH) -> None:
         self.path = Path(path)
         self._lock = threading.Lock()
         self._entries: dict[str, AllowEntry] = {}
         self._stamp: tuple[int, int] | None = None
+        self._checked_at = 0.0
         self._load()
 
     def _disk_stamp(self) -> tuple[int, int] | None:
@@ -85,7 +92,10 @@ class Allowlist:
         self._stamp = self._disk_stamp()
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError):
+            # ValueError covers JSONDecodeError and UnicodeDecodeError both.
+            # Only the first was caught, so a file saved as ANSI with a Thai
+            # name in it still crashed every entry point.
             self._entries = {}
             return
         if not isinstance(raw, dict):
@@ -107,13 +117,29 @@ class Allowlist:
                 log.warning("dropping a malformed allowlist entry for %s", digest[:12])
         self._entries = entries
 
-    def _save(self) -> None:
+    def _save(self) -> bool:
         payload = {k: asdict(v) for k, v in self._entries.items()}
         try:
             config.atomic_write_text(self.path, json.dumps(payload, indent=2))
         except OSError as exc:
             log.warning("could not save the allowlist: %s", exc)
+            return False
         self._stamp = self._disk_stamp()
+        return True
+
+    def _commit(self, what: str) -> None:
+        """Save, or drop the in-memory change and say so.
+
+        A failed save used to log a warning, re-sync the stamp to the file it
+        had NOT replaced, and serve the entry from memory: restore() reported
+        success, Settings listed the decision, and it vanished on the next
+        reload. Disk is the truth; a decision that is not on disk was not
+        made.
+        """
+        if self._save():
+            return
+        self._load()
+        raise OSError(f"could not record {what} in {self.path}")
 
     def reload(self) -> None:
         """Pick up decisions another AVGuard process recorded."""
@@ -128,8 +154,11 @@ class Allowlist:
             # the user had just restored elsewhere, and with automatic
             # quarantine on would have taken them straight back. One stat()
             # per lookup is nothing next to the read that precedes it.
-            if self._disk_stamp() != self._stamp:
-                self._load()
+            now = time.monotonic()
+            if now - self._checked_at >= self.CHECK_INTERVAL:
+                self._checked_at = now
+                if self._disk_stamp() != self._stamp:
+                    self._load()
             return self._entries.get(sha256)
 
     def add(self, sha256: str, name: str = "", reasons: list[str] | None = None) -> AllowEntry:
@@ -138,7 +167,7 @@ class Allowlist:
             entry = AllowEntry(sha256=sha256, name=name,
                                was_flagged_for=list(reasons or []))
             self._entries[sha256] = entry
-            self._save()
+            self._commit(f"the decision to keep {name or sha256[:12]}")
         log.info("allowing %s from now on (%s)", name or sha256[:12], sha256[:12])
         return entry
 
@@ -148,7 +177,7 @@ class Allowlist:
             if sha256 not in self._entries:
                 return False
             del self._entries[sha256]
-            self._save()
+            self._commit(f"the withdrawal of {sha256[:12]}")
         log.info("no longer allowing %s", sha256[:12])
         return True
 
