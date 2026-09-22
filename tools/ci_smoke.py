@@ -182,6 +182,31 @@ def _run(work: Path) -> int:
     check("a removed pack is gone", "smokepack" not in listing, listing[-300:])
 
     # --- the other commands at least run ------------------------------------
+    # --- the hash blocklist: import, detect, status -------------------------
+    # A CLI-only feature whose whole value is one lookup: prove the lookup
+    # happens on a scan and that the file's hash, not its name, is what hits.
+    listed = work / "listed.bin"
+    listed.write_bytes(b"nothing suspicious in these bytes at all " * 20)
+    import hashlib as _hashlib
+    listing = work / "hashes.txt"
+    listing.write_text("# pasted threat intel\n"
+                       + _hashlib.sha256(listed.read_bytes()).hexdigest() + "\n"
+                       + "not-a-hash\n", encoding="utf-8")
+    code, output = run("--iocs-import", str(listing), "--iocs-source", "smoke")
+    check("--iocs-import exits 0", code == 0, f"exit {code}: {output[-300:]}")
+    check("the import counts what it took and what it rejected",
+          "1 new hash" in output and "1 line(s) rejected" in output, output[-300:])
+    code, output = run("--scan", str(listed))
+    check("a listed hash is MALICIOUS", code == 1 and "MALICIOUS" in output, output[-300:])
+    check("the verdict names the blocklist", "smoke blocklist" in output, output[-300:])
+    renamed = work / "renamed.exe"
+    renamed.write_bytes(listed.read_bytes())
+    code, output = run("--scan", str(renamed))
+    check("the hash hits whatever the file is called", code == 1, output[-300:])
+    code, output = run("--iocs-status")
+    check("--iocs-status exits 0", code == 0, f"exit {code}: {output[-300:]}")
+    check("--iocs-status shows the source", "smoke" in output and "1" in output, output[-300:])
+
     for args, label in (
         (("--reload-rules",), "--reload-rules exits 0"),
         (("--schedule", "status"), "--schedule status exits 0"),

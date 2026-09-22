@@ -13,6 +13,7 @@ window freezing or the dialog never appearing.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 import queue
 import threading
 import tkinter as tk
@@ -28,6 +29,7 @@ from ttkbootstrap.dialogs import Messagebox
 from . import config, dialogs, logsetup, scheduling
 from .events import Event, EventStore
 from .cloud import VirusTotalClient
+from . import iocs as iocs_module
 from .instance import InstanceLock
 from .protection import SelfProtection
 from .quarantine import QuarantineError, QuarantineStore
@@ -44,6 +46,7 @@ MAX_DRAIN_PER_TICK = 200
 # being deleted and recreated kills watchdog's emitter silently, and the old
 # status check could not see it.
 HEALTH_TICK_MS = 30_000
+FEED_TICK_MS = 5_000          # the daily blocklist check, once the window is up
 
 LEVEL_TAGS = {
     logging.ERROR: ("error", "#ff6b6b"),
@@ -120,6 +123,7 @@ class AVGuardApp(tb.Window):
 
         self.after(UI_TICK_MS, self._pump)
         self.after(HEALTH_TICK_MS, self._check_realtime_health)
+        self.after(FEED_TICK_MS, self._update_blocklist_feed)
         self._refresh_quarantine()
 
         if not self.scanner.rules:
@@ -811,6 +815,7 @@ class AVGuardApp(tb.Window):
         if discarded:
             log.info("settings changed; discarded %d cached verdict(s)", discarded)
         log.info("settings saved")
+        self._update_blocklist_feed()
         if self.monitor.running:
             # Re-read from disk before restarting. The in-memory Config was
             # loaded at startup, so restarting from it would silently revert a
@@ -880,6 +885,54 @@ class AVGuardApp(tb.Window):
             parts.append(f"{pack.name} ({loaded:,} rules loaded, {state})")
         return "; ".join(parts)
 
+    def _describe_iocs(self) -> str:
+        store = self.scanner.iocs
+        total = store.count()
+        state = store.feed_state()
+        if self.cfg.ioc_feed_enabled:
+            if state["checked_at"]:
+                try:
+                    when = datetime.fromtimestamp(float(state["checked_at"])).strftime("%Y-%m-%d %H:%M")
+                except (ValueError, OSError):
+                    when = "unknown"
+                feed = f"daily feed on, last checked {when}"
+            else:
+                feed = "daily feed on, not fetched yet"
+        else:
+            feed = "daily feed off - nothing is fetched"
+        if not total:
+            return f"empty; {feed}. Import hashes with: avguard --iocs-import <file>"
+        by_source = ", ".join(f"{n:,} from {source}" for source, n in store.sources().items())
+        return f"{total:,} hash(es) ({by_source}); {feed}"
+
+    def _update_blocklist_feed(self) -> None:
+        """The daily feed check: off the GUI thread, and only when opted in.
+
+        The opt-in is enforced inside iocs.scheduled_update as well, so a
+        GUI that forgot to look at the setting could not phone home.
+        """
+        if not self.cfg.ioc_feed_enabled or not self.scanner.iocs.feed_due():
+            return
+        store = self.scanner.iocs
+
+        def work() -> None:
+            try:
+                result = iocs_module.scheduled_update(store, enabled=self.cfg.ioc_feed_enabled)
+            except iocs_module.IocError as exc:
+                log.warning("blocklist feed: %s", exc)
+                return
+            if result.status == "updated" and result.imported is not None:
+                log.info("blocklist updated: %s", result.imported.describe())
+                self.post(self._blocklist_changed)
+
+        threading.Thread(target=work, name="avguard-iocs-feed", daemon=True).start()
+
+    def _blocklist_changed(self) -> None:
+        """New hashes: every cached verdict that predates them goes."""
+        discarded = self.scanner.rekey_cache()
+        self.cache = self.scanner.cache
+        log.info("blocklist changed; %d cached verdict(s) discarded", discarded)
+
     def _packs_ok(self) -> bool:
         """Red if any pack is broken or has vanished from disk."""
         if self.scanner.broken_packs:
@@ -910,6 +963,7 @@ class AVGuardApp(tb.Window):
             ("VirusTotal", True,
              f"on, {self.cloud.spent_today} lookup(s) today" if self.cfg.cloud_enabled
              else "off - no hashes leave this machine"),
+            ("Hash blocklist", True, self._describe_iocs()),
             ("Scan cache", True, f"{len(self.cache)} remembered verdict(s)"),
             ("Quarantine integrity", not self.quarantine.orphaned_payloads(),
              "every stored file has a record"

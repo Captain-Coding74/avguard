@@ -76,6 +76,20 @@ class SettingsDialog(tb.Toplevel):
         tb.Checkbutton(block, text="Check the structure of executables",
                        variable=self.pe_var, bootstyle="round-toggle").pack(anchor="w", pady=2)
 
+        # Consent lives here, next to the switch, in the VirusTotal pattern:
+        # say exactly what leaves the machine before anything does.
+        self.ioc_feed_var = tk.BooleanVar(value=cfg.ioc_feed_enabled)
+        tb.Checkbutton(block, text="Download the MalwareBazaar hash blocklist once a day",
+                       variable=self.ioc_feed_var, bootstyle="round-toggle",
+                       command=self._ioc_feed_toggled).pack(anchor="w", pady=2)
+        tb.Label(block, bootstyle="secondary", wraplength=520, justify="left",
+                 text=("SHA-256 hashes of confirmed malware, matched on this PC. Off: "
+                       "nothing is fetched. On: one HTTPS request a day to "
+                       "bazaar.abuse.ch, carrying nothing about this PC or its files. "
+                       "Hashes can also be imported from a terminal:" + CHR_NL
+                       + "    python -m avguard --iocs-import <file>")
+                 ).pack(anchor="w", pady=(0, 8))
+
         # --- watched folders ----------------------------------------------
         watch = tb.Labelframe(pages["Folders"], text="Folders watched in real time", padding=12)
         watch.pack(fill=X, pady=(0, 8))
@@ -193,6 +207,19 @@ class SettingsDialog(tb.Toplevel):
                   command=self._save).pack(side=RIGHT, padx=(6, 0))
         tb.Button(actions, text="Cancel", bootstyle="secondary-outline",
                   command=self.destroy).pack(side=RIGHT)
+
+    def _ioc_feed_toggled(self) -> None:
+        if not self.ioc_feed_var.get():
+            return
+        Messagebox.show_info(
+            "Once a day, AVGuard will fetch the list of recent malware hashes from "
+            "bazaar.abuse.ch (abuse.ch, a non-profit)." + CHR_NL + CHR_NL
+            + "What leaves this PC: one HTTPS request carrying the previous download's "
+              "ETag. Nothing about this PC, its files or their hashes is sent."
+            + CHR_NL + CHR_NL
+            + "A file whose hash is on the list is MALICIOUS and can be moved. "
+              "Terms of use: https://bazaar.abuse.ch/faq/#tos",
+            "Blocklist downloads", parent=self)
 
     def _refresh_packs(self) -> None:
         self.pack_list.delete(0, END)
@@ -340,6 +367,7 @@ class SettingsDialog(tb.Toplevel):
         self.cfg.auto_quarantine = self.auto_var.get()
         self.cfg.archive_scanning_enabled = self.archives_var.get()
         self.cfg.pe_analysis_enabled = self.pe_var.get()
+        self.cfg.ioc_feed_enabled = self.ioc_feed_var.get()
         self.cfg.watch_paths = list(self.watch_list.get(0, END))
         self.cfg.excluded_globs = list(self.excl_list.get(0, END))
         try:

@@ -347,6 +347,22 @@ disaster now.
   a one-way door.
 - Packaging with PyInstaller, and moving `data/` to `%LOCALAPPDATA%`.
 
+## Tier 4 — the improvements plan
+
+[docs/improvements.md](docs/improvements.md) is a five-item plan handed to
+this project on 2026-09-22; each item lands here with what was measured. (Its
+preface says a numpy histogram shipped separately. Nothing in `avguard/`
+imports numpy, and nothing in the plan depends on it.)
+
+| Item | Result |
+|---|---|
+| 1. IOC hash blocklist | SQLite, one lookup per file: 7 µs against a million rows, and no measurable cost inside a scan (551 µs against 550 µs, warm). Manual import, an opt-in MalwareBazaar feed (1,484 hashes in 1 s live; a truncated download changes nothing), and the list is part of the detection generation. Tests 377 → **400** |
+
+**A transaction beat the file swap.** The plan asked for "build beside and
+`os.replace`". Windows refuses to replace a file another handle has open, and
+the running GUI holds the database open; a SQLite transaction gives the same
+guarantee without that fight.
+
 ## Deliberately not doing
 
 - **Real-time process, memory or kernel monitoring.** Needs a driver and admin

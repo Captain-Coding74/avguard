@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Iterator, Sequence
 
 from . import allowlist as allowlist_module
+from . import iocs as iocs_module
 from . import archives, config, peinfo, rulepacks, signing
 from .protection import SelfProtection, matches_excluded_glob
 
@@ -92,7 +93,7 @@ SUSPICIOUS_AT = 50
 # Learned by shipping it: the archive inspector stopped calling large resource
 # packs "hostile", and the machine kept reporting the old verdict because the
 # generation hash only covered the rule file.
-DETECTION_VERSION = 13
+DETECTION_VERSION = 14
 
 # The ruleset compiled last time, kept between runs. See _adopt_compiled_cache.
 COMPILED_RULES_PATH = config.DATA_DIR / "rules.compiled"
@@ -412,6 +413,7 @@ class Scanner:
         cloud_lookup: Callable[[str, Path], list[str]] | None = None,
         packs: "rulepacks.PackStore | None" = None,
         allowlist: "allowlist_module.Allowlist | None" = None,
+        iocs: "iocs_module.IocStore | None" = None,
     ) -> None:
         self.cfg = cfg
         self.protection = protection
@@ -431,6 +433,11 @@ class Scanner:
         # installed on this machine. Reaching into global state by default made
         # three tests fail the moment a real pack was added.
         self.packs = packs if packs is not None else rulepacks.PackStore()
+        # The hash blocklist. Injectable for the same reason; the default
+        # lives in the data directory, which the tests redirect.
+        self.iocs = iocs if iocs is not None else iocs_module.IocStore()
+        self._iocs_version = self.iocs.version()
+        self._iocs_checked_at = 0.0
         self._untrusted_namespaces: set[str] = set()
         self.broken_packs: dict[str, str] = {}
         # Rules each pack contributed to the loaded ruleset, counted from its
@@ -507,6 +514,10 @@ class Scanner:
         # again everywhere, including in every copy a cache remembers.
         for sha in sorted(entry.sha256 for entry in self.allowlist.entries()):
             digest.update(f"allow={sha}".encode())
+        # The blocklist is detection logic. Without this, a file cached CLEAN
+        # before an import replays CLEAN for the rest of the cache's life --
+        # the DETECTION_VERSION incident with a different trigger.
+        digest.update(f"iocs={self.iocs.generation_token()}".encode())
         for path in self.rule_files():
             # The sha256 of the contents, not (name, size, mtime). An earlier
             # version hashed the stat, and CI caught two genuinely different
@@ -927,6 +938,26 @@ class Scanner:
             self.rekey_cache()
             log.info("rule pack trust changed on disk; cap and cache rebuilt")
 
+    def _sync_iocs(self, force: bool = False) -> None:
+        """Notice a blocklist change another process made.
+
+        `--iocs-import` in a terminal while the GUI runs: a file cached
+        CLEAN a minute ago is on the list now. The generation folds the
+        list's version in, so re-keying the cache is the whole adoption.
+        One small query, at most every two seconds, like the pack index.
+        """
+        now = time.monotonic()
+        if not force and now - self._iocs_checked_at < PACKS_CHECK_INTERVAL:
+            return
+        with self._packs_sync_lock:
+            self._iocs_checked_at = now
+            version = self.iocs.version()
+            if version == self._iocs_version:
+                return
+            self._iocs_version = version
+            self.rekey_cache()
+            log.info("blocklist changed on disk (version %d); cache rebuilt", version)
+
     # ---------------------------------------------------------------- guards
 
     def _guard(self, path: Path) -> Verdict | None:
@@ -1194,6 +1225,7 @@ class Scanner:
             return guard
 
         self._sync_packs()
+        self._sync_iocs()
         stat = path.stat()
         size, mtime_ns = stat.st_size, stat.st_mtime_ns
 
@@ -1224,6 +1256,14 @@ class Scanner:
             return verdict
 
         findings: list[Finding] = []
+
+        # One indexed lookup per file, measured at 7 us against a million
+        # rows. A hash of confirmed malware is as decisive as a byte
+        # signature, so this is hard evidence: it can move a file.
+        listed_by = self.iocs.lookup(facts.sha256)
+        if listed_by:
+            findings.append(Finding("ioc", listed_by, WEIGHT_SIGNATURE,
+                                    f"SHA-256 is on the {listed_by} blocklist", hard=True))
 
         for name in facts.signature_hits:
             findings.append(Finding("signature", name, WEIGHT_SIGNATURE,

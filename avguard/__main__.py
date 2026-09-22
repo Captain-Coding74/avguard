@@ -12,6 +12,7 @@ import logging
 import sys
 from pathlib import Path
 
+from . import iocs
 from . import config, logsetup, scheduling
 from .cloud import VirusTotalClient
 from .instance import InstanceLock
@@ -239,6 +240,53 @@ def unknown_text() -> str:
     return "unknown"
 
 
+def _iocs_command(args) -> int:
+    """The blocklist from a terminal: import, fetch, or say what it holds."""
+    store = iocs.IocStore()
+    if args.iocs_import:
+        try:
+            result = store.import_file(args.iocs_import, source=args.iocs_source)
+        except OSError as exc:
+            print(f"Could not read {args.iocs_import}: {exc}", file=sys.stderr)
+            return 1
+        print(result.describe())
+        print(f"The blocklist holds {store.count():,} hash(es). A running AVGuard "
+              "picks this up within a few seconds.")
+        return 0
+
+    if args.iocs_update:
+        url = iocs.FEED_FULL_URL if args.iocs_full else iocs.FEED_RECENT_URL
+        print(f"Fetching {url}")
+        print("Nothing about this machine or its files is sent; the request carries "
+              "only the previous download's ETag.")
+        try:
+            result = store.update_from_feed(full=args.iocs_full)
+        except iocs.IocError as exc:
+            print(f"Update failed: {exc}", file=sys.stderr)
+            return 1
+        if result.status == "unchanged":
+            print("The feed has not changed since the last download. Nothing to do.")
+        elif result.imported is not None:
+            print(result.imported.describe())
+        print(f"The blocklist holds {store.count():,} hash(es).")
+        return 0
+
+    from datetime import datetime
+    print(f"Blocklist: {store.count():,} hash(es) in {store.path}")
+    for source, count in store.sources().items():
+        print(f"    {source:<16} {count:,}")
+    state = store.feed_state()
+    if state["checked_at"]:
+        try:
+            when = datetime.fromtimestamp(float(state["checked_at"])).strftime("%Y-%m-%d %H:%M")
+        except (ValueError, OSError):
+            when = state["checked_at"]
+        print(f"Feed last checked: {when}  ({state['url'] or iocs.FEED_RECENT_URL})")
+    else:
+        print("Feed: never fetched. Turn it on in Settings, or run --iocs-update once.")
+    return 0
+
+
 def _clean_corpus(limit: int = 400, roots: list[Path] | None = None,
                   per_directory: int = 6) -> list[Path]:
     """Real binaries off this machine, to measure a candidate pack against.
@@ -362,6 +410,20 @@ def _main(argv: list[str] | None = None) -> int:
                         help=argparse.SUPPRESS)
     parser.add_argument("--licence", "--license", dest="licence", default="",
                         help="with --packs add: the pack's licence, e.g. MIT")
+    parser.add_argument("--iocs-import", metavar="FILE", type=Path,
+                        help="add SHA-256 hashes to the local blocklist, one per line "
+                             "(# starts a comment); a file whose hash is listed is MALICIOUS")
+    parser.add_argument("--iocs-source", metavar="NAME", default="manual",
+                        help="with --iocs-import: where these hashes came from (default: manual)")
+    parser.add_argument("--iocs-update", action="store_true",
+                        help="fetch the MalwareBazaar hash blocklist now: one HTTPS request "
+                             "to bazaar.abuse.ch, carrying nothing about this machine")
+    parser.add_argument("--iocs-full", action="store_true",
+                        help="with --iocs-update: the full export (43 MB zipped) instead of "
+                             "the last 48 hours; a one-time seed")
+    parser.add_argument("--iocs-status", action="store_true",
+                        help="how many hashes the blocklist holds, from where, and when "
+                             "the feed was last checked")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
@@ -412,6 +474,9 @@ def _main(argv: list[str] | None = None) -> int:
             lock.release()
         print(f"Restored to {target}")
         return 0
+
+    if args.iocs_import or args.iocs_update or args.iocs_status:
+        return _iocs_command(args)
 
     if args.reload_rules:
         cfg = config.Config.load()

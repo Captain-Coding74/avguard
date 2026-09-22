@@ -42,7 +42,7 @@ smallest step to new detection value. Item 2 is the flagship feature. Items
 
 ---
 
-## 1. IOC hash blocklist with feed ingestion  (effort: S, ~half a day)
+## 1. IOC hash blocklist with feed ingestion  (effort: S, ~half a day)  — DONE
 
 ### Why
 
@@ -104,6 +104,30 @@ New module `avguard/iocs.py`.
 `tests/test_iocs.py`: hit, miss, hex validation, comment handling, the
 reject-tiny-download guard, atomic swap on failure (simulate with a download
 that raises mid-write), and a generation-change assertion.
+
+### Built  (2026-09-22)
+
+`avguard/iocs.py`; `--iocs-import FILE [--iocs-source NAME]`, `--iocs-update
+[--iocs-full]`, `--iocs-status`; a Settings switch with the consent text next
+to it; a Health row; `tests/test_iocs.py` (23 tests) and a smoke round trip.
+Two deviations from the text above, both for a measured reason:
+
+- **A transaction, not `os.replace`.** Windows will not replace a file that
+  another handle has open, and the running GUI holds one. One SQLite
+  transaction gives the same guarantee -- a bad or truncated download changes
+  nothing -- without the file dance. Tested with a write that dies halfway:
+  count and version unchanged.
+- **The recent export merges; no feed ever deletes.** Replacing the feed's
+  rows with the last 48 hours would forget every older hash on each update.
+  A download with fewer than 100 valid hashes is refused whole.
+
+Numbers: a million random digests import in 11.6 s and take 126 MB; a lookup
+is 7 us on a warm connection (289 us if a connection were opened per call, so
+there is one per thread); `COUNT(*)` on a million rows is 53 ms, so the count
+is kept in a meta row and the generation token is the list's version.
+Inside `scan()`, cache off, 300 warm files, three rounds: median 551 us with
+an empty list, 550 us with a million rows -- no measurable cost. The live
+feed parsed cleanly: 1,484 hashes in 1 s, then a 304 on the second call.
 
 ---
 

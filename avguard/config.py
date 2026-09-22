@@ -169,6 +169,12 @@ class Config:
         ]
     )
 
+    # The MalwareBazaar hash blocklist, fetched at most once a day while this
+    # is on. Off by default: nothing is fetched until the user says so, and
+    # turning it on names exactly what leaves the machine (an ETag, nothing
+    # else). Imported hashes work with this off.
+    ioc_feed_enabled: bool = False
+
     @classmethod
     def load(cls, path: Path = CONFIG_PATH) -> "Config":
         """Read config.json, falling back to defaults for anything missing."""

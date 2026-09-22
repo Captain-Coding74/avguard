@@ -47,6 +47,9 @@ Other flags:
 | `--restore ID` | put one file back |
 | `--export-all DIR` | write everything held out to a folder |
 | `--reload-rules` | recompile the rules and report what loaded |
+| `--iocs-import FILE` | add SHA-256 hashes to the local blocklist |
+| `--iocs-update` | fetch the MalwareBazaar blocklist once (`--iocs-full` for the full export) |
+| `--iocs-status` | what the blocklist holds, and when the feed was last checked |
 | `--schedule status\|on\|off` | start with Windows, and a daily scan |
 | `-v` | show clean files too |
 
@@ -340,6 +343,32 @@ Measured against ReversingLabs' MIT-licensed pack: 1,240 rules across 310
 files, **zero** false positives on 400 clean binaries at 8 ms a file, and zero
 across a real 5,369-file Downloads folder. They are hex patterns matching
 compiled malware code, which is why they do not fire on ordinary software.
+
+## Hash blocklist
+
+The cheapest real detection there is: the SHA-256 the scanner already
+computes for every file, looked up in a local list of confirmed malware. One
+indexed lookup per file — 7 µs against a million rows, and no measurable
+difference inside a scan — and it works offline.
+
+```bash
+python -m avguard --iocs-import hashes.txt
+python -m avguard --iocs-status
+```
+
+One hex SHA-256 per line; `#` starts a comment. A listed hash is hard
+evidence, like a byte signature: the file is MALICIOUS and can be moved. A
+restore still wins, because that is a decision about the exact bytes made by
+the person at the machine.
+
+MalwareBazaar publishes these hashes for free. Turning the daily download on
+(Settings, or `--iocs-update` once from a terminal) sends one HTTPS request a
+day to bazaar.abuse.ch carrying the previous download's ETag and nothing about
+this PC or its files. A download that is not the feed — a captive portal, an
+error page, anything with fewer than 100 valid hashes — is refused whole and
+changes nothing. The list is part of the detection generation, so a file
+cached CLEAN before an import is judged again, and a running AVGuard notices
+an import made from a terminal within seconds.
 
 ## VirusTotal
 
