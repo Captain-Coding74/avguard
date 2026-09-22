@@ -16,7 +16,7 @@ import ttkbootstrap as tb
 from ttkbootstrap.constants import BOTH, END, LEFT, RIGHT, VERTICAL, X, Y
 from ttkbootstrap.dialogs import Messagebox
 
-from . import allowlist as allowlist_module, config, rulepacks, scheduling
+from . import allowlist as allowlist_module, config, rulepacks, scheduling, shellext
 
 log = logging.getLogger("avguard.dialogs")
 
@@ -146,6 +146,28 @@ class SettingsDialog(tb.Toplevel):
                        "result is the last thing that should be moving files. "
                        "You can remove both from Task Manager's Startup tab and "
                        "Task Scheduler without opening AVGuard.")
+                 ).pack(anchor="w", pady=(6, 0))
+
+        self.context_menu_var = tk.BooleanVar(value=shellext.installed())
+        tb.Checkbutton(auto, text="Add 'Scan with AVGuard' to the right-click menu",
+                       variable=self.context_menu_var,
+                       bootstyle="round-toggle").pack(anchor="w", pady=(8, 2))
+        tb.Label(auto, bootstyle="secondary", wraplength=520, justify="left",
+                 text=("This user only, no administrator rights. If the AVGuard window "
+                       "is open the scan still runs; only moving a file is refused.")
+                 ).pack(anchor="w")
+
+        # --- forwarding ------------------------------------------------------
+        forward = tb.Labelframe(pages["Running by itself"], text="Forward events to a URL",
+                                padding=12)
+        forward.pack(fill=X, pady=8)
+        self.forward_var = tk.StringVar(value=cfg.event_forward_url)
+        tb.Entry(forward, textvariable=self.forward_var).pack(fill=X)
+        tb.Label(forward, bootstyle="secondary", wraplength=520, justify="left",
+                 text=("Empty means off. With a URL set, every scan event is POSTed to "
+                       "it as JSON: the file path, the verdict, the rule names and the "
+                       "file's SHA-256. Meant for a Network Watchdog server on your "
+                       "own network. A dead or slow endpoint never slows a scan.")
                  ).pack(anchor="w", pady=(6, 0))
 
         # --- rule packs ------------------------------------------------------
@@ -340,6 +362,25 @@ class SettingsDialog(tb.Toplevel):
         for index in reversed(listbox.curselection()):
             listbox.delete(index)
 
+    def _apply_context_menu(self) -> list[str]:
+        wanted = self.context_menu_var.get()
+        if wanted == shellext.installed():
+            return []
+        ok, detail = shellext.install() if wanted else shellext.uninstall()
+        return [] if ok else [f"Right-click scan: {detail}"]
+
+    def _consent_to_forwarding(self) -> bool:
+        """The URL is new or changed: say what will leave the machine, and ask."""
+        url = self.forward_var.get().strip()
+        if not url or url == self.cfg.event_forward_url:
+            return True
+        return Messagebox.yesno(
+            f"Send scan events to {url}?" + CHR_NL + CHR_NL
+            + "Every event carries the file's path, the verdict, the rule names and "
+              "the SHA-256 hash of the file. Nothing is sent while the address is "
+              "empty.",
+            "Forward events?", parent=self) == "Yes"
+
     def _apply_scheduling(self) -> list[str]:
         """Only touch the system when the toggle actually changed."""
         problems: list[str] = []
@@ -368,6 +409,10 @@ class SettingsDialog(tb.Toplevel):
         self.cfg.archive_scanning_enabled = self.archives_var.get()
         self.cfg.pe_analysis_enabled = self.pe_var.get()
         self.cfg.ioc_feed_enabled = self.ioc_feed_var.get()
+        if self._consent_to_forwarding():
+            self.cfg.event_forward_url = self.forward_var.get().strip()
+        else:
+            self.forward_var.set(self.cfg.event_forward_url)
         self.cfg.watch_paths = list(self.watch_list.get(0, END))
         self.cfg.excluded_globs = list(self.excl_list.get(0, END))
         try:
@@ -376,7 +421,7 @@ class SettingsDialog(tb.Toplevel):
             Messagebox.show_error(f"Could not save settings: {exc}", "AVGuard", parent=self)
             return
 
-        problems = self._apply_scheduling()
+        problems = self._apply_scheduling() + self._apply_context_menu()
         if problems:
             Messagebox.show_warning(
                 "Settings were saved, but some of it could not be applied:" + CHR_NL + CHR_NL

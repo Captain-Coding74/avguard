@@ -32,6 +32,11 @@ MAX_BYTES = 4 * 1024 * 1024      # rotate past this
 BACKUP_COUNT = 2
 
 
+# Schema 1, frozen. The watchdog parses these field names; changing one, or
+# its type, means schema 2 and a new number in forward.SCHEMA:
+#   kind: str, at: str (ISO-8601 UTC), path: str, level: str, score: int,
+#   reasons: list[str], detail: dict -- plus "schema": 1, added by the
+#   forwarder on the wire.
 @dataclass
 class Event:
     kind: str                     # scan_started | scan_finished | detection |
@@ -55,14 +60,17 @@ class Event:
 class EventStore:
     """Append-only history, rotated by size."""
 
-    def __init__(self, path: Path = EVENTS_FILE) -> None:
+    def __init__(self, path: Path = EVENTS_FILE, forwarder=None) -> None:
         self.path = Path(path)
         self._lock = threading.Lock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # An EventForwarder, or None. Swapped by the GUI when the URL changes.
+        self.forwarder = forwarder
 
     def record(self, event: Event) -> None:
         """Append one event. Never raises: history must not break a scan."""
-        line = json.dumps(asdict(event), ensure_ascii=False)
+        payload = asdict(event)
+        line = json.dumps(payload, ensure_ascii=False)
         try:
             with self._lock:
                 self._rotate_if_needed()
@@ -70,6 +78,12 @@ class EventStore:
                     handle.write(line + "\n")
         except OSError as exc:
             log.warning("could not record an event: %s", exc)
+        forwarder = self.forwarder
+        if forwarder is not None:
+            try:
+                forwarder.submit(payload)   # queues and returns; never waits
+            except Exception:
+                log.debug("could not queue an event for forwarding", exc_info=True)
 
     def _rotate_if_needed(self) -> None:
         try:

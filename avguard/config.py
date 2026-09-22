@@ -175,6 +175,12 @@ class Config:
     # else). Imported hashes work with this off.
     ioc_feed_enabled: bool = False
 
+    # Where scan events are POSTed as JSON (Network Watchdog's server, for
+    # instance). Empty means off. Setting it is a consent action: the file
+    # path, the verdict, the rule names and the file's SHA-256 leave the
+    # machine for every event.
+    event_forward_url: str = ""
+
     @classmethod
     def load(cls, path: Path = CONFIG_PATH) -> "Config":
         """Read config.json, falling back to defaults for anything missing."""

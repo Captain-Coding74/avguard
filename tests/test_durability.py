@@ -1154,7 +1154,11 @@ class TestAllowlistFilesAndSaves(TempCase):
             with self.assertRaises(RestoreIncomplete) as caught:
                 store.restore(record.entry_id)
         self.assertIn("not recorded", str(caught.exception))
-        self.assertEqual(caught.exception.target, target)
+        # Not assertEqual: on the CI runner %TEMP% is spelled RUNNER~1 and
+        # restore() answers with the long form. Same file, two spellings.
+        from avguard.protection import same_path
+        self.assertTrue(same_path(caught.exception.target, target),
+                        f"{caught.exception.target} is not {target}")
         self.assertTrue(target.exists(), "the file itself must still be back")
         # Not a failed restore: the CLI says restored, warns, and exits 0.
         self.assertTrue(issubclass(RestoreIncomplete, RuntimeError))

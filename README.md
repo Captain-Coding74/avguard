@@ -54,6 +54,8 @@ Other flags:
 | `--fim-check` | report what changed since (`--fast` trusts size and mtime) |
 | `--fim-accept PATH...` | re-baseline a change you have looked at |
 | `--fim-status`, `--fim-schedule status\|on\|off` | the baseline, and a daily unattended check |
+| `--pause` | with `--scan`: keep the result on screen (the right-click entry uses it) |
+| `--install-context-menu`, `--remove-context-menu` | 'Scan with AVGuard' in Explorer's right-click menu, this user only |
 | `--schedule status\|on\|off` | start with Windows, and a daily scan |
 | `-v` | show clean files too |
 
@@ -402,6 +404,29 @@ limit, stated plainly: code running as the same user can call the same DPAPI
 and re-sign a doctored baseline. The signature defends against other tools,
 casual edits and a copied-in baseline — not against an attacker who already
 owns the account.
+
+## Event forwarding
+
+Off by default. With a URL set in Settings, every recorded event — a
+detection, a quarantine, a restore, an integrity change — is POSTed to it as
+JSON, for a Network Watchdog server on your own network. Setting the URL
+asks first, and says what leaves the machine: the file path, the verdict,
+the rule names and the file's SHA-256. A dead or slow endpoint never slows a
+scan: events go onto a bounded queue and a background thread posts them,
+dropping the oldest when the queue is full.
+
+## Right-click scan
+
+```bash
+python -m avguard --install-context-menu
+```
+
+Adds "Scan with AVGuard" to Explorer's right-click menu for files and
+folders, for this user only and without administrator rights; the checkbox
+in Settings does the same. The entry runs the console scanner and keeps the
+result on screen. If the AVGuard window is open the scan still runs; only
+moving a file is refused, because two processes writing the quarantine store
+at once destroy its records.
 
 ## VirusTotal
 

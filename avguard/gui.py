@@ -31,6 +31,8 @@ from .events import Event, EventStore
 from .cloud import VirusTotalClient
 from . import iocs as iocs_module
 from . import fim as fim_module
+from . import forward as forward_module
+from . import shellext
 from .instance import InstanceLock
 from .protection import SelfProtection
 from .quarantine import QuarantineError, QuarantineStore, RestoreIncomplete
@@ -75,7 +77,10 @@ class AVGuardApp(tb.Window):
 
         self.cfg = config.Config.load()
         self.protection = SelfProtection()
-        self.events = EventStore()
+        # Off until a URL is set; the dialog asks for consent before one is.
+        self.forwarder = (forward_module.EventForwarder(self.cfg.event_forward_url)
+                          if self.cfg.event_forward_url else None)
+        self.events = EventStore(forwarder=self.forwarder)
 
         self.cloud = VirusTotalClient(self.cfg)
         # The Scanner is built FIRST and owns the shared state. The quarantine
@@ -812,9 +817,22 @@ class AVGuardApp(tb.Window):
         self.cache = self.scanner.cache
         log.info("kept-files list changed; %d cached verdict(s) discarded", discarded)
 
+    def _forwarding_changed(self) -> None:
+        """The URL changed in Settings: the old forwarder stops, a new one starts."""
+        url = self.cfg.event_forward_url
+        current = self.forwarder.url if self.forwarder is not None else ""
+        if url == current:
+            return
+        if self.forwarder is not None:
+            self.forwarder.stop()
+        self.forwarder = forward_module.EventForwarder(url) if url else None
+        self.events.forwarder = self.forwarder
+        log.info("event forwarding %s", f"to {url}" if url else "off")
+
     def _settings_saved(self) -> None:
         """Apply what can be applied live, and say what cannot."""
         self.scanner.cfg = self.cfg
+        self._forwarding_changed()
         # Ticking "look inside .zip files" changes what a clean verdict means,
         # so every verdict stored under the old setting has to go.
         discarded = self.scanner.rekey_cache()
@@ -996,6 +1014,11 @@ class AVGuardApp(tb.Window):
              else "off - no hashes leave this machine"),
             ("Hash blocklist", True, self._describe_iocs()),
             ("File integrity", self._fim_ok(), self._describe_fim()),
+            ("Event forwarding", True,
+             f"on -> {self.forwarder.url}: {self.forwarder.describe()}"
+             if self.forwarder is not None else "off - nothing is sent"),
+            ("Right-click scan", True,
+             "installed for this user" if shellext.installed() else "not installed"),
             ("Scan cache", True, f"{len(self.cache)} remembered verdict(s)"),
             ("Quarantine integrity", not self.quarantine.orphaned_payloads(),
              "every stored file has a record"
@@ -1057,6 +1080,11 @@ class AVGuardApp(tb.Window):
             self.cfg.save()
         except Exception:
             log.exception("error saving state")
+        if self.forwarder is not None:
+            try:
+                self.forwarder.stop()
+            except Exception:
+                pass
         if self.tray is not None:
             try:
                 self.tray.stop()

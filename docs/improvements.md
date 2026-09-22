@@ -239,7 +239,7 @@ cache was built around) and 1.0 s warm (577 MB/s); a full check 0.73 s
 
 ---
 
-## 3. Event bridge to Network Watchdog  (effort: S, ~2 hours)
+## 3. Event bridge to Network Watchdog  (effort: S, ~2 hours)  — DONE
 
 ### Why
 
@@ -275,9 +275,26 @@ log shows dropped forwards at debug level only.
 schema field present, queue overflow drops oldest, dead endpoint changes
 nothing about verdicts or timing.
 
+### Built  (2026-09-22)
+
+`avguard/forward.py` (`EventForwarder`: a bounded queue of 500, drop-oldest,
+a daemon thread posting JSON with a two-second timeout, failures at debug
+level); `EventStore(forwarder=...)` hands each event over after writing it;
+`event_forward_url` in the config, empty by default; a URL field in
+Settings with a yes/no that names what leaves the machine; a Health row;
+`tests/test_event_forward.py` (6 tests, an `http.server` on 127.0.0.1).
+Schema 1 is frozen in a comment above `Event`.
+
+Measured: `record()` is 170 us without a forwarder and 258 us with a dead
+endpoint, the difference being the queue. A closed local port does not
+refuse on this Windows -- the connect runs to its full timeout -- so a dead
+endpoint drains at one event per timeout on the worker thread, which the
+caller never feels; 601 events into a blocked endpoint: submit() returned
+in under a second, the newest 500 kept, the oldest 100 dropped.
+
 ---
 
-## 4. Explorer right-click scan  (effort: S, ~2 hours)
+## 4. Explorer right-click scan  (effort: S, ~2 hours)  — DONE
 
 ### Why
 
@@ -312,6 +329,27 @@ ROADMAP entry).
 `tests/test_shellext.py`: registry writes and removals against `winreg`
 mocked with a dict-backed fake, command-string quoting for paths with
 spaces and Thai characters, frozen vs unfrozen executable resolution.
+
+### Built  (2026-09-22)
+
+`avguard/shellext.py` (two per-user keys under `HKCU\Software\Classes`,
+`MUIVerb`, `Icon`, `command`; install, uninstall, installed, all through an
+injectable registry); `--install-context-menu`, `--remove-context-menu`; a
+checkbox in Settings; a Health row; `tests/test_shellext.py` (12 tests
+against a dict-backed fake of winreg).
+
+One addition the text did not ask for, because the entry would have been
+useless without it: `--pause`. The command runs `python.exe` (never
+`pythonw.exe`) with `--scan "%1" --pause`; a console that closes when the
+scan ends shows nothing, and the windowed build has no console, so
+`--pause` waits for Enter where there is a terminal and shows the summary
+in a small window where there is none. Its help text says what happens
+when the AVGuard window is open: the scan runs, only moving a file is
+refused.
+
+**Not checked on a real Explorer.** Writing to the user's registry is not
+this session's to do; the tests prove the exact keys and strings against
+the fake. The manual check is one right-click away.
 
 ---
 

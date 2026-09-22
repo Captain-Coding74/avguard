@@ -358,6 +358,8 @@ imports numpy, and nothing in the plan depends on it.)
 |---|---|
 | 1. IOC hash blocklist | SQLite, one lookup per file: 7 µs against a million rows, and no measurable cost inside a scan (551 µs against 550 µs, warm). Manual import, an opt-in MalwareBazaar feed (1,484 hashes in 1 s live; a truncated download changes nothing), and the list is part of the detection generation. Tests 377 → **400** |
 | 2. File integrity monitoring | A signed SQLite baseline (HMAC-SHA256, key under DPAPI) of every file under chosen roots; a check names modified, added and removed files with old and new hashes, records events, and never moves anything. Default hashes everything, `--fast` trusts size and mtime and says what that trades away; both asserted against a file whose mtime was put back. 2,000 files / 596 MB: baseline 1.0 s warm, check 0.73 s, `--fast` 0.21 s. Tests 400 → **421** |
+| 3. Event bridge to Network Watchdog | Every recorded event is POSTed as JSON (schema 1, frozen) to a URL that is empty by default and set only past a yes/no naming what leaves the machine. A bounded queue and a daemon thread: `record()` is 170 µs without a forwarder, 258 µs with a dead endpoint; 601 events into a blocked endpoint kept the newest 500. Tests 431 → **437** |
+| 4. Explorer right-click scan | Two per-user registry keys, no administrator rights, tested against a fake of winreg; `--pause` keeps the result on screen, in a window when there is no console. **Not yet checked on a real Explorer**: writing to the user's registry was left to the user. Tests 437 → **449** |
 
 **The baseline's signature has a stated limit.** Code running as the same
 user can call the same DPAPI and re-sign a doctored baseline. It defends

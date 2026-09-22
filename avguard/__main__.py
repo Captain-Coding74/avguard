@@ -12,7 +12,7 @@ import logging
 import sys
 from pathlib import Path
 
-from . import fim, iocs
+from . import fim, iocs, shellext
 from . import config, logsetup, scheduling
 from .cloud import VirusTotalClient
 from .instance import InstanceLock
@@ -22,9 +22,18 @@ from .quarantine import QuarantineError, QuarantineStore, RestoreIncomplete
 from .scanner import Level, Scanner
 
 
-def _console_scan(target: Path, quarantine_threats: bool, verbose: bool) -> int:
+def _console_scan(target: Path, quarantine_threats: bool, verbose: bool,
+                  pause: bool = False) -> int:
     logsetup.configure(level=logging.DEBUG if verbose else logging.INFO)
-    logging.getLogger("avguard").addHandler(logging.StreamHandler(sys.stdout))
+    if sys.stdout is not None:
+        logging.getLogger("avguard").addHandler(logging.StreamHandler(sys.stdout))
+    # Everything printed is also kept, for --pause under the windowed build,
+    # where there is no console to have printed it to.
+    transcript: list[str] = []
+
+    def say(text: str = "") -> None:
+        transcript.append(text)
+        print(text)
 
     cfg = config.Config.load()
     protection = SelfProtection()
@@ -42,9 +51,9 @@ def _console_scan(target: Path, quarantine_threats: bool, verbose: bool) -> int:
     def report(verdict) -> None:
         counts[verdict.level] += 1
         if verdict.level in (Level.MALICIOUS, Level.SUSPICIOUS):
-            print(f"[{verdict.level.value.upper()}] {verdict.path}")
+            say(f"[{verdict.level.value.upper()}] {verdict.path}")
             for reason in verdict.reasons:
-                print(f"    {reason}")
+                say(f"    {reason}")
             if verdict.level is Level.MALICIOUS:
                 threats.append(verdict)
         elif verbose:
@@ -53,14 +62,14 @@ def _console_scan(target: Path, quarantine_threats: bool, verbose: bool) -> int:
     scanner.scan_tree(target, on_verdict=report)
     cloud.save_cache()
 
-    print()
-    print(f"Examined : {sum(counts.values())} file(s)")
-    print(f"Clean    : {counts[Level.CLEAN]}")
-    print(f"Skipped  : {counts[Level.SKIPPED]}")
-    print(f"Suspect  : {counts[Level.SUSPICIOUS]}")
-    print(f"Threats  : {counts[Level.MALICIOUS]}")
+    say()
+    say(f"Examined : {sum(counts.values())} file(s)")
+    say(f"Clean    : {counts[Level.CLEAN]}")
+    say(f"Skipped  : {counts[Level.SKIPPED]}")
+    say(f"Suspect  : {counts[Level.SUSPICIOUS]}")
+    say(f"Threats  : {counts[Level.MALICIOUS]}")
     if counts[Level.ERROR]:
-        print(f"Errors   : {counts[Level.ERROR]}")
+        say(f"Errors   : {counts[Level.ERROR]}")
 
     if threats and quarantine_threats:
         # Writing to the quarantine store needs the lock. Another AVGuard
@@ -87,9 +96,38 @@ def _console_scan(target: Path, quarantine_threats: bool, verbose: bool) -> int:
         finally:
             lock.release()
     elif threats:
-        print("\nNothing was moved. Pass --quarantine to act on these findings.")
+        say("\nNothing was moved. Pass --quarantine to act on these findings.")
 
+    if pause:
+        _pause_for_the_user(target, transcript)
     return 1 if threats else 0
+
+
+def _pause_for_the_user(target: Path, transcript: list[str]) -> None:
+    """Keep the result on screen. The right-click menu entry runs with this.
+
+    A console window that closes when the scan ends shows nothing. Under
+    the windowed build there is no console at all, so the summary goes into
+    a small window instead. Under a test runner stdin is not a terminal and
+    this returns at once.
+    """
+    if sys.stdout is None:
+        try:
+            import tkinter
+            from tkinter import messagebox
+        except ImportError:
+            return
+        root = tkinter.Tk()
+        root.withdraw()
+        messagebox.showinfo(f"AVGuard scanned {target.name}", "\n".join(transcript[-40:]))
+        root.destroy()
+        return
+    stdin = getattr(sys, "stdin", None)
+    if stdin is not None and stdin.isatty():
+        try:
+            input("\nPress Enter to close")
+        except (EOFError, KeyboardInterrupt):
+            pass
 
 
 def _packs_command(args) -> int:
@@ -476,6 +514,18 @@ def _main(argv: list[str] | None = None) -> int:
                         help="scan a file or folder in the console and exit")
     parser.add_argument("--quarantine", action="store_true",
                         help="with --scan, move anything detected into quarantine")
+    parser.add_argument("--pause", action="store_true",
+                        help="with --scan: keep the result on screen (wait for Enter, or "
+                             "show it in a window when there is no console). The "
+                             "right-click menu entry uses this. If the AVGuard window "
+                             "is open the scan still runs; only moving a file is "
+                             "refused, because two processes writing the quarantine "
+                             "store at once destroy its records")
+    parser.add_argument("--install-context-menu", action="store_true",
+                        help="add 'Scan with AVGuard' to Explorer's right-click menu for "
+                             "this user (no administrator rights)")
+    parser.add_argument("--remove-context-menu", action="store_true",
+                        help="remove the right-click entry, and nothing else")
     parser.add_argument("--list-quarantine", action="store_true",
                         help="print the quarantine contents and exit")
     parser.add_argument("--export-all", metavar="DIR", type=Path,
@@ -584,6 +634,12 @@ def _main(argv: list[str] | None = None) -> int:
     if args.iocs_import or args.iocs_update or args.iocs_status:
         return _iocs_command(args)
 
+    if args.install_context_menu or args.remove_context_menu:
+        ok, detail = (shellext.install() if args.install_context_menu
+                      else shellext.uninstall())
+        print(("Right-click scan " if ok else "Right-click scan FAILED: ") + detail)
+        return 0 if ok else 1
+
     if (args.fim_baseline or args.fim_check or args.fim_accept or args.fim_status
             or args.fim_schedule):
         return _fim_command(args)
@@ -624,7 +680,7 @@ def _main(argv: list[str] | None = None) -> int:
         if not args.scan.exists():
             print(f"no such path: {args.scan}", file=sys.stderr)
             return 2
-        return _console_scan(args.scan, args.quarantine, args.verbose)
+        return _console_scan(args.scan, args.quarantine, args.verbose, pause=args.pause)
 
     from .gui import main as gui_main
     return gui_main()
