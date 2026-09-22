@@ -108,14 +108,19 @@ The suite in both modes and the smoke check: 431 tests. The two measured
 scenarios above, and the in-flight race, are tests that fail against
 `9e2e271`.
 
-## Not resolved
+## The CI failures, resolved and not
 
-The Windows CI job for the item-2 commit (`bfb2405`, run #29) failed with
-exit code 1 and no per-test annotation, which the harness prints for every
-failing test. The job log needs a GitHub login this session does not have.
-Locally the same commit passes 421 tests in both modes. The harness now
-writes its output as UTF-8 with replacement, so a failure message that the
-runner's console could not encode cannot itself be the reason the
-annotation is missing; if run #30 fails the same way, the log at
-https://github.com/Captain-Coding74/avguard/actions/runs/35738302825 is the
-place to look.
+Run #30 (this round's commit) failed on Windows and, with the harness now
+writing UTF-8, said why: a test compared the path `restore()` returned
+with the test's temp path as text, and the runner spells `%TEMP%` with an
+8.3 short name (`RUNNER~1`) while `restore()` answers with the long form.
+Same file, two spellings -- compared with `same_path` now, as everything
+else in the program compares paths.
+
+Run #29 (the item-2 commit, `bfb2405`) failed with exit code 1 and no
+annotation, before the UTF-8 change, and its log needs a login this session
+does not have: https://github.com/Captain-Coding74/avguard/actions/runs/35738302825.
+The one mechanism that produces "exit 1, no annotation" is the reporter
+raising while printing a failure message the runner's cp1252 console could
+not encode, which the UTF-8 change closes. If a later run fails, its
+annotation will say what.

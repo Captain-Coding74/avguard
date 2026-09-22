@@ -353,7 +353,7 @@ the fake. The manual check is one right-click away.
 
 ---
 
-## 5. Fuzzy hashing with TLSH  (effort: M, a day plus calibration)
+## 5. Fuzzy hashing with TLSH  (effort: M, a day plus calibration)  — NOT BUILT
 
 ### Why
 
@@ -414,6 +414,29 @@ warnings. The corpus false-positive run is recorded with its numbers.
 unrelated), TNULL handling, the soft cap keeping a lone match below
 MALICIOUS, generation change on reference update, and a skip marker when
 `py-tlsh` is absent so bare installs stay green.
+
+### Not built  (2026-09-22), and why
+
+Measured, in the order the text asks for:
+
+- `pip download py-tlsh --only-binary :all:` finds nothing for Python 3.13
+  on Windows; the index has only the sdist (`py_tlsh-5.0.0.tar.gz`). The
+  text's "wheels exist for Windows" was true for older interpreters.
+- The sdist needs a C++ compiler. `pip install py-tlsh` in a fresh venv
+  here fails at "Failed building wheel for py-tlsh". Nothing on this
+  machine builds it, and nothing on a user's machine would either.
+- A pure-Python implementation is the only dependency-free route. Its
+  inner loop -- six Pearson lookups per byte over 3-byte windows, plus the
+  checksum -- runs at **0.9 MB/s** in CPython 3.13 on this machine. The
+  text's own floor is 200 MB/s; a 1 MB file would cost a second, and the
+  size cap that keeps it affordable would exclude the executables it is
+  meant for.
+
+What would unblock it: a `py-tlsh` wheel for the interpreter in
+`requirements.txt`, or the vendored C++ behind a small extension built in
+CI and shipped with the executable. Both are a packaging decision, not an
+afternoon. The reference-set table, the `--iocs-import` extension and the
+soft-finding semantics are designed and small; the digest is the blocker.
 
 ---
 
