@@ -106,6 +106,14 @@ GUI_DEPENDENCIES = {"ttkbootstrap", "pystray", "PIL", "tkinter"}
 
 
 def main() -> int:
+    # The runner's console is cp1252. A failure message it cannot encode
+    # would raise out of the reporter itself: exit 1, no annotation, and the
+    # one line that said what failed never printed.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     if "--no-gui-deps" in sys.argv:
         sys.meta_path.insert(0, _HideModules(GUI_DEPENDENCIES))
         _prove_blocking_works(GUI_DEPENDENCIES)

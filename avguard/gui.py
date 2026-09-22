@@ -33,7 +33,7 @@ from . import iocs as iocs_module
 from . import fim as fim_module
 from .instance import InstanceLock
 from .protection import SelfProtection
-from .quarantine import QuarantineError, QuarantineStore
+from .quarantine import QuarantineError, QuarantineStore, RestoreIncomplete
 from .scanner import Level, ScanCache, Scanner, Verdict
 from .watcher import RealtimeMonitor
 
@@ -650,6 +650,12 @@ class AVGuardApp(tb.Window):
             return
         try:
             target = self.quarantine.restore(entry_id)
+        except RestoreIncomplete as exc:
+            # The file is back; the exception for it is not. Say exactly that.
+            Messagebox.show_warning(str(exc), "Restored, with a warning", parent=self)
+            self._allowlist_changed()
+            self._refresh_quarantine()
+            return
         except QuarantineError as exc:
             Messagebox.show_error(str(exc), "Restore failed", parent=self)
             log.error("restore failed: %s", exc)

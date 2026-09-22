@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import logging
 import os
 import shutil
@@ -119,12 +120,16 @@ class RulePack:
         for name in ("rule_count", "file_count", "corpus_size"):
             try:
                 setattr(self, name, int(getattr(self, name)))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
+                # json.loads turns 1e999 into inf; int(inf) is an OverflowError,
+                # which used to escape and stop the program starting.
                 setattr(self, name, 0)
         try:
             self.false_positive_rate = float(self.false_positive_rate)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             self.false_positive_rate = 0.0
+        if not math.isfinite(self.false_positive_rate):
+            self.false_positive_rate = 0.0   # float() takes inf and nan without complaint
         if not isinstance(self.trusted, bool):
             self.trusted = str(self.trusted).strip().lower() == "true"
         if not isinstance(self.notes, list):
@@ -175,13 +180,19 @@ class PackStore:
 
     # ---------------------------------------------------------------- index
 
-    def _disk_stamp(self) -> tuple[int, int] | None:
-        """Size and mtime of the index as it is on disk right now."""
+    def _disk_stamp(self) -> tuple[int, int, str] | None:
+        """Size, mtime and hash of the index as it is on disk right now.
+
+        Size and mtime alone missed a same-size rewrite in the same
+        timestamp tick: 4 of 200 here, 39 of 200 on the reviewer's run. The
+        index is two kilobytes; hashing it every two seconds is nothing.
+        """
         try:
             st = self.index_path.stat()
+            digest = hashlib.sha256(self.index_path.read_bytes()).hexdigest()
         except OSError:
             return None
-        return (st.st_size, st.st_mtime_ns)
+        return (st.st_size, st.st_mtime_ns, digest)
 
     def changed_on_disk(self) -> bool:
         """Has another process written the index since this one read it?"""
@@ -594,9 +605,15 @@ class PackStore:
 
 
 def _safe_name(name: str) -> str:
-    """A pack name that is safe as a directory name."""
-    cleaned = "".join(c if c.isalnum() or c in "-_." else "-" for c in name).strip("-.")
-    return cleaned[:64] or "pack"
+    """A pack name that is safe as a directory name. Idempotent.
+
+    Strip, then truncate, could leave a trailing "-" that a second call
+    stripped again; the symmetric self-match compared an index name with
+    _safe_name(name) and, for such a name, checked a pack against itself
+    and disarmed it on verify. Truncate, then strip.
+    """
+    cleaned = "".join(c if c.isalnum() or c in "-_." else "-" for c in name)
+    return cleaned[:64].strip("-.") or "pack"
 
 
 def _avguard_files(packs_dir: Path = PACKS_DIR,
@@ -623,10 +640,14 @@ def _avguard_files(packs_dir: Path = PACKS_DIR,
             relative = path.relative_to(directory).parts
             if any(part in skip_dirs for part in relative):
                 continue
-            # .git, .venv, and a pack's own `.name.staging` / `.name.previous`
-            # leftovers: the last two blocked re-adding a pack, since the
-            # CLI admits before install() clears them.
-            if any(part.startswith(".") for part in relative):
+            # .git and .venv anywhere; under the pack store, a pack's own
+            # `.name.staging` / `.name.previous` leftovers, which blocked
+            # re-adding a pack since the CLI admits before install() clears
+            # them. Not every dot path: a blanket skip dropped .github,
+            # .gitignore and .gitattributes from "the whole project".
+            if any(part in (".git", ".venv") for part in relative):
+                continue
+            if directory == packs_dir and relative and relative[0].startswith("."):
                 continue
             # Positive fixtures are supposed to match rules.
             if "must_match" in relative:

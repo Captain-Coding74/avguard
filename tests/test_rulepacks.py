@@ -1269,5 +1269,81 @@ class TestThePackIndexIsTypedAndStamped(TempCase):
         self.assertTrue(self.store.get("vendor").trusted)
 
 
+class TestRoundFiveIndexFixes(TempCase):
+    def test_an_infinite_number_in_the_index_does_not_stop_startup(self):
+        import json
+        self.store.index_path.parent.mkdir(parents=True, exist_ok=True)
+        self.store.index_path.write_text(json.dumps({"p": {"name": "p", "rule_count": 1e999,
+                                                           "false_positive_rate": -1e999}}),
+                                         encoding="utf-8")
+        reopened = PackStore(directory=self.store.directory, index_path=self.store.index_path)
+        pack = reopened.get("p")
+        self.assertEqual((pack.rule_count, pack.false_positive_rate), (0, 0.0))
+
+    def test_safe_name_is_idempotent(self):
+        for typed in ("a" * 63 + "-b", "-" * 70, "x" * 64 + ".", "plain", "..dots.."):
+            with self.subTest(typed=typed):
+                once = rulepacks._safe_name(typed)
+                self.assertEqual(rulepacks._safe_name(once), once)
+                self.assertFalse(once.endswith(("-", ".")))
+
+    def test_verify_does_not_check_a_long_named_pack_against_itself(self):
+        rule = self.rule_file("long.yara",
+                              "rule Long { meta: description = \"d\" strings: $a = \""
+                              + _needle("long") + "\" condition: $a }")
+        typed = "a" * 63 + "-b"
+        admission = self.store.admit(typed, [rule], self.clean_corpus(), licence="MIT")
+        self.assertTrue(admission.accepted, admission.reasons)
+        pack = self.store.install(typed, [rule], admission, licence="MIT")
+        again = self.store.admit(pack.name, self.store.rule_files_for(pack.name),
+                                 self.clean_corpus(), licence="MIT")
+        self.assertTrue(again.accepted, again.reasons)
+
+    def test_a_same_size_rewrite_is_a_change(self):
+        """4 of 200 same-size rewrites landed in the same mtime tick here."""
+        from avguard import config
+        rule = self.simple_rule()
+        self.store.install("vendor", [rule],
+                           Admission(accepted=True, rule_count=1, corpus_size=1), licence="MIT")
+        self.assertFalse(self.store.changed_on_disk())
+        text = self.store.index_path.read_text(encoding="utf-8")
+        flipped = text.replace('"trusted": false', '"trusted": true ') \
+            if '"trusted": false' in text else text.replace('"trusted": true', '"trusted": false')
+        self.assertEqual(len(flipped), len(text), "the rewrite must keep the size")
+        for _ in range(50):
+            config.atomic_write_text(self.store.index_path, flipped)
+            config.atomic_write_text(self.store.index_path, text)
+            config.atomic_write_text(self.store.index_path, flipped)
+            self.assertTrue(self.store.changed_on_disk())
+            self.store.reload()
+            config.atomic_write_text(self.store.index_path, text)
+            self.assertTrue(self.store.changed_on_disk())
+            self.store.reload()
+
+    def test_dot_files_of_the_project_are_still_protected(self):
+        from unittest import mock
+        checkout = self.tmp / "checkout"
+        (checkout / ".github" / "workflows").mkdir(parents=True)
+        (checkout / ".github" / "workflows" / "tests.yml").write_text("on: push\n", encoding="utf-8")
+        (checkout / ".gitignore").write_text("build/\n", encoding="utf-8")
+        (checkout / ".git").mkdir()
+        (checkout / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+        (checkout / "avguard").mkdir()
+        (checkout / "avguard" / "x.py").write_text("x = 1\n", encoding="utf-8")
+        leftover = self.store.directory / ".own.previous"
+        leftover.mkdir(parents=True)
+        (leftover / "old.yara").write_text("rule Old { condition: false }", encoding="utf-8")
+        with mock.patch.object(rulepacks.config, "PROJECT_ROOT", checkout):
+            names = {str(p.relative_to(checkout)).replace(chr(92), "/")
+                     for p in rulepacks._avguard_files(packs_dir=self.store.directory)
+                     if str(p).startswith(str(checkout))}
+            under_packs = [p for p in rulepacks._avguard_files(packs_dir=self.store.directory)
+                           if str(p).startswith(str(self.store.directory))]
+        self.assertIn(".github/workflows/tests.yml", names)
+        self.assertIn(".gitignore", names)
+        self.assertNotIn(".git/config", names)
+        self.assertEqual(under_packs, [], "the pack store's leftovers were protected files")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

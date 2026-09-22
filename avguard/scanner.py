@@ -8,6 +8,7 @@ first, so most files are decided without any I/O at all.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import logging
@@ -165,6 +166,28 @@ class FileFacts:
     entropy: float
     signature_hits: tuple[str, ...] = ()
     data: bytes | None = None  # kept only for files small enough to buffer
+
+
+@dataclass(frozen=True)
+class Ruleset:
+    """What a scan reads about the rules, as one object.
+
+    The compiled rules, the namespaces whose findings are capped, which pack
+    each namespace came from, the files it was built from, and the pack
+    state (recorded hash and file list per pack) it was built against. The
+    scanner swaps the whole thing as one reference; a scan takes its copy
+    once and uses nothing else. Before this, the rules, the cap set and the
+    cache were three attributes assigned separately, and a sync on one
+    worker thread could change them under a scan running on another: a
+    match started on the old ruleset scored against the new cap set, a
+    verdict scored under the old trust state stored into the re-keyed cache.
+    """
+
+    rules: object
+    untrusted: frozenset[str]
+    pack_of: dict[str, str]
+    sources: tuple[Path, ...]
+    pack_state: dict[str, tuple[str, tuple[str, ...]]]
 
 
 @dataclass
@@ -420,8 +443,7 @@ class Scanner:
         self.cache = cache if cache is not None else ScanCache()
         self.cloud_lookup = cloud_lookup
         self.rules_path = rules_path
-        self.rules = None
-        self.rule_sources: list[Path] = []
+        self._ruleset: Ruleset | None = None
         self.signatures = signing.SignatureChecker()
         # Injectable for the same reason the pack store is. The quarantine
         # store records a restore into ITS allowlist and the scanner reads
@@ -438,7 +460,6 @@ class Scanner:
         self.iocs = iocs if iocs is not None else iocs_module.IocStore()
         self._iocs_version = self.iocs.version()
         self._iocs_checked_at = 0.0
-        self._untrusted_namespaces: set[str] = set()
         self.broken_packs: dict[str, str] = {}
         # Rules each pack contributed to the loaded ruleset, counted from its
         # compiled object. The pack index's rule_count is what was measured at
@@ -448,7 +469,6 @@ class Scanner:
         # Which pack each namespace came from, built once per load. It was a
         # linear scan with a path resolution per YARA match, on the real-time
         # worker threads, for an answer that only changes with the ruleset.
-        self._pack_by_namespace: dict[str, str] = {}
         # sha256 of each rule file keyed on its stat, so the generation can be
         # computed without re-reading 3 MB of rules on every start.
         self._file_hashes: dict[str, tuple[int, int, str]] = {}
@@ -462,6 +482,41 @@ class Scanner:
             self.cache = ScanCache(generation=self.detection_generation())
 
     # ---------------------------------------------------------------- rules
+
+    @property
+    def rules(self):
+        return self._ruleset.rules if self._ruleset is not None else None
+
+    @property
+    def rule_sources(self) -> list[Path]:
+        return list(self._ruleset.sources) if self._ruleset is not None else []
+
+    @property
+    def _untrusted_namespaces(self) -> set[str]:
+        return set(self._ruleset.untrusted) if self._ruleset is not None else set()
+
+    @property
+    def _pack_by_namespace(self) -> dict[str, str]:
+        return dict(self._ruleset.pack_of) if self._ruleset is not None else {}
+
+    def _derive_cap(self, pack_of: dict[str, str]) -> frozenset[str]:
+        """Which loaded namespaces are capped: every one whose pack the index
+        does not call trusted. Derived from what was LOADED, never from the
+        disk. Round four derived it from the files present on disk, so a pack
+        whose directory had gone -- or been replaced under the same name --
+        dropped out of the cap set while its rules stayed loaded, and a
+        reports-only pack's critical rule moved a file. Measured, twice."""
+        trusted = {pack.name: pack.trusted for pack in self.packs.packs()}
+        return frozenset(namespace for namespace, name in pack_of.items()
+                         if not trusted.get(name, False))
+
+    def _pack_state_now(self) -> dict[str, tuple[str, tuple[str, ...]]]:
+        """Each pack's recorded hash and the rule files it has on disk."""
+        state: dict[str, tuple[str, tuple[str, ...]]] = {}
+        for pack in self.packs.packs():
+            files = self.packs.rule_files_for(pack.name)
+            state[pack.name] = (pack.sha256, tuple(sorted(_namespaces(files))))
+        return state
 
     def rekey_cache(self) -> int:
         """Rebuild the cache against the current settings and rules.
@@ -581,12 +636,6 @@ class Scanner:
             log.error("yara-python is not installed; rule matching is unavailable")
             return False
 
-        own = self.own_rule_files()
-        if not own:
-            log.error("no rule files found in %s or %s; rule matching is unavailable",
-                      self.rules_path.parent, config.USER_RULES_DIR)
-            return False
-
         if allow_cached and self._adopt_compiled_cache():
             return True
         if not allow_cached:
@@ -595,10 +644,21 @@ class Scanner:
             # the generation nor the saved blob changed.
             self._file_hashes.clear()
 
-        # The stat witnesses for the cache are taken BEFORE compiling. Taken
-        # after, a rule file rewritten during the compile gave a manifest
-        # describing the new content beside a blob compiled from the old one.
+        # The stat witnesses for the cache are taken BEFORE anything is
+        # globbed for the compile. Taken after, a rule file rewritten during
+        # the compile gave a manifest describing the new content beside a
+        # blob compiled from the old one; taken after `own` was listed, a
+        # file that appeared in between was witnessed but never compiled,
+        # and every later start adopted a blob without it. A file that
+        # appears after the witnesses is compiled but not witnessed, and the
+        # next start refuses the cache: the safe direction.
         witnesses = self._manifest_entries()
+
+        own = self.own_rule_files()
+        if not own:
+            log.error("no rule files found in %s or %s; rule matching is unavailable",
+                      self.rules_path.parent, config.USER_RULES_DIR)
+            return False
 
         # Stage one: the rules this program answers for. If THESE do not
         # compile, that is the loud failure it has always been.
@@ -622,11 +682,13 @@ class Scanner:
         counts: dict[str, int] = {}
         accepted_pack_files: list[Path] = []
         pack_of: dict[str, str] = {}
+        state: dict[str, tuple[str, tuple[str, ...]]] = {}
         for pack in self.packs.packs():
             files = self.packs.rule_files_for(pack.name)
+            pack_namespaces = _namespaces(files)
+            state[pack.name] = (pack.sha256, tuple(sorted(pack_namespaces)))
             if not files:
                 continue
-            pack_namespaces = _namespaces(files)
             try:
                 compiled_pack = yara.compile(filepaths=pack_namespaces)
             except yara.Error as exc:
@@ -652,22 +714,18 @@ class Scanner:
             self._report_rule_failure(f"rules failed to compile together: {exc}")
             return False
 
-        untrusted = self.packs.untrusted_namespaces()
-
         problem = self._validate_rules(candidate)
         if problem:
             self._report_rule_failure(problem)
             return False
 
-        # Ruleset and cap are adopted in the same breath, so a failed load can
-        # never leave new namespaces paired with an old compiled ruleset.
-        self._untrusted_namespaces = untrusted
-        self._pack_by_namespace = pack_of
+        # One object, one assignment: a failed load leaves the previous
+        # ruleset exactly as it was, and no reader can see half a change.
+        self._ruleset = Ruleset(rules=candidate, untrusted=self._derive_cap(pack_of),
+                                pack_of=pack_of, sources=tuple(sources), pack_state=state)
         self.broken_packs = broken
         self.pack_rule_counts = counts
-        self.rules = candidate
-        self.rule_sources = sources
-        shipped = [p.name for p in sources if str(p.resolve()) not in self._untrusted_namespaces]
+        shipped = [p.name for p in sources if str(p.resolve()) not in self._ruleset.untrusted]
         imported = len(sources) - len(shipped)
         # Summarised, not listed. Installing a real pack made this line
         # print 311 filenames on every single run.
@@ -760,15 +818,14 @@ class Scanner:
             log.info("compiled rule cache not usable (%s); compiling instead", exc)
             return False
 
-        self._untrusted_namespaces = self.packs.untrusted_namespaces()
-        self._pack_by_namespace = pack_by_namespace
-        self.broken_packs = broken
-        self.pack_rule_counts = counts
         for key, known in recorded.items():
             if isinstance(known.get("sha256"), str):
                 self._file_hashes[key] = (known["size"], known["mtime_ns"], known["sha256"])
-        self.rules = rules
-        self.rule_sources = sources
+        self._ruleset = Ruleset(rules=rules, untrusted=self._derive_cap(pack_by_namespace),
+                                pack_of=pack_by_namespace, sources=tuple(sources),
+                                pack_state=self._pack_state_now())
+        self.broken_packs = broken
+        self.pack_rule_counts = counts
         log.info("loaded the ruleset compiled last time (%d file(s), all unchanged)",
                  len(sources))
         return True
@@ -898,11 +955,12 @@ class Scanner:
             log.error("%s -- no rules are loaded, detection is severely reduced", message)
 
     def reload_rules(self) -> bool:
-        """Recompile from disk. Used by the Reload button and after an update."""
-        previous = self.rules
+        """Recompile from disk. Used by the Reload button and after an update.
+
+        A refused load leaves the previous ruleset in place by construction:
+        load_rules() assigns the one ruleset object only on success.
+        """
         ok = self.load_rules(allow_cached=False)
-        if not ok and previous is not None:
-            self.rules = previous
         if ok:
             self.cache = ScanCache(path=self.cache._path,
                                    generation=self.detection_generation())
@@ -914,10 +972,16 @@ class Scanner:
         `--packs verify` in a terminal disarms a failing pack by writing
         trusted=false. A running GUI held its own PackStore in memory and
         kept scoring by the old trust state -- the same failure round three
-        fixed for the allowlist. A trust change re-derives the cap and
-        re-keys the cache (the generation includes trust). A pack added or
-        removed is a reload: a removed reports-only pack's rules would
-        otherwise go on running with nothing capping them.
+        fixed for the allowlist.
+
+        What changed decides what happens. Any pack whose recorded hash or
+        rule files differ from what was loaded -- added, removed, or
+        replaced under the same name -- is a reload, because the loaded
+        rules no longer describe the index. A change of trust alone is a
+        re-derivation of the cap set over the SAME loaded rules, and a
+        re-key of the cache (the generation includes trust). Round four
+        compared names, so a pack replaced under its own name kept the old
+        rules running and re-keyed the cache to the new generation.
         """
         now = time.monotonic()
         if not force and now - self._packs_checked_at < PACKS_CHECK_INTERVAL:
@@ -926,15 +990,16 @@ class Scanner:
             self._packs_checked_at = now
             if not self.packs.changed_on_disk():
                 return
-            before = {p.name for p in self.packs.packs()}
             self.packs.reload()
-            after = {p.name for p in self.packs.packs()}
-            if before != after:
-                log.info("rule packs changed on disk (%s); reloading rules",
-                         ", ".join(sorted(before ^ after)))
+            current = self._ruleset
+            if current is None or self._pack_state_now() != current.pack_state:
+                log.info("rule packs changed on disk; reloading rules")
                 self.reload_rules()
                 return
-            self._untrusted_namespaces = self.packs.untrusted_namespaces()
+            untrusted = self._derive_cap(current.pack_of)
+            if untrusted == current.untrusted:
+                return
+            self._ruleset = dataclasses.replace(current, untrusted=untrusted)
             self.rekey_cache()
             log.info("rule pack trust changed on disk; cap and cache rebuilt")
 
@@ -1033,23 +1098,23 @@ class Scanner:
 
     # ---------------------------------------------------------------- rules
 
-    def _yara_matches(self, facts: FileFacts) -> list[Finding]:
-        if self.rules is None:
+    def _yara_matches(self, facts: FileFacts, ruleset: Ruleset | None) -> list[Finding]:
+        if ruleset is None:
             return []
         try:
             # Files small enough to buffer are matched from memory, so the
             # whole scan is genuinely one read.
             if facts.data is not None:
-                matches = self.rules.match(data=facts.data)
+                matches = ruleset.rules.match(data=facts.data)
             else:
-                matches = self._match_large_file(facts)
+                matches = self._match_large_file(facts, ruleset.rules)
         except Exception as exc:  # yara.Error, plus timeouts on huge files
             log.warning("YARA could not scan %s: %s", facts.path, exc)
             return []
 
-        return [self._finding_from_match(m) for m in matches]
+        return [self._finding_from_match(m, ruleset) for m in matches]
 
-    def _finding_from_match(self, match, inside: str = "") -> Finding:
+    def _finding_from_match(self, match, ruleset: Ruleset, inside: str = "") -> Finding:
         """Turn one YARA match into a scored finding.
 
         The single place a match becomes a weight. There used to be two of
@@ -1078,13 +1143,13 @@ class Scanner:
         # "critical" as decisive would hand a stranger the power to delete
         # things here.
         namespace = str(getattr(match, "namespace", "") or "")
-        imported = namespace in self._untrusted_namespaces
+        imported = namespace in ruleset.untrusted
         if imported:
             weight = min(weight, SEVERITY_WEIGHTS["medium"])
 
         description = str(meta.get("description", "")).strip()
         detail = description or f"matched rule {match.rule}"
-        origin = self._pack_by_namespace.get(namespace, "") if namespace else ""
+        origin = ruleset.pack_of.get(namespace, "") if namespace else ""
         attribution = f", from the {origin} pack" if origin else ""
         location = f" inside {inside}" if inside else ""
 
@@ -1093,7 +1158,7 @@ class Scanner:
             f"{detail} (rule {match.rule}, {severity or 'unrated'}{attribution}){location}",
             hard=weight >= MALICIOUS_AT and not imported)
 
-    def _match_large_file(self, facts: FileFacts):
+    def _match_large_file(self, facts: FileFacts, rules):
         """YARA-match a file too big to have been buffered during the read.
 
         `match(filepath=...)` is preferred because it lets YARA memory-map the
@@ -1105,7 +1170,7 @@ class Scanner:
         not a substitute for scanning the file.
         """
         try:
-            return self.rules.match(filepath=str(facts.path), timeout=60)
+            return rules.match(filepath=str(facts.path), timeout=60)
         except yara.Error as exc:
             if "could not open file" not in str(exc):
                 raise
@@ -1114,7 +1179,7 @@ class Scanner:
         # Bounded by the guard: anything past cfg.max_file_size never gets here.
         with open(facts.path, "rb") as handle:
             data = handle.read(self.cfg.max_file_size)
-        return self.rules.match(data=data)
+        return rules.match(data=data)
 
     def _pe_findings(self, facts: FileFacts) -> list[Finding]:
         """Structural oddities in an executable.
@@ -1134,7 +1199,7 @@ class Scanner:
         return [Finding("pe", "structure", WEIGHT_PE_STRUCTURE,
                         f"unusual executable structure: {report.describe()}")]
 
-    def _archive_findings(self, facts: FileFacts) -> list[Finding]:
+    def _archive_findings(self, facts: FileFacts, ruleset: Ruleset | None) -> list[Finding]:
         """Scan the contents of a container without unpacking it.
 
         Real-time protection watches Downloads, so a zipped sample is the
@@ -1171,16 +1236,16 @@ class Scanner:
                         "signature", name, WEIGHT_SIGNATURE,
                         f"matched the byte signature for {name} inside {display}",
                         hard=True))
-            if self.rules is not None:
+            if ruleset is not None:
                 try:
-                    matches = self.rules.match(data=payload)
+                    matches = ruleset.rules.match(data=payload)
                 except Exception as exc:
                     log.debug("YARA could not scan %s: %s", display, exc)
                     continue
                 for match in matches:
                     # Same scoring as a loose file, including the cap on
                     # rules from packs nobody has promoted.
-                    findings.append(self._finding_from_match(match, inside=display))
+                    findings.append(self._finding_from_match(match, ruleset, inside=display))
 
         if report.members and report.inspected:
             log.debug("%s: inspected %d of %d archive members",
@@ -1226,11 +1291,18 @@ class Scanner:
 
         self._sync_packs()
         self._sync_iocs()
+        # This scan's view of the rules and the cache, taken once. A sync on
+        # another worker may swap either while this file is being read; a
+        # verdict from the old ruleset then goes into the old cache object,
+        # which is never saved again -- lost, not misfiled under a
+        # generation that means something else.
+        ruleset = self._ruleset
+        cache = self.cache
         stat = path.stat()
         size, mtime_ns = stat.st_size, stat.st_mtime_ns
 
         if use_cache:
-            cached = self.cache.get(path, size, mtime_ns)
+            cached = cache.get(path, size, mtime_ns)
             if cached and self._cache_still_applies(cached):
                 return Verdict(path, Level(cached["level"]), list(cached["reasons"]))
 
@@ -1251,8 +1323,8 @@ class Scanner:
             verdict = Verdict(path, Level.CLEAN, [reason], facts,
                               [Finding("allowlist", "user-decision", 0, reason)])
             if use_cache:
-                self.cache.put(path, size, mtime_ns, Level.CLEAN, [reason], facts.sha256,
-                               allowed=True)
+                cache.put(path, size, mtime_ns, Level.CLEAN, [reason], facts.sha256,
+                          allowed=True)
             return verdict
 
         findings: list[Finding] = []
@@ -1269,9 +1341,9 @@ class Scanner:
             findings.append(Finding("signature", name, WEIGHT_SIGNATURE,
                                     f"matched the byte signature for {name}", hard=True))
 
-        findings.extend(self._yara_matches(facts))
+        findings.extend(self._yara_matches(facts, ruleset))
         findings.extend(self._pe_findings(facts))
-        findings.extend(self._archive_findings(facts))
+        findings.extend(self._archive_findings(facts, ruleset))
 
         # Entropy is supporting evidence only. On its own a high-entropy file is
         # usually a zip, a JPEG or an installer, so it can raise a file to
@@ -1323,7 +1395,7 @@ class Scanner:
         reasons = [f.describe() for f in findings]
         verdict = Verdict(path, level, reasons, facts, findings)
         if use_cache:
-            self.cache.put(path, size, mtime_ns, level, reasons, facts.sha256)
+            cache.put(path, size, mtime_ns, level, reasons, facts.sha256)
         return verdict
 
     # ------------------------------------------------------------ walking

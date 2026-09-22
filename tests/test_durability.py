@@ -1045,6 +1045,75 @@ class TestAPackDecisionFromAnotherProcessIsSeen(TempCase):
                       "the removed pack's rules were still loaded")
         self.assertNotIn("stranger", self.scanner.pack_rule_counts)
 
+    def test_a_pack_whose_directory_vanished_stays_capped_through_an_index_rewrite(self):
+        """Measured on 9e2e271: a reports-only pack, its directory deleted,
+        any other process rewriting the index -- MALICIOUS, hard. The cap
+        set was rebuilt from the disk while the rules stayed loaded."""
+        import shutil
+        from avguard.scanner import Level
+        self._other_process().set_trusted("stranger", False)
+        self.assertIs(self.scanner.scan(self.sample, use_cache=False).level, Level.SUSPICIOUS)
+        shutil.rmtree(self.store.pack_dir("stranger"))
+        self._other_process().set_trusted("stranger", False)   # any rewrite at all
+        verdict = self.scanner.scan(self.sample, use_cache=False)
+        self.assertFalse(verdict.is_threat, "a reports-only pack moved a file")
+        self.assertFalse(any(f.hard for f in verdict.findings))
+
+    def test_a_pack_replaced_under_the_same_name_runs_the_new_rules_capped(self):
+        """Measured on 9e2e271: remove and re-add under one name and the OLD
+        rules kept running, uncapped, with the cache re-keyed to the new
+        generation. Names compared equal; the pack state did not."""
+        from avguard.scanner import Level
+        from avguard.rulepacks import Admission
+        other = self._other_process()
+        other.set_trusted("stranger", False)
+        self.assertIs(self.scanner.scan(self.sample, use_cache=False).level, Level.SUSPICIOUS)
+        other.remove("stranger")
+        replacement = self.tmp / "replacement.yara"
+        replacement.write_text("rule Replacement { meta: description = \"d\" "
+                               "severity = \"critical\" strings: $a = \""
+                               + self.NEEDLE + "\" condition: $a }", encoding="utf-8")
+        other.install("stranger", [replacement],
+                      Admission(accepted=True, rule_count=1, corpus_size=1), licence="MIT")
+        verdict = self.scanner.scan(self.sample, use_cache=False)
+        self.assertEqual([f.name for f in verdict.findings if f.source == "yara"],
+                         ["Replacement"], "the old rules were still running")
+        self.assertIs(verdict.level, Level.SUSPICIOUS)
+        self.assertFalse(verdict.is_threat)
+
+    def test_a_scan_in_flight_keeps_the_ruleset_it_started_with(self):
+        """A match started on the old ruleset must be scored against the old
+        cap set, whatever another worker swaps in meanwhile."""
+        import dataclasses
+        import threading
+        from avguard.scanner import Level
+        self._other_process().set_trusted("stranger", False)
+        self.scanner.scan(self.sample, use_cache=False)          # loaded, capped
+        started, gate = threading.Event(), threading.Event()
+        inner = self.scanner._ruleset.rules
+
+        class Held:
+            def match(self, *args, **kwargs):
+                result = inner.match(*args, **kwargs)
+                started.set()
+                gate.wait(timeout=10)
+                return result
+
+        self.scanner._ruleset = dataclasses.replace(self.scanner._ruleset, rules=Held())
+        verdicts: list = []
+        worker = threading.Thread(target=lambda: verdicts.append(
+            self.scanner.scan(self.sample, use_cache=False)))
+        worker.start()
+        self.assertTrue(started.wait(timeout=10))
+        self._other_process().remove("stranger")                 # gone from the index
+        self.scanner._sync_packs(force=True)                     # reloads: rules gone
+        gate.set()
+        worker.join(timeout=10)
+        self.assertEqual(len(verdicts), 1)
+        self.assertIs(verdicts[0].level, Level.SUSPICIOUS,
+                      "scored against a cap set from a different ruleset")
+        self.assertFalse(verdicts[0].is_threat)
+
 
 class TestAllowlistFilesAndSaves(TempCase):
     def test_a_non_utf8_file_is_an_empty_list(self):
@@ -1080,11 +1149,16 @@ class TestAllowlistFilesAndSaves(TempCase):
                                 allowlist=allow)
         target = self.write("kept.bin", SELFTEST_MARKER)
         record = store.quarantine(target, ["marker"])
+        from avguard.quarantine import RestoreIncomplete
         with mock.patch.object(Allowlist, "_save", return_value=False):
-            with self.assertRaises(QuarantineError) as caught:
+            with self.assertRaises(RestoreIncomplete) as caught:
                 store.restore(record.entry_id)
         self.assertIn("not recorded", str(caught.exception))
+        self.assertEqual(caught.exception.target, target)
         self.assertTrue(target.exists(), "the file itself must still be back")
+        # Not a failed restore: the CLI says restored, warns, and exits 0.
+        self.assertTrue(issubclass(RestoreIncomplete, RuntimeError))
+        self.assertFalse(issubclass(RestoreIncomplete, QuarantineError))
 
     def test_the_stat_is_throttled(self):
         """Measured before: one stat per lookup, under the lock, 125 us of a
@@ -1097,6 +1171,30 @@ class TestAllowlistFilesAndSaves(TempCase):
             for _ in range(200):
                 allow.allows("b" * 64)
         self.assertLessEqual(stamp.call_count, 2, "a stat on every lookup")
+
+
+class TestLoopbackShares(unittest.TestCase):
+    """The administrative share is a spelling of every local file."""
+
+    def test_local_admin_share_maps_to_the_drive(self):
+        from avguard.protection import _canonical_spelling
+        bs = chr(92)
+        for host in ("localhost", "127.0.0.1", "LOCALHOST"):
+            spelling = Path(bs * 2 + host + bs + "C$" + bs + "Users" + bs + "x.txt")
+            with self.subTest(host=host):
+                self.assertEqual(_canonical_spelling(spelling),
+                                 Path("C:" + bs + "Users" + bs + "x.txt"))
+        prefixed = Path(bs * 2 + "?" + bs + "UNC" + bs + "localhost" + bs + "D$" + bs + "f")
+        self.assertEqual(_canonical_spelling(prefixed), Path("D:" + bs + "f"))
+
+    def test_a_real_share_is_left_alone(self):
+        from avguard.protection import _canonical_spelling
+        bs = chr(92)
+        for text in (bs * 2 + "fileserver" + bs + "C$" + bs + "x",
+                     bs * 2 + "localhost" + bs + "public" + bs + "x",
+                     bs * 2 + "localhost" + bs + "CC$" + bs + "x"):
+            with self.subTest(text=text):
+                self.assertEqual(_canonical_spelling(Path(text)), Path(text))
 
 
 if __name__ == "__main__":

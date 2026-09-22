@@ -573,6 +573,15 @@ class TestStopKeepingRemovesWhatWasSelected(unittest.TestCase):
         allow = Allowlist(path=tmp / "allow.json")
         allow.add("a" * 64, "v1.exe", ["older"])
         allow.add("b" * 64, "v2.exe", ["newer"])
+        # Distinct timestamps, or the test proves nothing: three entries added
+        # in one second sort as a tie, and the old row-index code removed the
+        # right file anyway. With v1 and v2 dated last year, v3 sorts first.
+        import json
+        raw = json.loads((tmp / "allow.json").read_text(encoding="utf-8"))
+        raw["a" * 64]["added_at"] = "2025-01-01T00:00:00+00:00"
+        raw["b" * 64]["added_at"] = "2025-01-02T00:00:00+00:00"
+        (tmp / "allow.json").write_text(json.dumps(raw), encoding="utf-8")
+        allow.reload()
         store = PackStore(directory=tmp / "packs", index_path=tmp / "packs" / "packs.json")
         dialog = dialogs.SettingsDialog(root, config.Config(), lambda: None,
                                         pack_store=store, allowlist=allow)
@@ -590,6 +599,8 @@ class TestStopKeepingRemovesWhatWasSelected(unittest.TestCase):
         self.assertIsNone(allow.allows("a" * 64), "v1 was selected and must be gone")
         self.assertIsNotNone(allow.allows("b" * 64), "v2 was removed instead of v1")
         self.assertIsNotNone(allow.allows("c" * 64))
+        self.assertEqual([e.sha256[:1] for e in allow.entries()], ["c", "b"],
+                         "v3 must have sorted first, or the row shift never happened")
 
 
 if __name__ == "__main__":

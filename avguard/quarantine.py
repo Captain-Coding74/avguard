@@ -37,6 +37,18 @@ log = logging.getLogger(__name__)
 MASK_BLOCK = 32  # SHA-256 digest size
 
 
+class RestoreIncomplete(RuntimeError):
+    """The file is back and its record consumed, but the decision to keep it
+    could not be recorded. Not a QuarantineError: callers treated that as a
+    failed restore and told the user so, with exit code 1 and a message that
+    contradicted itself."""
+
+    def __init__(self, target: Path, reason: str) -> None:
+        super().__init__(f"restored to {target}, but the decision to keep it was not "
+                         f"recorded ({reason}); it may be flagged again")
+        self.target = target
+
+
 class QuarantineError(RuntimeError):
     """Raised when a quarantine or restore cannot be completed safely."""
 
@@ -387,9 +399,7 @@ class QuarantineStore:
             # recorded, beats a restore that reports success and a file that
             # is flagged again within the second.
             log.error("restored %s to %s, but %s", record.original_name, target, exc)
-            raise QuarantineError(
-                f"restored to {target}, but the decision to keep it was not recorded "
-                f"({exc}); it may be flagged again") from exc
+            raise RestoreIncomplete(target, str(exc)) from exc
 
         log.info("restored %s to %s", record.original_name, target)
         return target

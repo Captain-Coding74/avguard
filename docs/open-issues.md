@@ -74,8 +74,31 @@ Ranked by the same rule as everything else in this project:
 | 50 | A trust change written by `--packs verify` in another process never reached a running scanner | `tests/test_durability.py` |
 | 51 | "Stop keeping" indexed a fresh list with a stale row number and could remove the wrong exception | `tests/test_tier3.py` |
 | 52 | A failed allowlist save left a phantom decision; a non-UTF-8 file crashed startup; `"trusted": "false"` armed a pack | `tests/test_durability.py`, `tests/test_rulepacks.py` |
+| 53 | **The pack sync derived the cap set from the disk: a reports-only pack whose directory vanished, or was replaced under its own name, ran uncapped** | `tests/test_durability.py` |
+| 54 | **The ruleset, the cap set and the cache were swapped separately from worker threads; a scan in flight could mix them** | `tests/test_durability.py` |
+| 55 | A rule file appearing between the compile's listing and the cache's witnesses was witnessed but never compiled | reordered; argued |
+| 56 | `1e999` in a pack record raised `OverflowError` out of every entry point | `tests/test_rulepacks.py` |
+| 57 | `_safe_name` was not idempotent, so `verify` checked a long-named pack against itself and disarmed it | `tests/test_rulepacks.py` |
+| 58 | The index stamp missed a same-size rewrite in the same tick (4 of 200) | `tests/test_rulepacks.py` |
+| 59 | The dot-path skip dropped `.github` and `.gitignore` from the self-match set | `tests/test_rulepacks.py` |
+| 60 | A restore whose decision was not recorded was reported as a failed restore | `tests/test_durability.py` |
 
 ### Notes worth keeping
+
+**Round four's sync was designed wrong (53, 54).** Reviewed the way rounds
+two and three were. It rebuilt the cap set from the files on disk while the
+rules compiled from those files stayed loaded, so a namespace with no entry
+in the cap set scored as a shipped rule: a reports-only pack's `critical`
+rule moved a file once its directory was gone and any process rewrote the
+index, and a pack replaced under its own name kept the OLD rules running
+uncapped with the cache re-keyed to the NEW generation. Both measured. And
+it assigned the rules, the cap set and the cache as three attributes from
+worker threads, so a scan in flight could read any mix of them. There is
+one `Ruleset` object now, swapped as one reference; the cap is derived from
+the loaded namespaces and the index's trust flags, with an unknown pack
+capped; the sync compares each pack's recorded hash and file list with what
+was loaded and reloads on any difference; and a scan takes its ruleset and
+its cache once. Plan and numbers in [next-5.md](next-5.md).
 
 **Rounds two and three, reviewed (44-52).** Six reviewers over the diff
 since `050dd94`, two refuters per finding told to prove it wrong: fifteen

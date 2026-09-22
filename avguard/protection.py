@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import socket
 import sys
 from pathlib import Path
 from typing import Iterable
@@ -74,7 +75,7 @@ class SelfProtection:
     @staticmethod
     def _forms(path: Path) -> set[Path]:
         """Every spelling of a path this platform might hand us."""
-        path = _strip_extended_prefix(path)
+        path = _canonical_spelling(path)
         forms: set[Path] = set()
         for spell in (lambda p: Path(os.path.abspath(p)), Path.resolve):
             try:
@@ -84,7 +85,7 @@ class SelfProtection:
             # realpath answers with the extended-length prefix for a volume
             # GUID spelling, or for anything over 260 characters. Compare the
             # same text on the way out as on the way in.
-            forms.add(_strip_extended_prefix(form))
+            forms.add(_canonical_spelling(form))
         return forms
 
     @property
@@ -170,6 +171,44 @@ def _strip_extended_prefix(path: Path) -> Path:
         # and _forms strips again afterwards.
         return path
     return path
+
+
+def _local_hosts() -> set[str]:
+    hosts = {"localhost", "127.0.0.1", "::1"}
+    try:
+        hosts.add(socket.gethostname().lower())
+    except OSError:
+        pass
+    return hosts
+
+
+_LOCAL_HOSTS = _local_hosts()
+
+
+def _local_share_to_drive(path: Path) -> Path:
+    """`\\\\localhost\\C$\\x` is `C:\\x` with extra steps.
+
+    The administrative share is a spelling of every local file, and
+    resolve() keeps the UNC form, so a protected file spelled that way
+    compared unequal to its root. Not reproducible on this machine (the
+    share is off), mapped anyway: the cost is a string compare.
+    """
+    text = str(path)
+    if not text.startswith("\\\\") or text.startswith(("\\\\?\\", "\\\\.\\")):
+        return path
+    parts = text[2:].split("\\", 2)
+    if len(parts) < 2:
+        return path
+    host, share = parts[0].lower(), parts[1]
+    if host in _LOCAL_HOSTS and len(share) == 2 and share[1] == "$" and share[0].isalpha():
+        rest = parts[2] if len(parts) > 2 else ""
+        return Path(share[0].upper() + ":\\" + rest)
+    return path
+
+
+def _canonical_spelling(path: Path) -> Path:
+    """One text for every way Windows can name the same local file."""
+    return _local_share_to_drive(_strip_extended_prefix(path))
 
 
 def _normalise(path: Path) -> str:

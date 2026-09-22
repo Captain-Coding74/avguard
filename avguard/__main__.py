@@ -18,7 +18,7 @@ from .cloud import VirusTotalClient
 from .instance import InstanceLock
 from .protection import SelfProtection
 from . import rulepacks
-from .quarantine import QuarantineError, QuarantineStore
+from .quarantine import QuarantineError, QuarantineStore, RestoreIncomplete
 from .scanner import Level, Scanner
 
 
@@ -569,6 +569,10 @@ def _main(argv: list[str] | None = None) -> int:
             return 2
         try:
             target = store.restore(args.restore)
+        except RestoreIncomplete as exc:
+            print(f"Restored to {exc.target}")
+            print(f"WARNING: {exc}", file=sys.stderr)
+            return 0
         except QuarantineError as exc:
             print(f"Could not restore: {exc}", file=sys.stderr)
             return 1
