@@ -357,6 +357,13 @@ imports numpy, and nothing in the plan depends on it.)
 | Item | Result |
 |---|---|
 | 1. IOC hash blocklist | SQLite, one lookup per file: 7 µs against a million rows, and no measurable cost inside a scan (551 µs against 550 µs, warm). Manual import, an opt-in MalwareBazaar feed (1,484 hashes in 1 s live; a truncated download changes nothing), and the list is part of the detection generation. Tests 377 → **400** |
+| 2. File integrity monitoring | A signed SQLite baseline (HMAC-SHA256, key under DPAPI) of every file under chosen roots; a check names modified, added and removed files with old and new hashes, records events, and never moves anything. Default hashes everything, `--fast` trusts size and mtime and says what that trades away; both asserted against a file whose mtime was put back. 2,000 files / 596 MB: baseline 1.0 s warm, check 0.73 s, `--fast` 0.21 s. Tests 400 → **421** |
+
+**The baseline's signature has a stated limit.** Code running as the same
+user can call the same DPAPI and re-sign a doctored baseline. It defends
+against other tools, casual edits and a baseline copied in from elsewhere --
+not against an attacker who already owns the account. The README says so the
+way it says the quarantine masking is masking.
 
 **A transaction beat the file swap.** The plan asked for "build beside and
 `os.replace`". Windows refuses to replace a file another handle has open, and

@@ -50,6 +50,10 @@ Other flags:
 | `--iocs-import FILE` | add SHA-256 hashes to the local blocklist |
 | `--iocs-update` | fetch the MalwareBazaar blocklist once (`--iocs-full` for the full export) |
 | `--iocs-status` | what the blocklist holds, and when the feed was last checked |
+| `--fim-baseline ROOT...` | record every file's hash under ROOT as the integrity baseline |
+| `--fim-check` | report what changed since (`--fast` trusts size and mtime) |
+| `--fim-accept PATH...` | re-baseline a change you have looked at |
+| `--fim-status`, `--fim-schedule status\|on\|off` | the baseline, and a daily unattended check |
 | `--schedule status\|on\|off` | start with Windows, and a daily scan |
 | `-v` | show clean files too |
 
@@ -369,6 +373,35 @@ error page, anything with fewer than 100 valid hashes — is refused whole and
 changes nothing. The list is part of the detection generation, so a file
 cached CLEAN before an import is judged again, and a running AVGuard notices
 an import made from a terminal within seconds.
+
+## File integrity
+
+A scanner asks whether a file is bad. Integrity monitoring asks a different
+question about files that should not change at all — a web root, a folder of
+scripts, a configuration tree: is it still what it was?
+
+```bash
+python -m avguard --fim-baseline "C:\inetpub\wwwroot"
+python -m avguard --fim-check
+```
+
+The check names every modified, added or removed file with its old and new
+hash, records each as an event, and moves nothing: changed is not the same as
+malicious. `--fim-accept PATH` re-baselines a change you have looked at, so
+the alert stops repeating; accepting is always a person's action.
+
+The default check hashes every file. `--fast` trusts an unchanged size and
+mtime and skips the read, which is exactly what an attacker restoring a
+file's timestamp defeats — so the help text says so, and a test proves the
+default catches what `--fast` misses.
+
+The baseline is a target, so it is signed: an HMAC-SHA256 over the database
+with a key protected by Windows DPAPI. A signature that no longer matches does
+not stop the check; it is reported as a change to the baseline itself. The
+limit, stated plainly: code running as the same user can call the same DPAPI
+and re-sign a doctored baseline. The signature defends against other tools,
+casual edits and a copied-in baseline — not against an attacker who already
+owns the account.
 
 ## VirusTotal
 

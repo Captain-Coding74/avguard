@@ -40,6 +40,7 @@ _NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 class ScheduleStatus:
     starts_with_windows: bool = False
     scheduled_scan: bool = False
+    scheduled_fim_check: bool = False
     detail: str = ""
 
 
@@ -165,10 +166,42 @@ def disable_scheduled_scan() -> tuple[bool, str]:
     return True, "removed"
 
 
+FIM_TASK_NAME = "AVGuard FIM check"
+
+
+def scheduled_fim_check_exists() -> bool:
+    ok, _ = _run(["schtasks", "/Query", "/TN", FIM_TASK_NAME])
+    return ok
+
+
+def enable_scheduled_fim_check(time_of_day: str = "12:30") -> tuple[bool, str]:
+    """A daily integrity check, unattended. It records events and moves
+    nothing -- a check cannot quarantine at all, scheduled or not."""
+    if sys.platform != "win32":
+        return False, "only supported on Windows"
+    runner, _ = _launcher()
+    command = f'"{runner}" -m avguard --fim-check'
+    ok, output = _run(["schtasks", "/Create", "/F", "/SC", "DAILY",
+                       "/TN", FIM_TASK_NAME, "/TR", command, "/ST", time_of_day])
+    if not ok:
+        return False, output or "schtasks refused to create the task"
+    log.info("scheduled a daily integrity check at %s", time_of_day)
+    return True, f"daily at {time_of_day}"
+
+
+def disable_scheduled_fim_check() -> tuple[bool, str]:
+    ok, output = _run(["schtasks", "/Delete", "/F", "/TN", FIM_TASK_NAME])
+    if not ok and "cannot find" not in output.lower():
+        return False, output
+    log.info("removed the scheduled integrity check")
+    return True, "removed"
+
+
 def status() -> ScheduleStatus:
     if sys.platform != "win32":
         return ScheduleStatus(detail="scheduling is only supported on Windows")
     return ScheduleStatus(
         starts_with_windows=starts_with_windows(),
         scheduled_scan=scheduled_scan_exists(),
+        scheduled_fim_check=scheduled_fim_check_exists(),
     )

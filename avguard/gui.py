@@ -30,6 +30,7 @@ from . import config, dialogs, logsetup, scheduling
 from .events import Event, EventStore
 from .cloud import VirusTotalClient
 from . import iocs as iocs_module
+from . import fim as fim_module
 from .instance import InstanceLock
 from .protection import SelfProtection
 from .quarantine import QuarantineError, QuarantineStore
@@ -933,6 +934,30 @@ class AVGuardApp(tb.Window):
         self.cache = self.scanner.cache
         log.info("blocklist changed; %d cached verdict(s) discarded", discarded)
 
+    def _fim_store(self):
+        return fim_module.FimStore(excluded_globs=self.cfg.excluded_globs)
+
+    def _fim_ok(self) -> bool:
+        """Red only when a baseline exists and its signature does not hold."""
+        store = self._fim_store()
+        return not store.exists() or store.verify_integrity() == fim_module.INTEGRITY_OK
+
+    def _describe_fim(self) -> str:
+        store = self._fim_store()
+        if not store.exists():
+            return ("no baseline. Record one from a terminal: "
+                    "avguard --fim-baseline <folder>")
+        try:
+            when = datetime.fromtimestamp(store.baselined_at()).strftime("%Y-%m-%d %H:%M")
+        except (ValueError, OSError):
+            when = "unknown"
+        integrity = store.verify_integrity()
+        state = ("signature holds" if integrity == fim_module.INTEGRITY_OK
+                 else f"SIGNATURE {integrity.upper()} - the baseline was changed outside AVGuard")
+        roots = store.roots()
+        return (f"{store.file_count():,} file(s) under {len(roots)} root(s), baselined {when}; "
+                f"{state}. Check with: avguard --fim-check")
+
     def _packs_ok(self) -> bool:
         """Red if any pack is broken or has vanished from disk."""
         if self.scanner.broken_packs:
@@ -964,6 +989,7 @@ class AVGuardApp(tb.Window):
              f"on, {self.cloud.spent_today} lookup(s) today" if self.cfg.cloud_enabled
              else "off - no hashes leave this machine"),
             ("Hash blocklist", True, self._describe_iocs()),
+            ("File integrity", self._fim_ok(), self._describe_fim()),
             ("Scan cache", True, f"{len(self.cache)} remembered verdict(s)"),
             ("Quarantine integrity", not self.quarantine.orphaned_payloads(),
              "every stored file has a record"

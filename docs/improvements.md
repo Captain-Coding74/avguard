@@ -131,7 +131,7 @@ feed parsed cleanly: 1,484 hashes in 1 s, then a 304 on the second call.
 
 ---
 
-## 2. File Integrity Monitoring  (effort: L, a weekend)
+## 2. File Integrity Monitoring  (effort: L, a weekend)  — DONE
 
 ### Why
 
@@ -208,6 +208,34 @@ honoured during baseline and check, REMOVED does not fire for excluded
 paths, and a second baseline run replaces rows without duplicating them.
 Mock DPAPI on non-Windows CI with a reversible stub so the HMAC logic runs
 everywhere and the ctypes path is exercised only on the Windows runner.
+
+### Built  (2026-09-22)
+
+`avguard/fim.py`; `--fim-baseline ROOT...`, `--fim-check [--fast]`,
+`--fim-accept PATH...`, `--fim-status`, `--fim-schedule status|on|off` (a
+second `schtasks` task, records only); a Health row; `tests/test_fim.py` (21
+tests: the acceptance list, exclusions, the second-baseline replace, the real
+DPAPI round trip on Windows, a reversible stub everywhere else, and the CLI
+round trip). CLI first, as the text says; a GUI tab is not built yet -- the
+History window already shows the `fim` events.
+
+Two things found while building:
+
+- **A baseline damaged badly enough that SQLite cannot read it** made the
+  first version of `check()` raise instead of report. The signature check
+  runs before the rows are read, so the tamper event is recorded and the
+  check says what it could not do; a scheduled task raising into nothing is
+  the v1 failure shape.
+- **Excluding the data directory cost 1.34 s of a 1.64 s check** over 2,000
+  files, because every path was resolved against the disk twice through
+  `path_within`. The data directory's spellings are computed once and
+  compared as text: the same check is 0.21 s.
+
+Numbers, 2,000 files / 596 MB: baseline 21 s on cold files (28 MB/s -- the
+first touch, the on-access scanner's cost, the same thing the compiled-rule
+cache was built around) and 1.0 s warm (577 MB/s); a full check 0.73 s
+(818 MB/s); `--fast` 0.21 s with nothing hashed. A DPAPI-protected key is
+332 bytes.
 
 ---
 

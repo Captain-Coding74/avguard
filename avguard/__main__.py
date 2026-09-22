@@ -12,7 +12,7 @@ import logging
 import sys
 from pathlib import Path
 
-from . import iocs
+from . import fim, iocs
 from . import config, logsetup, scheduling
 from .cloud import VirusTotalClient
 from .instance import InstanceLock
@@ -240,6 +240,91 @@ def unknown_text() -> str:
     return "unknown"
 
 
+def _fim_command(args) -> int:
+    """Integrity monitoring from a terminal. Reports; never moves a file."""
+    from datetime import datetime
+    from .events import EventStore
+    cfg = config.Config.load()
+    store = fim.FimStore(excluded_globs=cfg.excluded_globs)
+
+    if args.fim_baseline:
+        roots = [Path(r) for r in args.fim_baseline]
+        report = store.baseline(roots)
+        for problem in report.errors:
+            print(f"  skipped: {problem}", file=sys.stderr)
+        if not report.roots:
+            print("Nothing was baselined.", file=sys.stderr)
+            return 1
+        mb = report.bytes / (1024 * 1024)
+        print(f"Baselined {report.files:,} file(s), {mb:,.1f} MB, under "
+              f"{len(report.roots)} root(s) in {report.seconds:.1f}s:")
+        for root in report.roots:
+            print(f"    {root}")
+        print("The baseline is signed. Check it with:  python -m avguard --fim-check")
+        return 0
+
+    if args.fim_check:
+        report = store.check(fast=args.fast, events=EventStore())
+        if report.integrity == fim.INTEGRITY_NO_BASELINE:
+            print("No baseline. Create one with:  python -m avguard --fim-baseline <folder>",
+                  file=sys.stderr)
+            return 2
+        integrity_event = report.integrity_event()
+        if integrity_event is not None:
+            print(f"BASELINE: {integrity_event.reasons[0]}")
+            print()
+        for change in report.changes:
+            print(f"  {change.describe()}")
+        for problem in report.errors:
+            print(f"  error: {problem}", file=sys.stderr)
+        print()
+        mode = "size and mtime trusted (--fast)" if report.fast else "every file hashed"
+        print(f"Examined {report.examined:,} baselined file(s), hashed {report.hashed:,}, "
+              f"{mode}, {report.seconds:.1f}s")
+        if report.changes:
+            print(f"{len(report.modified)} modified, {len(report.added)} added, "
+                  f"{len(report.removed)} removed. Nothing was moved; a check never does.")
+            print("Accept a change you have looked at with:  python -m avguard --fim-accept <path>")
+        else:
+            print("No changes.")
+        if integrity_event is not None:
+            return 3
+        return 1 if report.changes else 0
+
+    if args.fim_accept:
+        if not store.exists():
+            print("No baseline to accept into.", file=sys.stderr)
+            return 2
+        for note in store.accept(Path(p) for p in args.fim_accept):
+            print(f"  {note}")
+        return 0
+
+    if args.fim_schedule:
+        if args.fim_schedule == "status":
+            print("Daily integrity check scheduled: "
+                  f"{'yes' if scheduling.scheduled_fim_check_exists() else 'no'}")
+            return 0
+        if args.fim_schedule == "on":
+            ok, detail = scheduling.enable_scheduled_fim_check()
+            print(f"Daily integrity check: {detail if ok else 'FAILED - ' + detail}")
+            print("It records what changed and moves nothing.")
+            return 0 if ok else 1
+        ok, detail = scheduling.disable_scheduled_fim_check()
+        print("Removed." if ok else f"Not removed: {detail}")
+        return 0 if ok else 1
+
+    # --fim-status
+    if not store.exists():
+        print("No baseline. Create one with:  python -m avguard --fim-baseline <folder>")
+        return 0
+    when = datetime.fromtimestamp(store.baselined_at()).strftime("%Y-%m-%d %H:%M")
+    print(f"Baseline: {store.file_count():,} file(s), last baselined {when}, "
+          f"signature {store.verify_integrity()}")
+    for root in store.roots():
+        print(f"    {root}")
+    return 0
+
+
 def _iocs_command(args) -> int:
     """The blocklist from a terminal: import, fetch, or say what it holds."""
     store = iocs.IocStore()
@@ -424,6 +509,23 @@ def _main(argv: list[str] | None = None) -> int:
     parser.add_argument("--iocs-status", action="store_true",
                         help="how many hashes the blocklist holds, from where, and when "
                              "the feed was last checked")
+    parser.add_argument("--fim-baseline", metavar="ROOT", nargs="+",
+                        help="record the hash of every file under ROOT (repeatable) as the "
+                             "baseline for --fim-check; a root already recorded is replaced")
+    parser.add_argument("--fim-check", action="store_true",
+                        help="report every file that differs from the baseline: modified, "
+                             "added, removed. Records events and never moves a file")
+    parser.add_argument("--fast", action="store_true",
+                        help="with --fim-check: trust an unchanged size and mtime and skip "
+                             "the read. Faster, and blind to a file whose mtime was reset "
+                             "after it was modified -- the default hashes everything")
+    parser.add_argument("--fim-accept", metavar="PATH", nargs="+",
+                        help="re-baseline these paths after you have looked at the change, "
+                             "so the alert stops repeating")
+    parser.add_argument("--fim-status", action="store_true",
+                        help="what the baseline covers and whether its signature holds")
+    parser.add_argument("--fim-schedule", choices=["status", "on", "off"],
+                        help="a daily unattended --fim-check (records only)")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
@@ -477,6 +579,10 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.iocs_import or args.iocs_update or args.iocs_status:
         return _iocs_command(args)
+
+    if (args.fim_baseline or args.fim_check or args.fim_accept or args.fim_status
+            or args.fim_schedule):
+        return _fim_command(args)
 
     if args.reload_rules:
         cfg = config.Config.load()
