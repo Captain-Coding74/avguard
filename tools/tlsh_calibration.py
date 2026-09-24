@@ -64,9 +64,22 @@ def is_binary(path: Path) -> bool:
     return head == b"\x7fELF" or head[:2] == b"MZ"
 
 
+def digestible(path: Path) -> bool:
+    """What the scanner would digest on this backend: not too small, not over the cap."""
+    try:
+        return tlsh.MIN_BYTES <= path.stat().st_size <= tlsh.size_cap()
+    except OSError:
+        return False
+
+
 def corpus(roots: list[Path], limit: int, per_directory: int, binaries: bool) -> list[Path]:
     if os.name == "nt" and not binaries:
-        return _clean_corpus(limit=limit, roots=roots, per_directory=per_directory)
+        # The size filter below applied off Windows only; here the sampler
+        # took every .exe and .dll, cap or no cap, so files the scanner never
+        # digests were in the measurement. Sample twice the limit and keep
+        # what fits.
+        picked = _clean_corpus(limit=limit * 2, roots=roots, per_directory=per_directory)
+        return [path for path in picked if digestible(path)][:limit]
     # Off Windows the .exe/.dll filter of _clean_corpus finds nothing; take
     # whatever real files these roots hold, a few per directory, under the cap.
     rng = random.Random(20240607)
@@ -88,7 +101,7 @@ def corpus(roots: list[Path], limit: int, per_directory: int, binaries: bool) ->
                 except OSError:
                     continue
                 if not (tlsh.MIN_BYTES <= size <= tlsh.size_cap()):
-                    continue
+                    continue          # the same rule digestible() applies on Windows
                 if binaries and not is_binary(path):
                     continue
                 picked.append(path)

@@ -1,0 +1,55 @@
+name: tlsh calibration
+
+# Runs tools/tlsh_calibration.py on a Windows runner: the plan's corpus is
+# Program Files and System32, and the session that measured the thresholds
+# ran on Linux, where the corpus was ELF. The runner is a Windows box with a
+# great deal of software installed. It is not the owner's machine; the same
+# command on that machine is the number that matters most, and this is the
+# next best thing. Started by hand only; it changes nothing in the repo.
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "how many .exe/.dll files to sample"
+        default: "2000"
+      per_directory:
+        description: "at most this many files from one directory"
+        default: "6"
+      extra:
+        description: "further arguments for tools/tlsh_calibration.py"
+        default: ""
+
+jobs:
+  windows:
+    name: calibrate on a Windows runner
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build the TLSH reference, if this runner can
+        # With py-tlsh importable the digest runs at the reference's speed
+        # and the size cap is 16 MB; without it, numpy's 2 MB. Either way the
+        # report says which, and the corpus is what that backend would digest.
+        run: pip install py-tlsh || echo "py-tlsh did not build here; the Python digest runs instead"
+
+      - name: Calibrate
+        env:
+          AVGUARD_DATA: ${{ runner.temp }}/avguard-data
+          PYTHONUTF8: "1"
+        shell: bash
+        run: |
+          python tools/tlsh_calibration.py --limit ${{ inputs.limit }} --per-directory ${{ inputs.per_directory }} --band 30 40 --band 40 60 ${{ inputs.extra }} | tee "$RUNNER_TEMP/tlsh-calibration-windows.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tlsh-calibration-windows
+          path: ${{ runner.temp }}/tlsh-calibration-windows.txt
