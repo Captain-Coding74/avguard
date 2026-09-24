@@ -442,12 +442,15 @@ The digest is computed here, in Python (`py-tlsh` ships no wheel and needs a
 compiler). It matches the reference implementation byte for byte and runs at
 16 MB/s with numpy, 2.4 MB/s without, so a size cap keeps one digest near a
 tenth of a second: files above 2 MB (256 KB without numpy) are scanned
-without one, and `--iocs-status` says which. The thresholds were measured on
-this machine's own software with `tools/tlsh_calibration.py`; the table is
-in ROADMAP.md, and the short version is that every 1,000 references mark
-about 1% of clean executables SUSPICIOUS on resemblance alone, so keep the
-set to the families that matter to you. A change to the references is part
-of the detection generation, like a hash import.
+without one, and `--iocs-status` says which. The thresholds were measured
+with `tools/tlsh_calibration.py` on this project's Linux box and on a
+Windows CI runner full of software (`.github/workflows/calibration.yml`
+runs it there by hand); the tables are in ROADMAP.md, and the short version
+is that every 100 references mark 0.1% of clean executables SUSPICIOUS on
+resemblance alone on the Linux corpus and 0.6% on the Windows one, so keep
+the set to the families that matter to you; the store warns past 250. A
+change to the references is part of the detection generation, like a hash
+import.
 
 ## File integrity
 

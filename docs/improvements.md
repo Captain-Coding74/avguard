@@ -445,10 +445,14 @@ Five deviations from the text above, each for a measured reason:
 - **The warning is about false positives, not cost.** With the match
   vectorised, 10,000 references cost 2.5 ms per file; what grows with the
   set is the chance that some reference sits near an unrelated file, about
-  1% of clean executables per 1,000 references. The store warns at 1,000.
+  1% of clean executables per 1,000 references on the Linux corpus and 5.7%
+  on the Windows one. The store warned at 1,000; it warns at 250 now.
 - **The corpus was ELF.** This session ran on Linux, so the calibration
   used the software here. The tool takes the plan's Windows roots by default
-  on Windows, and re-running it there is one command.
+  on Windows, and it was run there two days later on the CI runner through
+  `.github/workflows/calibration.yml`: ROADMAP.md, "The same calibration
+  on Windows". Both bands held; the far band's "as clean as the near band"
+  did not.
 
 ### First attempt  (2026-09-22): not built, and why
 

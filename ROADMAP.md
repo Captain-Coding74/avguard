@@ -396,7 +396,8 @@ native backend batches its input.
 scores every pair of files from different directories, and patches each
 file three ways to see what a variant scores. This machine is Linux, so the
 corpus is ELF; on Windows the same command takes the plan's Program Files
-and System32 roots, and re-running it there is one command.
+and System32 roots, and re-running it there is one command. It was run
+there two days later: the next paragraph.
 
 | distance | unrelated executable pairs (of 976,529) | unrelated pairs, all kinds (of 1,963,623) | clean executables tagged per 100 references |
 |---|---|---|---|
@@ -418,8 +419,72 @@ the far band ends at 40, where it is as clean as the near band; at the
 plan's 60 a hundred references would tag one clean executable in thirty
 with a finding that, together with the entropy of a packed file, reaches
 SUSPICIOUS. The rate grows with the set -- every 1,000 references, about 1%
-of clean executables on resemblance alone -- so the store warns at 1,000
-and the README says to keep the set to the families that matter.
+of clean executables on resemblance alone -- so the store warns (at 250
+now, a number the Windows run set) and the README says to keep the set to
+the families that matter.
+
+**The same calibration on Windows, 2026-09-24.** This session has no
+Windows machine, so `.github/workflows/calibration.yml` runs the tool by
+hand on the CI runner: a Windows box with Visual Studio Enterprise and its
+language packs, four Android NDKs, the Azure and AWS command lines and the
+rest, which is not the owner's desktop but is the plan's corpus (Program
+Files, Program Files (x86), System32). The reference library built there
+in 13 s, so the digest ran native: 1,984 distinct .exe and .dll files,
+1,176 MB, in 9 s. Three runs, each about three minutes of runner time.
+
+The first table read thirty times worse than Linux at 30, and the reason
+took two more runs to pin down. It was not the small files: counting only
+pairs where both files are at least 64 KB made the rate higher, not lower.
+It was the same file in several places. The runner holds the Android NDK
+four times over and four releases of SQL Server Integration Services, and
+every pair under 10 was `glslc.exe` beside `glslc.exe`, `python311.dll`
+beside `python311.dll` in the next version's directory, a version string
+apart: the digest doing what it is for. 1,606 of the 1,576,943 unrelated
+pairs share a file name, and they are 421 of the 513 pairs under 30. So the
+table has a column for every pair, one for pairs whose file names differ,
+and what the second means for a reference set.
+
+| distance | unrelated pairs (of 1,576,943) | with different names (of 1,575,337) | clean executables tagged per 100 references, different names |
+|---|---|---|---|
+| ≤ 10 | 174 | 4 | 0.03% |
+| ≤ 20 | 349 | 31 | 0.20% |
+| ≤ 30 | 513 | 92 | 0.58% |
+| ≤ 40 | 1,055 | 466 | 2.92% |
+| ≤ 50 | 3,773 | 2,965 | 17.2% |
+| ≤ 60 | 9,276 | 8,301 | 41.0% |
+| ≤ 80 | 22,711 | 21,572 | 74.8% |
+
+Even the different-name pairs under 20 are one code base under two names:
+`cpack.exe` and `ctest.exe` (CMake's tools, the same static library in
+each), `llvm-lipo.exe` and `llvm-nm.exe`, `yasm.exe` and `vsyasm.exe`,
+the pip launcher stub as `pywin32_postinstall.exe` and as `normalizer.exe`,
+Git's `git-lfs.exe` and `bash.exe` in `Git\cmd` (both the 43 KB launcher),
+`pywintypes313.dll` and `pywintypes314.dll`. The 30 to 40 band is another
+thing entirely: 561 pairs, and every one sampled is a 15 KB .NET satellite
+resource assembly beside another, PE and CLR boilerplate with a few
+strings in it, alike because there is nothing else in them. A patched copy
+scores as it did on Linux: one byte changed, 8 at most; a byte per 4 KB,
+10 at most; 1% overwritten, a median of 7, a 90th percentile of 19 and a
+99th of 57.
+
+What that decides. The near band stays at 30: 0.58% of clean executables
+per hundred references on this corpus, six times the Linux rate, and the
+pairs under it are shared code, which a malware reference is not; 20 would
+halve that and lose one heavy variant in ten. The far band stays at 40,
+with its Linux description withdrawn: it is not "as clean as the near
+band" here, it is five times noisier, and what it picks up is tiny
+resource-only assemblies, which never carry the entropy finding it was
+meant to reinforce, so on a machine like this a hundred references put a
+25-point "loose resemblance" on 3% of clean executables and move none of
+them past CLEAN. It buys four of three hundred heavy variants. Ending it
+at 30 would be cheaper and would be a detection change; it is recorded
+here as the first thing to try if the far band ever proves noisy in use.
+One number did move: the store's warning, which said 1,000 references
+mark about 1% of clean executables, now comes at 250, because on this
+corpus 1,000 mark 5.7% and 250 mark 1.5% (0.25% on Linux). Neither
+threshold changed, so `DETECTION_VERSION` did not. The tool gained the
+size and file-name splits on the way, and a fix: on Windows it had sampled
+every .exe and .dll regardless of the digest's size cap.
 
 **What the digest costs, and what it does not.** `_read_facts` on a 2 MB
 file: 139 ms without the digest, 259 ms with it; on 64 MB, 4.2 s against

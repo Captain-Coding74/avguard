@@ -70,14 +70,15 @@ USER_AGENT = "AVGuard (https://github.com/Captain-Coding74/avguard)"
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 # Past this many TLSH references the similarity match starts crying wolf.
-# Measured with tools/tlsh_calibration.py: every 1,000 references mark about
-# 1% of clean executables (5% of files of every kind) SUSPICIOUS on
-# resemblance alone, because the chance that SOME reference sits within
-# distance 30 of an unrelated file grows with the set. The set is meant to
-# be seeded by hand with families that matter here, not with a feed. Logged
-# once, at load. (Cost is not the limit: 10,000 references measured 2.5 ms
-# per digested file with numpy, 53 ms without.)
-TLSH_WARN_REFERENCES = 1_000
+# Measured with tools/tlsh_calibration.py: the chance that SOME reference
+# sits within distance 30 of an unrelated file grows with the set, and 250
+# references mark about 0.25% of clean executables SUSPICIOUS on resemblance
+# alone on the Linux corpus and 1.5% on a Windows CI runner full of
+# software (1,000 mark 1% and 5.7%; ROADMAP.md has both tables). The set is
+# meant to be seeded by hand with families that matter here, not with a
+# feed. Logged once, at load. (Cost is not the limit: 10,000 references
+# measured 2.5 ms per digested file with numpy, 53 ms without.)
+TLSH_WARN_REFERENCES = 250
 
 
 class IocError(RuntimeError):
@@ -300,10 +301,10 @@ class IocStore:
         references = tlsh_module.ReferenceSet(
             tlsh_module.Reference(str(d), str(f), str(s)) for d, f, s in rows)
         if len(references) > TLSH_WARN_REFERENCES:
-            log.warning("%s TLSH references loaded; measured on this program's benign "
-                        "corpus, every 1,000 references mark about 1%% of clean "
-                        "executables SUSPICIOUS on resemblance alone. Keep the set to "
-                        "the families that matter here.", f"{len(references):,}")
+            log.warning("%s TLSH references loaded; measured on benign software, every "
+                        "250 references mark about 0.25%% of clean executables SUSPICIOUS "
+                        "on resemblance alone on Linux and 1.5%% on Windows. Keep the set "
+                        "to the families that matter here.", f"{len(references):,}")
         return references
 
     def import_tlsh(self, references: Iterable[tuple[str, str]], source: str) -> ImportResult:

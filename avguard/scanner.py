@@ -161,6 +161,13 @@ WEIGHT_UNLABELLED = 25
 # nothing but ELF boilerplate. A copy with one byte changed scores 5 at
 # most; one with a byte per 4 KB changed, 18 at most; one with 1% of its
 # bytes overwritten, a median of 10. So 40, not 60, for the far band.
+#
+# The same tool on a Windows CI runner two days later (ROADMAP.md, "The
+# same calibration on Windows"): among pairs of files with different names,
+# 0.58% of clean executables per hundred references at 30 and 2.9% at 40,
+# the latter 15 KB resource-only .NET assemblies that never carry the
+# entropy finding the far band exists to reinforce. Both bands kept; ending
+# the far band at 30 is the first thing to try if it proves noisy in use.
 TLSH_NEAR = 30
 TLSH_FAR = 40
 WEIGHT_TLSH_NEAR = 50      # SUSPICIOUS on its own
