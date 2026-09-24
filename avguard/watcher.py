@@ -10,6 +10,17 @@ that loop.
 Here the observer thread only records a path. A debouncer collapses the burst
 of events a single file save produces, and a small pool of worker threads does
 the actual scanning.
+
+No thread here waits with a timeout for another thread to wake it. CI run #34
+died on Windows with `Fatal Python error: _PySemaphore_Wakeup: parking_lot:
+ReleaseSemaphore failed (error: 6)` as `stop()` put a sentinel on the queue
+while two workers sat in `queue.get(timeout=0.5)`: CPython 3.13's parking
+lot on Windows racing a timed wait's expiry against the wake-up, in the
+interpreter, not in this code. The debouncer's `Event.wait(0.25)` had the
+same shape. So the workers block on the queue with no timeout and leave on a
+sentinel that always has room; the debouncer waits untimed while it has
+nothing pending and sleeps in short naps -- which nothing wakes -- while it
+does. Neither path can be caught with a timed wait expiring under it.
 """
 
 from __future__ import annotations
@@ -37,41 +48,62 @@ class Debouncer:
     rename. Without this the scanner runs three or four times per save.
     """
 
+    # The longest nap while something is pending: bounds how late a
+    # dispatch can be and how long stop() can take, without any timed wait.
+    TICK = 0.1
+
     def __init__(self, delay: float, sink: Callable[[Path], None]) -> None:
         self.delay = delay
         self._sink = sink
         self._pending: dict[Path, float] = {}
-        self._lock = threading.Lock()
-        self._stop = threading.Event()
+        self._changed = threading.Condition()
+        self._stopping = False
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
-        self._stop.clear()
+        with self._changed:
+            self._stopping = False
         self._thread = threading.Thread(target=self._run, name="avguard-debounce", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
-        self._stop.set()
+        with self._changed:
+            self._stopping = True
+            self._changed.notify_all()
         if self._thread is not None:
             self._thread.join(timeout=3)
             self._thread = None
 
     def touch(self, path: Path) -> None:
-        with self._lock:
+        with self._changed:
             self._pending[path] = time.monotonic() + self.delay
+            self._changed.notify()
 
     def _run(self) -> None:
-        while not self._stop.wait(0.25):
-            now = time.monotonic()
-            with self._lock:
+        while True:
+            with self._changed:
+                # Idle: an untimed wait, woken by touch() or stop(). Nothing
+                # can come due while nothing is pending, so there is nothing
+                # to poll for.
+                while not self._pending and not self._stopping:
+                    self._changed.wait()
+                if self._stopping:
+                    return
+                now = time.monotonic()
                 due = [p for p, deadline in self._pending.items() if deadline <= now]
                 for path in due:
                     del self._pending[path]
+                # A touch only ever pushes a deadline later, so the earliest
+                # one cannot move closer while this thread sleeps.
+                nap = (min(min(self._pending.values()) - now, self.TICK)
+                       if self._pending else 0.0)
             for path in due:
                 try:
                     self._sink(path)
                 except Exception:
                     log.exception("debounced dispatch failed for %s", path)
+            if nap > 0:
+                time.sleep(nap)
 
 
 class ScanWorkerPool:
@@ -88,11 +120,20 @@ class ScanWorkerPool:
         self.on_verdict = on_verdict
         self.workers = max(1, workers)
         self._max_queued = max_queued
-        self._queue: queue.Queue[Path | None] = queue.Queue(maxsize=max_queued)
+        self._queue: queue.Queue[Path | None] = self._new_queue()
         self._threads: list[threading.Thread] = []
         self._running = threading.Event()
         self._lifecycle = threading.Lock()
         self._dropped = 0
+
+    def _new_queue(self) -> "queue.Queue[Path | None]":
+        """Room for the backlog plus one sentinel per worker.
+
+        submit() stops at max_queued, so stop() can always hand every worker
+        its sentinel without waiting; a worker parked on an empty queue with
+        no sentinel coming would otherwise block for good.
+        """
+        return queue.Queue(maxsize=self._max_queued + self.workers)
 
     def start(self) -> None:
         """Start the workers. Safe to call again after `stop()`.
@@ -107,7 +148,7 @@ class ScanWorkerPool:
         with self._lifecycle:
             if self._threads:
                 return
-            self._queue = queue.Queue(maxsize=self._max_queued)
+            self._queue = self._new_queue()
             self._running.set()
             for index in range(self.workers):
                 thread = threading.Thread(
@@ -117,12 +158,17 @@ class ScanWorkerPool:
                 self._threads.append(thread)
 
     def stop(self, timeout: float = 5.0) -> None:
+        """Stop after the scan in hand, abandoning the rest of the backlog."""
         with self._lifecycle:
             self._running.clear()
             for _ in self._threads:
                 try:
                     self._queue.put_nowait(None)
                 except queue.Full:
+                    # Only reachable if two submitters overshot max_queued at
+                    # once. A full queue is a non-empty one, so no worker is
+                    # parked: each comes back from get() with a path, sees
+                    # running cleared, and leaves without scanning it.
                     pass
             deadline = time.monotonic() + timeout
             for thread in self._threads:
@@ -154,6 +200,8 @@ class ScanWorkerPool:
         Anything dropped is still caught by the next full scan.
         """
         try:
+            if self._queue.qsize() >= self._max_queued:
+                raise queue.Full
             self._queue.put_nowait(path)
             return True
         except queue.Full:
@@ -167,15 +215,13 @@ class ScanWorkerPool:
         return self._queue.qsize()
 
     def _run(self) -> None:
-        while self._running.is_set():
+        while True:
+            # No timeout: the sentinel from stop() is what ends the wait, and
+            # a queue.get(timeout=0.5) here is what CI run #34 died in.
+            path = self._queue.get()
             try:
-                path = self._queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            if path is None:
-                self._queue.task_done()
-                break
-            try:
+                if path is None or not self._running.is_set():
+                    return
                 verdict = self.scanner.scan(path)
                 self.on_verdict(verdict)
             except Exception:

@@ -454,6 +454,32 @@ is the checksum chain, not the histogram), so its size caps stand; a
 digested 2 MB file now costs 14 ms of facts plus 120 ms of digest rather
 than 120 plus 120. Tests 481 → **482**.
 
+**The watcher waits without a timeout.** Run #34's Windows failure
+([docs/next-5.md](docs/next-5.md)) was CPython's parking lot dying --
+`_PySemaphore_Wakeup: ReleaseSemaphore failed (error: 6)` -- as `stop()`
+woke a scan worker sitting in `queue.get(timeout=0.5)`; the debouncer's
+`Event.wait(0.25)` had the same shape, a timed wait that another thread
+wakes. Both are gone. Workers block on the queue with no timeout and leave
+on a sentinel that always has room: the queue holds the backlog plus one
+slot per worker and `submit()` stops at the backlog. The debouncer waits
+untimed while nothing is pending and, while something is, naps for at
+most 0.1 s in a `time.sleep` that nothing wakes; a touch only ever pushes
+a deadline later, so the earliest one cannot move under it. The crash
+does not reproduce on Linux, so the claim rests on the mechanism, not a
+repro: the timed waits that expired twice a second per worker and four
+times a second in the debouncer, all suite long, no longer exist. The
+joins inside `stop()` keep their timeouts; they expire only when a thread
+is already stuck, which is the case they exist for.
+
+Measured, before and after: `stop()` with four idle workers 0.48 and
+0.64 ms; with two workers mid-scan and eighteen queued, 150 ms both ways
+and two of twenty scanned both ways -- the backlog was always abandoned,
+and a test now says so; a 0.3 s debounce fires at 303 ms instead of 502,
+the old 0.25 s tick having rounded it up; an idle pool and debouncer cost
+0.1 ms of CPU per five seconds instead of 5.4. A test holds every `get()`
+the workers make to a blocking one, and another gives three workers a
+one-slot queue and checks all three leave. Tests 482 → **486**.
+
 ## Deliberately not doing
 
 - **Real-time process, memory or kernel monitoring.** Needs a driver and admin

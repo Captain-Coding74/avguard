@@ -141,4 +141,6 @@ stop the workers without a timed wait -- `queue.get()` blocking on a
 sentinel, or `Queue.shutdown()` on 3.13 -- and that is a change to the
 watcher's stop protocol to be made and measured on its own, not folded
 into an unrelated commit. Until then a run that dies this way is re-run
-once, and the second run is the answer.
+once, and the second run is the answer. (The re-run of #34 passed, and
+the change followed in the next commit: see "The watcher waits without a
+timeout" in ROADMAP.md. The debouncer's `Event.wait(0.25)` went with it.)

@@ -766,6 +766,105 @@ class TestRealtimeMonitor(TempCase):
         self.assertTrue(pool.submit(Path("b")))
         self.assertFalse(pool.submit(Path("c")), "a full queue must refuse, not block")
 
+    def test_workers_never_wait_on_the_queue_with_a_timeout(self):
+        """CI run #34: CPython on Windows died in its parking lot as stop()
+        woke a worker sitting in queue.get(timeout=0.5). The wait is untimed
+        now, and this holds it there: every get() the workers make while
+        scanning and while being stopped is a blocking one."""
+        import queue as queue_module
+        pool = ScanWorkerPool(self.scanner, lambda v: None, workers=2)
+        with mock.patch.object(queue_module.Queue, "get", autospec=True,
+                               side_effect=queue_module.Queue.get) as get:
+            pool.start()
+            pool.submit(self.write("a.txt", b"plain"))
+            self.assertTrue(self.wait_for(lambda: pool.pending == 0))
+            started = time.monotonic()
+            pool.stop()
+            stopped_in = time.monotonic() - started
+        self.assertGreaterEqual(len(get.call_args_list), 3)
+        for call in get.call_args_list:
+            self.assertEqual(len(call.args), 1, f"positional timeout in {call}")
+            self.assertNotIn("timeout", call.kwargs, f"timed wait in {call}")
+        self.assertFalse(pool.running)
+        self.assertLess(stopped_in, 1.0, "idle workers must leave on the sentinel at once")
+
+    def test_stop_ends_after_the_scan_in_hand_and_abandons_the_backlog(self):
+        gate = threading.Event()
+        self.addCleanup(gate.set)   # never leave the worker parked if an assertion fails first
+        scanned: list[Path] = []
+
+        class Slow:
+            def scan(self, path):
+                scanned.append(path)
+                gate.wait()
+                return mock.Mock(path=path)
+
+        pool = ScanWorkerPool(Slow(), lambda v: None, workers=1, max_queued=2)
+        self.addCleanup(pool.stop)   # runs after gate.set(), so it cannot hang on the worker
+        pool.start()
+        self.assertTrue(pool.submit(Path("a")))
+        self.assertTrue(self.wait_for(lambda: len(scanned) == 1), "the worker never took the first path")
+        self.assertTrue(pool.submit(Path("b")))
+        self.assertTrue(pool.submit(Path("c")))
+        self.assertFalse(pool.submit(Path("d")), "backlog of two plus one in hand is the cap")
+
+        stopper = threading.Thread(target=pool.stop)
+        stopper.start()
+        time.sleep(0.2)
+        self.assertTrue(stopper.is_alive(), "stop() must wait for the scan in hand")
+        gate.set()
+        stopper.join()   # stop() bounds its own joins, so this cannot hang
+        self.assertFalse(stopper.is_alive())
+        self.assertFalse(pool.running)
+        self.assertEqual(scanned, [Path("a")], "the backlog is abandoned, not scanned")
+
+        # And a restart scans again, on a fresh queue.
+        pool.start()
+        pool.submit(Path("e"))
+        self.assertTrue(self.wait_for(lambda: Path("e") in scanned))
+        pool.stop()
+
+    def test_every_worker_gets_its_sentinel_even_with_a_tiny_queue(self):
+        """More workers than queue slots: the sentinels have their own room,
+        so no worker is left parked forever on an empty queue."""
+        pool = ScanWorkerPool(self.scanner, lambda v: None, workers=3, max_queued=1)
+        pool.start()
+        self.assertEqual(pool.alive_workers, 3)
+        pool.stop(timeout=3)
+        self.assertEqual(pool.alive_workers, 0)
+        self.assertTrue(pool.submit(Path("x")))
+        self.assertFalse(pool.submit(Path("y")), "max_queued still bounds what submit() accepts")
+
+    def test_the_debouncer_idles_without_polling_and_fires_on_the_deadline(self):
+        from avguard.watcher import Debouncer
+        got: list[Path] = []
+        naps: list[float] = []
+        real_sleep = time.sleep
+
+        def counting_sleep(seconds):
+            if threading.current_thread().name == "avguard-debounce":
+                naps.append(seconds)
+            real_sleep(seconds)
+
+        debouncer = Debouncer(0.3, got.append)
+        with mock.patch("avguard.watcher.time.sleep", counting_sleep):
+            debouncer.start()
+            time.sleep(0.5)
+            self.assertEqual(naps, [], "an idle debouncer must not wake up at all")
+            started = time.monotonic()
+            debouncer.touch(Path("saved.txt"))
+            self.assertTrue(self.wait_for(lambda: got == [Path("saved.txt")], timeout=3))
+            elapsed = time.monotonic() - started
+            self.assertGreaterEqual(elapsed, 0.3)
+            self.assertLess(elapsed, 0.3 + 2 * Debouncer.TICK + 0.1,
+                            "dispatch must follow the deadline, not the next tick")
+            self.assertTrue(naps, "while something is pending it naps")
+            self.assertLessEqual(max(naps), Debouncer.TICK)
+            stopped_at = time.monotonic()
+            debouncer.stop()
+        self.assertLess(time.monotonic() - stopped_at, 0.5)
+        self.assertIsNone(debouncer._thread)
+
 
 # ------------------------------------------------------- concurrency safety
 
