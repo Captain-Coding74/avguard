@@ -193,10 +193,19 @@ def main(argv: list[str] | None = None) -> int:
     unrelated_hits = {t: 0 for t in THRESHOLDS}
     related_hits = {t: 0 for t in THRESHOLDS}
     large_hits = {t: 0 for t in THRESHOLDS}      # unrelated, both files >= the split
+    other_hits = {t: 0 for t in THRESHOLDS}      # unrelated, and the file names differ
     unrelated_pairs = 0
     related_pairs = 0
     large_pairs = 0
+    other_pairs = 0
     big = [size >= args.size_split * 1024 for size in sizes]
+    # The second Windows run's pairs under 30 were, by the sample, the same
+    # program in another version's directory: four Android NDKs, four SSIS
+    # releases, one satellite assembly per language. Same name, other
+    # place, is another copy of the same code, which the digest is right
+    # to score close; a pair with two different names is the collision
+    # the thresholds are for.
+    names = [p.name.lower() for p, _ in digests]
     closest_unrelated: list[tuple[int, str, str]] = []
     keys = [package_key(p) for p, _ in digests]
     for i, mine in enumerate(parsed):
@@ -217,6 +226,11 @@ def main(argv: list[str] | None = None) -> int:
                     for t in THRESHOLDS:
                         if d <= t:
                             large_hits[t] += 1
+                if names[i] != names[j]:
+                    other_pairs += 1
+                    for t in THRESHOLDS:
+                        if d <= t:
+                            other_hits[t] += 1
             for t in THRESHOLDS:
                 if d <= t:
                     bucket[t] += 1
@@ -263,6 +277,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  <= {t:<4} {large_hits[t]:>12,} of {large_pairs:<12,} "
               f"{p:12.2e}   {trip[0]:6.2%} / {trip[1]:6.2%} / {trip[2]:6.2%}")
     print()
+    print(f"the same, counting only pairs whose file names differ "
+          f"({other_pairs:,} of {unrelated_pairs:,} unrelated pairs; the rest are another "
+          "copy or version of the same file):")
+    for t in THRESHOLDS:
+        p = other_hits[t] / other_pairs if other_pairs else 0.0
+        trip = [1 - (1 - p) ** k for k in (100, 1000, 10000)]
+        print(f"  <= {t:<4} {other_hits[t]:>12,} of {other_pairs:<12,} "
+              f"{p:12.2e}   {trip[0]:6.2%} / {trip[1]:6.2%} / {trip[2]:6.2%}")
+    print()
     print("same-package pairs (files of one directory) within each distance:")
     print("  " + "  ".join(f"<={t}: {related_hits[t]:,}" for t in THRESHOLDS) + f"  of {related_pairs:,}")
     print()
@@ -279,9 +302,20 @@ def main(argv: list[str] | None = None) -> int:
               + "  ".join(f"over {t}: {sum(s > t for s in scores)}" for t in (30, 40, 60)))
     print()
     closest_unrelated.sort()
-    print("closest unrelated pairs (distance, sizes, paths):")
+    print("closest unrelated pairs (distance, sizes, paths; * = same file name):")
     for d, a, b in closest_unrelated[:20]:
+        same = "*" if os.path.basename(a).lower() == os.path.basename(b).lower() else " "
+        print(f"  {d:>4}{same} {os.path.getsize(a):>9,} B  {a}\n        {os.path.getsize(b):>9,} B  {b}")
+    print()
+    print("closest unrelated pairs with DIFFERENT file names:")
+    shown = 0
+    for d, a, b in closest_unrelated:
+        if os.path.basename(a).lower() == os.path.basename(b).lower():
+            continue
         print(f"  {d:>4}  {os.path.getsize(a):>9,} B  {a}\n        {os.path.getsize(b):>9,} B  {b}")
+        shown += 1
+        if shown >= 20:
+            break
     for low, high in args.band or ():
         band = [p for p in closest_unrelated if low <= p[0] <= high]
         rng.shuffle(band)
