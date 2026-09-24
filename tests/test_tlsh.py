@@ -368,7 +368,8 @@ class TestImportingReferences(TlshCase):
         self.assertEqual(len(refs), 3)
         self.assertEqual(len(captured.records), 1)
         self.assertIn("3 TLSH references", captured.output[0])
-        self.assertIn("1% of clean executables", captured.output[0])
+        self.assertIn("of clean executables SUSPICIOUS on resemblance alone", captured.output[0])
+        self.assertIn("250 references", captured.output[0])
 
 
 # ---------------------------------------------------------------- verdicts
