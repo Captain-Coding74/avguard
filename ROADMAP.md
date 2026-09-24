@@ -603,6 +603,27 @@ three changes, check, accept; Health and History opened beside it) and the
 suite's window tests run on the Windows CI runner, which has a display. Not
 yet on the owner's desktop.
 
+**Marking a known sample from the window, 2026-09-24.** The reference
+table is empty until somebody fills it, by design, and filling it meant
+`--tlsh` on a sample and `--iocs-import` of the line it printed. The
+Quarantine tab has a fourth button now, *Mark as a known sample*: it reads
+the quarantined file's bytes back in memory (`QuarantineStore.payload`,
+which `export` now shares; nothing is written), suggests a family name from
+what caught the file (the byte signature's name, else the first rule's,
+else the file's stem), and hands the bytes to `IocStore.add_reference`,
+which refuses what the scanner could never match (above the backend's
+size cap, or too small for a digest) with the reason, and otherwise adds
+one row under the source `quarantine`. `Scanner.adopt_iocs` then reloads
+the references and re-keys the cache in this process instead of at the
+next two-second check, an event of kind `reference` goes to the History,
+and the banner says what will happen. Nothing is moved on resemblance,
+as before. Driven on a real window under Xvfb: a 64 KB sample quarantined
+for the selftest marker, a copy of it with the marker broken and one more
+byte changed scanning CLEAN; the button pressed with the dialog answered,
+9 ms from click to the scanner holding the row (digest, import, adopt,
+re-key); the copy scanning SUSPICIOUS, "resembles a Selftest-Family
+sample: TLSH distance 2". Tests 506 → **512**.
+
 **The manual test plan, 2026-09-24.** Ten tests, written by the project's
 owner, of what a user would do to a scanner. Tests 1 to 3 were run on
 their Windows machine with the GUI and recorded as passed in their plan;

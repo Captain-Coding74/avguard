@@ -536,3 +536,113 @@ class TestTheCommandLine(TlshCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ------------------------------------------------------ marking a known sample
+
+class TestMarkingAKnownSample(TlshCase):
+    """The Quarantine tab's button, minus the widgets: the store call behind
+    it, the family it suggests, and the running scanner taking the row up."""
+
+    def test_a_reference_from_bytes_is_added_once(self):
+        data = chain(20000, b"family-q")
+        first = self.store.add_reference(data, "Fam", source="quarantine")
+        self.assertTrue(first.ok and first.added and not first.known, first)
+        self.assertEqual(first.digest, tlsh.hash_bytes(data))
+        again = self.store.add_reference(data, "Other", source="quarantine")
+        self.assertTrue(again.ok and again.known and not again.added, again)
+        self.assertEqual(self.store.tlsh_count(), 1)
+        match = self.store.tlsh_references().nearest(first.digest)
+        self.assertEqual((match.distance, match.reference.family, match.reference.source),
+                         (0, "Fam", "quarantine"))
+
+    def test_too_small_and_too_large_are_refused_with_a_reason(self):
+        tiny = self.store.add_reference(b"x" * 10, "Fam")
+        self.assertFalse(tiny.ok)
+        self.assertIn("too small", tiny.reason)
+        with mock.patch.object(tlsh, "size_cap", return_value=1024):
+            big = self.store.add_reference(chain(2048, b"big"), "Fam")
+        self.assertFalse(big.ok)
+        self.assertIn("above the 1 KB", big.reason)
+        self.assertEqual(self.store.tlsh_count(), 0, "a refusal stores nothing")
+
+    def test_the_family_is_suggested_from_the_reasons(self):
+        suggest = iocs.family_from_reasons
+        self.assertEqual(suggest(["matched the byte signature for EICAR-Test-File inside "
+                                  "a.zip!inner.zip!eicar.com"]), "EICAR-Test-File")
+        self.assertEqual(suggest(["encoded command (rule Suspicious_Script_Obfuscation, medium)"]),
+                         "Suspicious_Script_Obfuscation")
+        self.assertEqual(suggest(["SHA-256 is on the malwarebazaar blocklist"], fallback="invoice"),
+                         "invoice")
+        self.assertEqual(suggest([], fallback="  "), "quarantined")
+
+    def test_the_running_scanner_adopts_the_reference_at_once(self):
+        base = chain(20000, b"family")
+        variant = self.sample("variant.bin", flipped(base, 1))
+        scanner = self.scanner()
+        self.assertIs(scanner.scan(variant).level, Level.CLEAN)      # cached, no digest
+        self.assertTrue(self.store.add_reference(base, "Family", source="quarantine").added)
+        scanner.adopt_iocs()
+        verdict = scanner.scan(variant)
+        self.assertIs(verdict.level, Level.SUSPICIOUS,
+                      "adopted at once, not at the next two-second check")
+        self.assertIn("Family", "; ".join(verdict.reasons))
+
+
+class TestTheQuarantineTabButton(TlshCase):
+    """AVGuardApp._mark_known_sample with everything it touches handed in:
+    the dialog answered by a mock, the reference store real."""
+
+    def test_the_handler_adds_records_adopts_and_refuses(self):
+        try:
+            from avguard import gui
+        except ImportError:
+            self.skipTest("GUI dependencies are not installed")
+        from types import SimpleNamespace
+        from avguard.events import EventStore
+        data = chain(20000, b"button")
+        record = SimpleNamespace(entry_id="e1", original_name="dropper.exe",
+                                 original_path=str(self.tmp / "dropper.exe"),
+                                 reasons=["matched the byte signature for Fam-Test-File"])
+        adopted: list[int] = []
+        banners: list[tuple[str, str]] = []
+        events = EventStore(path=self.tmp / "events.jsonl")
+        fake = SimpleNamespace(
+            _selected_id=lambda: "e1",
+            quarantine=SimpleNamespace(get=lambda entry_id: record, payload=lambda entry_id: data),
+            scanner=SimpleNamespace(iocs=self.store, adopt_iocs=lambda: adopted.append(1),
+                                    cache="the re-keyed cache"),
+            events=events, cache=None,
+            _banner=lambda text, style="": banners.append((text, style)),
+            _refresh_quarantine=lambda: None)
+
+        with mock.patch.object(gui.Querybox, "get_string", return_value="   ") as ask:
+            gui.AVGuardApp._mark_known_sample(fake)
+        self.assertEqual(ask.call_args.kwargs["initialvalue"], "Fam-Test-File")
+        self.assertEqual(self.store.tlsh_count(), 1)
+        self.assertEqual(adopted, [1])
+        self.assertEqual(fake.cache, "the re-keyed cache")
+        self.assertIn("known sample of Fam-Test-File", banners[-1][0], "a blank answer takes the suggestion")
+        recorded = events.read(kinds={"reference"})
+        self.assertEqual(len(recorded), 1)
+        self.assertEqual(recorded[0].detail["family"], "Fam-Test-File")
+        self.assertEqual(recorded[0].path, record.original_path)
+
+        with mock.patch.object(gui.Querybox, "get_string", return_value="Fam-Test-File"):
+            gui.AVGuardApp._mark_known_sample(fake)
+        self.assertEqual(self.store.tlsh_count(), 1, "the same bytes again add nothing")
+        self.assertIn("already a known sample", banners[-1][0])
+        self.assertEqual(len(events.read(kinds={"reference"})), 1)
+        self.assertEqual(adopted, [1], "nothing to adopt the second time")
+
+        with mock.patch.object(gui.Querybox, "get_string", return_value=None):
+            gui.AVGuardApp._mark_known_sample(fake)          # cancelled
+        self.assertEqual(len(banners), 2)
+
+        fake.quarantine.payload = lambda entry_id: b"tiny"
+        with mock.patch.object(gui.Querybox, "get_string", return_value="X"), \
+                mock.patch.object(gui.Messagebox, "show_warning") as warn:
+            gui.AVGuardApp._mark_known_sample(fake)
+        warn.assert_called_once()
+        self.assertIn("too small", warn.call_args.args[0])
+        self.assertEqual(self.store.tlsh_count(), 1)

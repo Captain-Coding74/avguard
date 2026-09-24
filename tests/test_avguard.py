@@ -564,6 +564,18 @@ class TestQuarantine(TempCase):
         self.assertEqual(out.read_bytes(), original)
         self.assertEqual(len(self.store), 1)
 
+    def test_payload_returns_the_original_bytes_and_writes_nothing(self):
+        """The Quarantine tab's "known sample" digests a file this way."""
+        original = b"sample bytes for a digest" * 20
+        target = self.write("threat.bin", original)
+        record = self.store.quarantine(target, [])
+        before = sorted(p.name for p in self.qdir.iterdir())
+        self.assertEqual(self.store.payload(record.entry_id), original)
+        self.assertEqual(sorted(p.name for p in self.qdir.iterdir()), before, "nothing written")
+        self.assertEqual(len(self.store), 1)
+        with self.assertRaises(QuarantineError):
+            self.store.payload("no-such-entry")
+
     def test_mask_is_reversible_and_changes_the_bytes(self):
         data = b"A" * 100
         nonce = b"0123456789abcdef"

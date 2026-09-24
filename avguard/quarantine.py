@@ -463,18 +463,27 @@ class QuarantineStore:
     def total_bytes(self) -> int:
         return sum(record.size for record in self.records())
 
-    def export(self, entry_id: str, destination: Path | str) -> Path:
-        """Write the original bytes out for analysis, without touching the record.
+    def payload(self, entry_id: str) -> bytes:
+        """The original bytes, unmasked, in memory: for a digest, not for disk.
 
-        Kept separate from restore so pulling a sample out for inspection is a
-        deliberate, differently named action.
+        The Quarantine tab's "known sample" reads a file this way to seed the
+        similarity match. Nothing is written anywhere and the record is not
+        touched.
         """
         with self._lock:
             record = self._records.get(entry_id)
             if record is None:
                 raise QuarantineError(f"no quarantine record with id {entry_id}")
             payload = self._payload_path(entry_id)
-            data = _mask(payload.read_bytes(), bytes.fromhex(record.nonce))
+            return _mask(payload.read_bytes(), bytes.fromhex(record.nonce))
+
+    def export(self, entry_id: str, destination: Path | str) -> Path:
+        """Write the original bytes out for analysis, without touching the record.
+
+        Kept separate from restore so pulling a sample out for inspection is a
+        deliberate, differently named action.
+        """
+        data = self.payload(entry_id)
         target = Path(destination)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)

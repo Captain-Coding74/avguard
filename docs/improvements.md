@@ -424,7 +424,9 @@ no compiled dependency; a `tlsh` table in the blocklist database, filled by
 `--tlsh PATH...` to print digests for seeding; the nearest reference as one
 soft finding in `scan()`; `--iocs-status` and the Health row report the
 count; `tests/test_tlsh.py` (32 tests); `tools/tlsh_calibration.py` for the
-thresholds. The measurements and the table are in ROADMAP.md.
+thresholds. The measurements and the table are in ROADMAP.md. Later the
+same day: seeding from the window, the Quarantine tab's *Mark as a known
+sample* button (ROADMAP.md, "Marking a known sample from the window").
 
 Five deviations from the text above, each for a measured reason:
 

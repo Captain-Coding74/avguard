@@ -1076,6 +1076,11 @@ class Scanner:
             self.rekey_cache()
             log.info("blocklist changed on disk (version %d); cache rebuilt", version)
 
+    def adopt_iocs(self) -> None:
+        """This process changed the blocklist or the reference table: take it
+        up now, not at the next two-second check."""
+        self._sync_iocs(force=True)
+
     # ---------------------------------------------------------------- guards
 
     def _guard(self, path: Path) -> Verdict | None:

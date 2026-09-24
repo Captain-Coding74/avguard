@@ -120,6 +120,38 @@ class ParsedLines:
 
 
 @dataclass
+class ReferenceResult:
+    """What came of marking a sample as a known one."""
+    digest: str = ""
+    added: bool = False
+    known: bool = False
+    reason: str = ""          # why no reference was added, when none was
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.digest)
+
+
+_SIGNATURE_NAME = re.compile(r"byte signature for (\S+)")
+_RULE_NAME = re.compile(r"\(rule ([^,)\s]+)")
+
+
+def family_from_reasons(reasons: Iterable[str], fallback: str = "") -> str:
+    """A family name to suggest for a quarantined file, from why it was taken.
+
+    The byte signature's name, else the first YARA rule's name, else the
+    fallback (the file's stem), else "quarantined". A suggestion: the dialog
+    lets the user change it.
+    """
+    for reason in reasons:
+        for pattern in (_SIGNATURE_NAME, _RULE_NAME):
+            found = pattern.search(reason)
+            if found:
+                return found.group(1).strip()
+    return fallback.strip() or "quarantined"
+
+
+@dataclass
 class FeedResult:
     status: str                       # "updated" | "unchanged" | "not due" | "disabled"
     url: str = ""
@@ -331,6 +363,28 @@ class IocStore:
         result.tlsh_added = added
         result.tlsh_known = len(rows) - added
         return result
+
+    def add_reference(self, data: bytes, family: str, source: str = "quarantine") -> ReferenceResult:
+        """One reference from a sample's bytes: the Quarantine tab's "known sample".
+
+        Refuses what the scanner could never match. Bytes above this backend's
+        size cap are not digested at scan time, so a reference for them would
+        sit in the table and fire on nothing; a digest that cannot be computed
+        (too small, too uniform) is said so, not stored as nothing.
+        """
+        cap = tlsh_module.size_cap()
+        if len(data) > cap:
+            return ReferenceResult(reason=(
+                f"{len(data):,} bytes is above the {cap // 1024:,} KB this backend digests "
+                "at scan time, so nothing would ever be compared with it"))
+        digest = tlsh_module.hash_bytes(data)
+        if digest is None:
+            return ReferenceResult(reason=(
+                "too small or too uniform for a similarity digest (at least "
+                f"{tlsh_module.MIN_BYTES} bytes, with some variety in them)"))
+        result = self.import_tlsh([(digest, family)], source)
+        return ReferenceResult(digest=digest, added=result.tlsh_added == 1,
+                               known=result.tlsh_known == 1)
 
     def remove_tlsh(self, digest: str) -> bool:
         canonical = tlsh_module.normalize(digest)

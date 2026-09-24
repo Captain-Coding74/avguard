@@ -24,7 +24,7 @@ import ttkbootstrap as tb
 from ttkbootstrap.constants import (
     BOTH, DISABLED, END, HORIZONTAL, LEFT, NORMAL, RIGHT, VERTICAL, X, Y
 )
-from ttkbootstrap.dialogs import Messagebox
+from ttkbootstrap.dialogs import Messagebox, Querybox
 
 from . import config, dialogs, fimpanel, logsetup, scheduling
 from .events import Event, EventStore
@@ -235,6 +235,8 @@ class AVGuardApp(tb.Window):
 
         tb.Button(quarantine, text="Export everything...", bootstyle="secondary-outline",
                   command=self._export_all).pack(fill=X, pady=(0, 4))
+        tb.Button(quarantine, text="Mark as a known sample...", bootstyle="info-outline",
+                  command=self._mark_known_sample).pack(fill=X, pady=(0, 4))
 
         # The file-integrity baseline, beside the quarantine because both are
         # things the user comes back to look at. Its work runs on a thread of
@@ -722,6 +724,57 @@ class AVGuardApp(tb.Window):
                 "This is the unmodified file. Handle it carefully.",
                 "Exported", parent=self,
             )
+
+    def _mark_known_sample(self) -> None:
+        """Seed the similarity match from a file already judged bad.
+
+        The reference set is empty until somebody fills it, and until this
+        button that meant two commands in a terminal. A quarantined file is
+        one the user has looked at; its digest under a family name makes the
+        next variant of it a soft finding. Nothing is moved on resemblance.
+        """
+        entry_id = self._selected_id()
+        if entry_id is None:
+            return
+        record = self.quarantine.get(entry_id)
+        if record is None:
+            Messagebox.show_info("That entry is already gone.", "AVGuard", parent=self)
+            self._refresh_quarantine()
+            return
+        suggested = iocs_module.family_from_reasons(record.reasons, Path(record.original_name).stem)
+        family = Querybox.get_string(
+            prompt=(f"Family name for '{record.original_name}'." + chr(10) + chr(10)
+                    + "Files that resemble it will be reported as SUSPICIOUS under this "
+                      "name. Resemblance alone never moves a file."),
+            title="Mark as a known sample", initialvalue=suggested, parent=self)
+        if family is None:
+            return
+        family = family.strip() or suggested
+        try:
+            data = self.quarantine.payload(entry_id)
+        except (QuarantineError, OSError) as exc:
+            Messagebox.show_error(str(exc), "Could not read the sample", parent=self)
+            return
+        result = self.scanner.iocs.add_reference(data, family, source="quarantine")
+        if not result.ok:
+            Messagebox.show_warning(f"'{record.original_name}' was not added: {result.reason}.",
+                                    "No reference added", parent=self)
+            return
+        if result.known:
+            self._banner(f"'{record.original_name}' is already a known sample.", "inverse-secondary")
+            return
+        self.events.record(Event(
+            kind="reference", path=record.original_path,
+            reasons=[f"marked as a known sample of {family}"],
+            detail={"digest": result.digest, "family": family, "entry_id": entry_id}))
+        # The scanner reloads its references and re-keys the cache, so a copy
+        # cached CLEAN a minute ago is measured against the new row next time.
+        self.scanner.adopt_iocs()
+        self.cache = self.scanner.cache
+        log.info("known sample: %s added as %s (%s...)", record.original_name, family,
+                 result.digest[:14])
+        self._banner(f"'{record.original_name}' is now a known sample of {family}: files that "
+                     "resemble it will be reported.", "inverse-success")
 
     def _open_logs(self) -> None:
         import subprocess
