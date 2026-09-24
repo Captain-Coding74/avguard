@@ -44,6 +44,7 @@ import threading
 import time
 import zipfile
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
@@ -117,6 +118,22 @@ class ParsedLines:
     tlsh: list[tuple[str, str]]   # (canonical digest, family)
     rejected: int
     seen: int
+
+
+@dataclass
+class TlshEntry:
+    """One row of the reference table, as the Settings page lists it."""
+    digest: str
+    family: str
+    source: str
+    added_at: float
+
+    @property
+    def when(self) -> str:
+        try:
+            return datetime.fromtimestamp(self.added_at).strftime("%Y-%m-%d %H:%M")
+        except (ValueError, OSError, OverflowError):
+            return "unknown"
 
 
 @dataclass
@@ -363,6 +380,17 @@ class IocStore:
         result.tlsh_added = added
         result.tlsh_known = len(rows) - added
         return result
+
+    def tlsh_entries(self) -> list[TlshEntry]:
+        """Every reference, newest first: what Settings > Known samples shows."""
+        try:
+            rows = self._conn().execute(
+                "SELECT digest, family, source, added_at FROM tlsh "
+                "ORDER BY added_at DESC, digest").fetchall()
+        except sqlite3.Error as exc:
+            log.warning("TLSH references could not be listed: %s", exc)
+            return []
+        return [TlshEntry(str(d), str(f), str(s), float(a or 0.0)) for d, f, s, a in rows]
 
     def add_reference(self, data: bytes, family: str, source: str = "quarantine") -> ReferenceResult:
         """One reference from a sample's bytes: the Quarantine tab's "known sample".

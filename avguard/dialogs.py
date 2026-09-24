@@ -8,6 +8,7 @@ thread or touches the filesystem outside config and the event store.
 from __future__ import annotations
 
 import logging
+import sqlite3
 from pathlib import Path
 from tkinter import filedialog
 
@@ -16,7 +17,7 @@ import ttkbootstrap as tb
 from ttkbootstrap.constants import BOTH, END, LEFT, RIGHT, VERTICAL, X, Y
 from ttkbootstrap.dialogs import Messagebox
 
-from . import allowlist as allowlist_module, config, rulepacks, scheduling, shellext
+from . import allowlist as allowlist_module, config, iocs as iocs_module, rulepacks, scheduling, shellext
 
 log = logging.getLogger("avguard.dialogs")
 
@@ -33,12 +34,14 @@ class SettingsDialog(tb.Toplevel):
 
     def __init__(self, parent, cfg: config.Config, on_saved,
                  pack_store=None, on_packs_changed=None,
-                 allowlist=None, on_allowlist_changed=None) -> None:
+                 allowlist=None, on_allowlist_changed=None,
+                 ioc_store=None, on_references_changed=None) -> None:
         super().__init__(title="Settings", transient=parent, resizable=(False, False))
         self.cfg = cfg
         self._on_saved = on_saved
         self._on_packs_changed = on_packs_changed
         self._on_allowlist_changed = on_allowlist_changed
+        self._on_references_changed = on_references_changed
 
         body = tb.Frame(self, padding=18)
         body.pack(fill=BOTH, expand=True)
@@ -51,7 +54,8 @@ class SettingsDialog(tb.Toplevel):
         tabs = tb.Notebook(body)
         tabs.pack(fill=BOTH, expand=True, pady=(12, 0))
         pages: dict[str, tb.Frame] = {}
-        for name in ("Protection", "Folders", "Running by itself", "Rule packs", "Kept files"):
+        for name in ("Protection", "Folders", "Running by itself", "Rule packs", "Kept files",
+                     "Known samples"):
             page = tb.Frame(tabs, padding=(0, 8, 0, 0))
             tabs.add(page, text=name)
             pages[name] = page
@@ -222,6 +226,30 @@ class SettingsDialog(tb.Toplevel):
                        "changes its bytes and ends the exception by itself.")
                  ).pack(anchor="w", pady=(6, 0))
 
+        # --- known samples ---------------------------------------------------
+        # A reference can be added from the Quarantine panel; until this page
+        # it could be seen and undone only from a terminal.
+        known_frame = tb.Labelframe(pages["Known samples"], text="Known samples", padding=12)
+        known_frame.pack(fill=X, pady=(0, 8))
+        # The scanner's store, for the reason the pack store and the allowlist
+        # are the scanner's: a removal here must reach the running scanner.
+        self.ioc_store = ioc_store if ioc_store is not None else iocs_module.IocStore()
+        self.known_list = tk.Listbox(known_frame, height=4, bg="#12161c", fg="#cfd8dc",
+                                     relief="flat", highlightthickness=0)
+        self.known_list.pack(fill=X)
+        self._refresh_known()
+        row = tb.Frame(known_frame, padding=(0, 6, 0, 0))
+        row.pack(fill=X)
+        tb.Button(row, text="Remove", bootstyle="danger-outline",
+                  command=self._remove_known).pack(side=LEFT)
+        tb.Label(known_frame, bootstyle="secondary", wraplength=520, justify="left",
+                 text=("Each is the similarity digest of a sample: a file that resembles it "
+                       "is reported as SUSPICIOUS under the family name, and never moved on "
+                       "resemblance alone. Add one from the Quarantine panel (Mark as a "
+                       "known sample) or from a terminal:" + CHR_NL
+                       + "    python -m avguard --iocs-import <file>")
+                 ).pack(anchor="w", pady=(6, 0))
+
         # --- buttons -------------------------------------------------------
         actions = tb.Frame(body, padding=(0, 14, 0, 0))
         actions.pack(fill=X)
@@ -346,6 +374,47 @@ class SettingsDialog(tb.Toplevel):
         if self._on_allowlist_changed:
             self._on_allowlist_changed()
         self._refresh_allowlist()
+
+    def _refresh_known(self) -> None:
+        self.known_list.delete(0, END)
+        entries = self.ioc_store.tlsh_entries()
+        # Each row remembers its digest, for the reason the kept-files list
+        # does: a reference added underneath the open dialog shifts the rows.
+        self._known_digests = [entry.digest for entry in entries]
+        if not entries:
+            self.known_list.insert(END, "  (none - nothing has been marked as a known sample)")
+            return
+        for entry in entries:
+            self.known_list.insert(
+                END, f"{entry.family or 'unnamed'}  -  added {entry.when} from {entry.source}, "
+                     f"{entry.digest[:14]}...")
+
+    def _remove_known(self) -> None:
+        selection = self.known_list.curselection()
+        digests = getattr(self, "_known_digests", [])
+        if not selection or not digests or selection[0] >= len(digests):
+            Messagebox.show_info("Select a known sample first.", "AVGuard", parent=self)
+            return
+        digest = digests[selection[0]]
+        entry = next((e for e in self.ioc_store.tlsh_entries() if e.digest == digest), None)
+        if entry is None:
+            Messagebox.show_info("That reference is already gone; the list has changed.",
+                                 "AVGuard", parent=self)
+            self._refresh_known()
+            return
+        if Messagebox.yesno(
+                f"Stop treating '{entry.family or 'unnamed'}' ({entry.digest[:14]}...) as a "
+                "known sample?" + CHR_NL + CHR_NL
+                + "Files that resemble it will no longer be reported for it.",
+                "Remove this reference?", parent=self) != "Yes":
+            return
+        try:
+            self.ioc_store.remove_tlsh(digest)
+        except (iocs_module.IocError, sqlite3.Error, OSError) as exc:
+            Messagebox.show_error(f"Could not remove it: {exc}", "AVGuard", parent=self)
+        if self._on_references_changed:
+            self._on_references_changed()
+        self._refresh_known()
 
     def _add_watch(self) -> None:
         chosen = filedialog.askdirectory(title="Watch this folder", parent=self)

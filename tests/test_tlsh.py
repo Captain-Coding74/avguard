@@ -646,3 +646,109 @@ class TestTheQuarantineTabButton(TlshCase):
         warn.assert_called_once()
         self.assertIn("too small", warn.call_args.args[0])
         self.assertEqual(self.store.tlsh_count(), 1)
+
+
+# ------------------------------------------------------- the Settings page
+
+class TestKnownSamplesAreListedAndRemovable(TlshCase):
+    """Settings > Known samples: the store call behind the list, and removal
+    reaching the running scanner at once."""
+
+    def test_entries_are_newest_first_with_family_source_and_date(self):
+        with mock.patch.object(iocs.time, "time", return_value=1_700_000_000.0):
+            self.store.import_lines([REFERENCE["text"] + ",Older"], source="unit")
+        with mock.patch.object(iocs.time, "time", return_value=1_700_000_600.0):
+            self.store.import_lines([REFERENCE["chain50"] + ",Newer"], source="pasted")
+        entries = self.store.tlsh_entries()
+        self.assertEqual([(e.family, e.source) for e in entries],
+                         [("Newer", "pasted"), ("Older", "unit")])
+        self.assertEqual(entries[0].digest, tlsh.normalize(REFERENCE["chain50"]))
+        self.assertRegex(entries[0].when, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
+        self.assertEqual(iocs.TlshEntry("d", "f", "s", float("nan")).when, "unknown")
+
+    def test_removing_a_reference_reaches_the_running_scanner(self):
+        base = chain(20000, b"family")
+        variant = self.sample("variant.bin", flipped(base, 1))
+        scanner = self.scanner()
+        result = self.store.add_reference(base, "Family", source="quarantine")
+        scanner.adopt_iocs()
+        self.assertIs(scanner.scan(variant).level, Level.SUSPICIOUS)   # cached under this row
+        version = self.store.version()
+        self.assertTrue(self.store.remove_tlsh(result.digest))
+        self.assertGreater(self.store.version(), version, "a removal is a generation change")
+        self.assertEqual(self.store.tlsh_entries(), [])
+        scanner.adopt_iocs()
+        self.assertIs(scanner.scan(variant).level, Level.CLEAN,
+                      "the SUSPICIOUS cached on resemblance to the removed row is gone")
+        self.assertFalse(self.store.remove_tlsh(result.digest), "removing twice is a no")
+
+
+class TestTheKnownSamplesPage(TlshCase):
+    """The page itself, on the shared window: rows keyed by digest, so a
+    reference added underneath the open dialog cannot shift the target."""
+
+    def test_remove_takes_the_selected_reference_and_tells_the_window(self):
+        try:
+            import ttkbootstrap as tb   # noqa: F401
+            from avguard import dialogs
+        except ImportError:
+            self.skipTest("GUI dependencies are not installed")
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from guiroot import gui_root
+        try:
+            root = gui_root()
+        except Exception as exc:  # no display on this machine
+            self.skipTest(f"no display: {exc}")
+        from avguard import config
+        from avguard.allowlist import Allowlist
+        from avguard.rulepacks import PackStore
+
+        with mock.patch.object(iocs.time, "time", return_value=1_700_000_000.0):
+            self.store.import_lines([REFERENCE["text"] + ",Older"], source="unit")
+        with mock.patch.object(iocs.time, "time", return_value=1_700_000_600.0):
+            self.store.import_lines([REFERENCE["chain50"] + ",Newer"], source="unit")
+        changed: list[int] = []
+        dialog = dialogs.SettingsDialog(
+            root, config.Config(), lambda: None,
+            pack_store=PackStore(directory=self.tmp / "packs", index_path=self.tmp / "packs" / "packs.json"),
+            allowlist=Allowlist(path=self.tmp / "allow.json"),
+            ioc_store=self.store, on_references_changed=lambda: changed.append(1))
+        self.addCleanup(dialog.destroy)
+        dialog.update_idletasks()
+        self.assertEqual(dialog.known_list.size(), 2)
+        self.assertIn("Newer", dialog.known_list.get(0))
+        self.assertIn("Older", dialog.known_list.get(1))
+
+        older = tlsh.normalize(REFERENCE["text"])
+        dialog.known_list.selection_clear(0, "end")
+        dialog.known_list.selection_set(dialog._known_digests.index(older))
+        # A reference lands underneath the open dialog: newest, so row 0.
+        with mock.patch.object(iocs.time, "time", return_value=1_700_001_200.0):
+            self.store.import_lines([REFERENCE["chain10000"] + ",Newest"], source="unit")
+        with mock.patch.object(dialogs.Messagebox, "yesno", return_value="Yes"):
+            dialog._remove_known()
+        families = sorted(e.family for e in self.store.tlsh_entries())
+        self.assertEqual(families, ["Newer", "Newest"], "Older went, and only Older")
+        self.assertEqual(changed, [1])
+        self.assertEqual(dialog.known_list.size(), 2, "the list was refreshed")
+
+        with mock.patch.object(dialogs.Messagebox, "yesno", return_value="No"):
+            dialog.known_list.selection_set(0)
+            dialog._remove_known()
+        self.assertEqual(len(self.store.tlsh_entries()), 2, "declined")
+        with mock.patch.object(dialogs.Messagebox, "show_info") as info:
+            dialog.known_list.selection_clear(0, "end")
+            dialog._remove_known()
+        info.assert_called_once()
+
+    def test_the_window_adopts_a_removal(self):
+        try:
+            from avguard import gui
+        except ImportError:
+            self.skipTest("GUI dependencies are not installed")
+        from types import SimpleNamespace
+        adopted: list[int] = []
+        fake = SimpleNamespace(scanner=SimpleNamespace(adopt_iocs=lambda: adopted.append(1),
+                                                       cache="re-keyed"), cache=None)
+        gui.AVGuardApp._references_changed(fake)
+        self.assertEqual((adopted, fake.cache), ([1], "re-keyed"))

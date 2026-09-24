@@ -855,7 +855,9 @@ class AVGuardApp(tb.Window):
                                pack_store=self.scanner.packs,
                                on_packs_changed=self._packs_changed,
                                allowlist=self.scanner.allowlist,
-                               on_allowlist_changed=self._allowlist_changed)
+                               on_allowlist_changed=self._allowlist_changed,
+                               ioc_store=self.scanner.iocs,
+                               on_references_changed=self._references_changed)
 
     def _packs_changed(self) -> None:
         """A pack was trusted, untrusted or removed. Adopt it now.
@@ -882,6 +884,16 @@ class AVGuardApp(tb.Window):
         discarded = self.scanner.rekey_cache()
         self.cache = self.scanner.cache
         log.info("kept-files list changed; %d cached verdict(s) discarded", discarded)
+
+    def _references_changed(self) -> None:
+        """A known sample was removed in Settings: the scanner adopts it now.
+
+        A verdict cached SUSPICIOUS on resemblance to the removed row would
+        otherwise replay for the cache's lifetime; re-keying drops it.
+        """
+        self.scanner.adopt_iocs()
+        self.cache = self.scanner.cache
+        log.info("known samples changed; references reloaded and cache rebuilt")
 
     def _forwarding_changed(self) -> None:
         """The URL changed in Settings: the old forwarder stops, a new one starts."""

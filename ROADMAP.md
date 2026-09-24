@@ -624,6 +624,21 @@ byte changed scanning CLEAN; the button pressed with the dialog answered,
 re-key); the copy scanning SUSPICIOUS, "resembles a Selftest-Family
 sample: TLSH distance 2". Tests 506 → **512**.
 
+**Settings > Known samples, 2026-09-24.** The button above adds a
+reference from the window; this page shows and undoes them there. It is
+the "Kept files" page's shape: a list of every reference with its family,
+source and date (`IocStore.tlsh_entries`, newest first), a Remove button
+that confirms, and rows that remember their digest rather than their
+number, so a reference landing underneath the open dialog cannot shift
+the target (the kept-files lesson, tested the same way). A removal bumps
+the store's version, and the window's `_references_changed` has the
+scanner adopt it at once and re-key its cache, so a verdict cached
+SUSPICIOUS on resemblance to the removed row is gone rather than replayed
+for the cache's lifetime; that is a test. Measured on the real window
+under Xvfb with 1,003 references, four times the warning point: the
+Settings dialog builds in 23 ms, the list alone in 8 ms. Tests
+512 → **516**.
+
 **The manual test plan, 2026-09-24.** Ten tests, written by the project's
 owner, of what a user would do to a scanner. Tests 1 to 3 were run on
 their Windows machine with the GUI and recorded as passed in their plan;

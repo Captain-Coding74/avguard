@@ -433,7 +433,8 @@ fetched. From the window, select a quarantined file and press *Mark as a
 known sample*: AVGuard digests the stored bytes in memory, asks for a family
 name (suggested from what caught the file), adds the reference, and the
 running scanner takes it up at once, so a copy cached CLEAN a minute ago is
-measured against it on its next scan. Once at least one reference exists, files up to the size cap are
+measured against it on its next scan. Settings > Known samples lists every
+reference with its family, source and date, and Remove undoes one. Once at least one reference exists, files up to the size cap are
 digested in the same read that computes the SHA-256, and the nearest
 reference is measured: distance 30 or under is reported as a near variant,
 which is SUSPICIOUS on its own; 31 to 40 as a loose resemblance, which is
