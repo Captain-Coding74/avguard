@@ -5,7 +5,11 @@
 yara-python>=4.5.0      # rule-based detection
 watchdog>=6.0.0         # filesystem events for real-time mode
 requests>=2.32.0        # VirusTotal lookups (optional feature, still imported)
-ttkbootstrap>=1.14.0    # themed Tkinter widgets
+ttkbootstrap>=1.14.0,<3 # themed Tkinter widgets. A fresh install resolves to 2.x,
+                        # which the window runs on since 2026-09-24 (one widget name
+                        # differed). 2.x calls the "darkly" theme a legacy name kept
+                        # for migration and planned for removal in 3.0, so 3.x is
+                        # held off until the theme is chosen against it.
 pystray>=0.19.0         # system tray icon
 Pillow>=10.0.0          # tray icon image, required by pystray
 numpy>=1.26             # TLSH similarity digest: 16 MB/s with it, 2.4 MB/s without;

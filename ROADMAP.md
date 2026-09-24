@@ -595,7 +595,10 @@ alias, 2.x exports only `Panedwindow`, and `requirements.txt`'s `>=1.14.0`
 resolves to 2.x on a fresh install today, where the window never opened.
 Nothing had caught it because no test built the main window; one now reads
 every `tb.<Name>` the GUI modules use and asks the installed ttkbootstrap
-for each. The tab was driven on a real window under Xvfb here (baseline,
+for each. The same 2.x prints, at every window, that the "darkly" theme
+name is a legacy alias planned for removal in 3.0, so `requirements.txt`
+now holds the package below 3: the next fresh install gets what was
+exercised here, and 3.x waits until the theme is chosen against it. The tab was driven on a real window under Xvfb here (baseline,
 three changes, check, accept; Health and History opened beside it) and the
 suite's window tests run on the Windows CI runner, which has a display. Not
 yet on the owner's desktop.
