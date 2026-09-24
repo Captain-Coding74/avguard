@@ -309,27 +309,29 @@ class TestScanner(TempCase):
 
     def test_a_tree_scan_counts_vanished_files_as_skipped(self):
         """Delete files under a running scan, as a user emptying a folder
-        does: every one is a skip, none an error, and the walk finishes."""
+        does: every one is a skip, none an error, and the walk finishes.
+
+        One worker, so the callback runs between scans with nothing open:
+        with four, the callback deleted files other workers were reading,
+        and on Windows an open file cannot be unlinked, so the first
+        in-use file raised and nothing vanished at all (CI run #37)."""
         folder = self.tmp / "emptying"
         folder.mkdir()
         for i in range(60):
             (folder / f"f{i:02d}.txt").write_text(f"file {i}\n" * 50)
         levels: list[Level] = []
-        seen = 0
 
         def report(verdict):
-            nonlocal seen
             levels.append(verdict.level)
-            seen += 1
-            if seen == 5:
+            if len(levels) == 5:
                 for leftover in folder.glob("f*.txt"):
                     leftover.unlink()
 
-        self.scanner.scan_tree(folder, on_verdict=report)
-        self.assertEqual(len(levels), 60)
+        self.scanner.scan_tree(folder, on_verdict=report, workers=1)
+        self.assertEqual(len(levels), 60, "every listed file gets a verdict")
         self.assertNotIn(Level.ERROR, levels)
-        self.assertIn(Level.SKIPPED, levels)
-        self.assertIn(Level.CLEAN, levels)
+        self.assertEqual(levels.count(Level.CLEAN), 5)
+        self.assertEqual(levels.count(Level.SKIPPED), 55)
 
     def test_cache_prevents_a_second_read(self):
         target = self.write("cached.txt", "hello world")
