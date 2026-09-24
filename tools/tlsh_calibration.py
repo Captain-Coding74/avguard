@@ -147,6 +147,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="executables only (ELF or PE magic), the harder case")
     parser.add_argument("--band", nargs=2, type=int, metavar=("LOW", "HIGH"), action="append",
                         help="also list a sample of unrelated pairs scoring in [LOW, HIGH]")
+    parser.add_argument("--size-split", type=int, default=64, metavar="KB",
+                        help="also report the pairs where both files are at least this big; "
+                             "the first Windows run's near misses were all 15 KB resource DLLs")
     args = parser.parse_args(argv)
 
     roots = args.roots or default_roots()
@@ -162,18 +165,21 @@ def main(argv: list[str] | None = None) -> int:
 
     started = time.perf_counter()
     digests: list[tuple[Path, str]] = []
+    sizes: list[int] = []
     undigestable = 0
     total_bytes = 0
     for path in files:
         try:
             digest = tlsh.hash_file(path)
-            total_bytes += path.stat().st_size
+            size = path.stat().st_size
         except OSError:
             continue
+        total_bytes += size
         if digest is None:
             undigestable += 1
             continue
         digests.append((path, digest))
+        sizes.append(size)
     elapsed = time.perf_counter() - started
     print(f"digested {len(digests)} files, {total_bytes / 2**20:.0f} MB in {elapsed:.1f} s "
           f"({total_bytes / elapsed / 1e6:.1f} MB/s); {undigestable} too small or too uniform")
@@ -186,8 +192,11 @@ def main(argv: list[str] | None = None) -> int:
     started = time.perf_counter()
     unrelated_hits = {t: 0 for t in THRESHOLDS}
     related_hits = {t: 0 for t in THRESHOLDS}
+    large_hits = {t: 0 for t in THRESHOLDS}      # unrelated, both files >= the split
     unrelated_pairs = 0
     related_pairs = 0
+    large_pairs = 0
+    big = [size >= args.size_split * 1024 for size in sizes]
     closest_unrelated: list[tuple[int, str, str]] = []
     keys = [package_key(p) for p, _ in digests]
     for i, mine in enumerate(parsed):
@@ -203,6 +212,11 @@ def main(argv: list[str] | None = None) -> int:
                 bucket = unrelated_hits
                 if d <= 100:
                     closest_unrelated.append((d, str(digests[i][0]), str(digests[j][0])))
+                if big[i] and big[j]:
+                    large_pairs += 1
+                    for t in THRESHOLDS:
+                        if d <= t:
+                            large_hits[t] += 1
             for t in THRESHOLDS:
                 if d <= t:
                     bucket[t] += 1
@@ -239,6 +253,14 @@ def main(argv: list[str] | None = None) -> int:
         p = unrelated_hits[t] / unrelated_pairs if unrelated_pairs else 0.0
         trip = [1 - (1 - p) ** k for k in (100, 1000, 10000)]
         print(f"  <= {t:<4} {unrelated_hits[t]:>12,} of {unrelated_pairs:<12,} "
+              f"{p:12.2e}   {trip[0]:6.2%} / {trip[1]:6.2%} / {trip[2]:6.2%}")
+    print()
+    print(f"the same, counting only pairs where both files are at least {args.size_split} KB "
+          f"({sum(big)} of {len(big)} files):")
+    for t in THRESHOLDS:
+        p = large_hits[t] / large_pairs if large_pairs else 0.0
+        trip = [1 - (1 - p) ** k for k in (100, 1000, 10000)]
+        print(f"  <= {t:<4} {large_hits[t]:>12,} of {large_pairs:<12,} "
               f"{p:12.2e}   {trip[0]:6.2%} / {trip[1]:6.2%} / {trip[2]:6.2%}")
     print()
     print("same-package pairs (files of one directory) within each distance:")
