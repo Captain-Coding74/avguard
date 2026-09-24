@@ -216,8 +216,9 @@ everywhere and the ctypes path is exercised only on the Windows runner.
 second `schtasks` task, records only); a Health row; `tests/test_fim.py` (21
 tests: the acceptance list, exclusions, the second-baseline replace, the real
 DPAPI round trip on Windows, a reversible stub everywhere else, and the CLI
-round trip). CLI first, as the text says; a GUI tab is not built yet -- the
-History window already shows the `fim` events.
+round trip). CLI first, as the text says; the GUI tab followed on
+2026-09-24: `avguard/fimpanel.py`, the Integrity tab beside Quarantine in
+the main window, measured in ROADMAP.md under "The Integrity tab".
 
 Two things found while building:
 

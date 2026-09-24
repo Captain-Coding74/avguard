@@ -16,8 +16,10 @@ import hashlib
 import io
 import logging
 import os
+import queue
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -337,3 +339,309 @@ class TestTheCommandLine(FimCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ------------------------------------------------------- front-end hooks
+
+class TestTheHooksAFrontEndNeeds(FimCase):
+    """The Integrity tab runs baseline() and check() on a worker thread with a
+    progress bar and a Cancel button. Both hooks are optional; the CLI passes
+    neither, so every test above this class exercises the no-hook path."""
+
+    def test_progress_counts_every_file_and_knows_the_total_from_the_first_call(self):
+        calls: list[tuple[int, int]] = []
+        self.store.baseline([self.tree], progress=lambda d, t: calls.append((d, t)))
+        self.assertEqual(calls, [(i, 7) for i in range(1, 8)])
+        (self.tree / "new.txt").write_bytes(b"new")
+        calls.clear()
+        report = self.store.check(progress=lambda d, t: calls.append((d, t)))
+        self.assertEqual(calls, [(i, 8) for i in range(1, 9)],
+                         "seven baselined files plus one new one, the total known up front")
+        self.assertEqual([c.kind for c in report.changes], ["added"])
+
+    def test_a_cancelled_first_baseline_writes_nothing(self):
+        seen: list[int] = []
+        report = self.store.baseline([self.tree], progress=lambda d, t: seen.append(d),
+                                     should_stop=lambda: len(seen) >= 3)
+        self.assertTrue(report.cancelled)
+        self.assertEqual(seen, [1, 2, 3], "the stop is polled before each file")
+        self.assertEqual(report.files, 0)
+        self.assertFalse(self.store.exists())
+        self.assertFalse(self.store.signature_path.exists())
+
+    def test_a_cancelled_re_baseline_leaves_the_old_one_intact(self):
+        self.baseline()
+        before = self.store.db_path.read_bytes()
+        signature = self.store.signature_path.read_text(encoding="utf-8")
+        (self.tree / "f0.txt").write_bytes(b"changed")
+        report = self.store.baseline([self.tree], should_stop=lambda: True)
+        self.assertTrue(report.cancelled)
+        self.assertEqual(self.store.db_path.read_bytes(), before)
+        self.assertEqual(self.store.signature_path.read_text(encoding="utf-8"), signature)
+        self.assertEqual(self.store.verify_integrity(), fim.INTEGRITY_OK)
+        self.assertEqual([c.kind for c in self.store.check().changes], ["modified"],
+                         "the old baseline still sees the change")
+
+    def test_a_cancelled_check_records_nothing_and_is_not_clean(self):
+        self.baseline()
+        (self.tree / "f0.txt").write_bytes(b"changed")      # f0 is examined first
+        seen: list[int] = []
+        report = self.store.check(events=self.events, progress=lambda d, t: seen.append(d),
+                                  should_stop=lambda: len(seen) >= 2)
+        self.assertTrue(report.cancelled)
+        self.assertFalse(report.clean)
+        self.assertEqual([c.path for c in report.changes], [str(self.tree / "f0.txt")],
+                         "what was found before the stop is reported, marked cancelled")
+        self.assertEqual(self.events.read(kinds={"fim"}), [], "and none of it is recorded")
+        self.store.check(events=self.events)
+        self.assertEqual(len(self.events.read(kinds={"fim"})), 1, "a full check records it")
+
+    def test_the_hooks_do_not_change_what_a_check_finds(self):
+        self.baseline()
+        modified = self.tree / "f3.txt"
+        modified.write_bytes(modified.read_bytes()[:-1] + b"!")
+        (self.tree / "sub" / "new.txt").write_bytes(b"brand new")
+        (self.tree / "f5.txt").unlink()
+        plain = self.store.check()
+        hooked = self.store.check(progress=lambda d, t: None, should_stop=lambda: False)
+        self.assertEqual([(c.kind, c.path, c.old_sha256, c.new_sha256) for c in plain.changes],
+                         [(c.kind, c.path, c.old_sha256, c.new_sha256) for c in hooked.changes])
+        self.assertEqual((plain.examined, plain.hashed), (hooked.examined, hooked.hashed))
+
+
+class TestWhatTheTabSays(FimCase):
+    """The panel's text is built by functions with no widgets in them, so
+    the words are checked here, where tkinter need not be installed."""
+
+    def _panel_module(self):
+        try:
+            from avguard import fimpanel
+        except ImportError:
+            self.skipTest("GUI dependencies are not installed")
+        return fimpanel
+
+    def test_the_summary_before_and_after_a_baseline_and_when_tampered(self):
+        fimpanel = self._panel_module()
+        ok, text = fimpanel.summarize(self.store)
+        self.assertTrue(ok)
+        self.assertIn("No baseline yet", text)
+        self.baseline()
+        ok, text = fimpanel.summarize(self.store)
+        self.assertTrue(ok)
+        self.assertIn("7 file(s) baselined", text)
+        self.assertIn(str(self.tree), text)
+        self.assertIn("Signature holds", text)
+        data = bytearray(self.store.db_path.read_bytes())
+        data[-1] ^= 0xFF
+        self.store.db_path.write_bytes(bytes(data))
+        ok, text = fimpanel.summarize(self.store)
+        self.assertFalse(ok)
+        self.assertIn("SIGNATURE TAMPERED", text)
+        self.assertIn("outside AVGuard", text)
+
+    def test_a_row_names_the_change_and_both_hashes(self):
+        fimpanel = self._panel_module()
+        change = fim.Change("modified", "C:/site/index.html", old_sha256="a" * 64,
+                            new_sha256="b" * 64, old_size=1000, new_size=1200)
+        self.assertEqual(fimpanel.row_for(change),
+                         ("MODIFIED", "C:/site/index.html",
+                          "aaaaaaaaaaaa -> bbbbbbbbbbbb, 1,000 -> 1,200 bytes"))
+        self.assertEqual(fimpanel.row_for(fim.Change("added", "x", new_sha256="c" * 64,
+                                                     new_size=5))[2], "cccccccccccc, 5 bytes")
+        self.assertEqual(fimpanel.row_for(fim.Change("removed", "x", old_sha256="d" * 64,
+                                                     old_size=6))[2], "was dddddddddddd, 6 bytes")
+        deep = fim.Change("added", str(self.tree / "sub" / "new.txt"), new_sha256="e" * 64)
+        self.assertEqual(fimpanel.row_for(deep, [str(self.tmp), str(self.tree)])[1],
+                         os.path.join("sub", "new.txt"), "the deepest root wins")
+        self.assertEqual(fimpanel.row_for(deep, [str(self.tmp / "elsewhere")])[1], deep.path,
+                         "a path under no root is shown in full")
+
+    def test_the_status_line_after_a_check(self):
+        fimpanel = self._panel_module()
+        self.baseline()
+        self.assertIn("No changes", fimpanel.describe_check(self.store.check()))
+        (self.tree / "f0.txt").write_bytes(b"changed")
+        text = fimpanel.describe_check(self.store.check(fast=True))
+        self.assertIn("1 modified, 0 added, 0 removed", text)
+        self.assertIn("Nothing was moved", text)
+        self.assertIn("size and date trusted", text)
+        cancelled = self.store.check(should_stop=lambda: True)
+        self.assertIn("cancelled", fimpanel.describe_check(cancelled))
+        self.assertIn("nothing recorded", fimpanel.describe_check(cancelled))
+        self.assertIn("No baseline", fimpanel.describe_check(
+            fim.CheckReport(integrity=fim.INTEGRITY_NO_BASELINE)))
+        self.store.signature_path.unlink()
+        self.assertIn("BASELINE: the baseline has no signature file",
+                      fimpanel.describe_check(self.store.check()))
+
+
+class TestThePanelOnAWindow(FimCase):
+    """The Integrity tab itself, on the shared withdrawn window: baseline,
+    check and accept through its buttons' handlers, with the worker thread
+    real and the window's pump played by wait()."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        try:
+            from avguard import fimpanel
+            from guiroot import gui_root
+        except ImportError:
+            self.skipTest("GUI dependencies are not installed")
+        try:
+            self.root = gui_root()
+        except Exception as exc:  # no display on this machine
+            self.skipTest(f"no display: {exc}")
+        self.fimpanel = fimpanel
+        self.posted: "queue.Queue" = queue.Queue()
+        self.panel = fimpanel.IntegrityPanel(
+            self.root, store_factory=lambda: self.store, events=self.events,
+            post=lambda fn, *args: self.posted.put((fn, args)))
+        self.addCleanup(self.panel.destroy)
+
+    def wait(self, timeout: float = 60.0) -> None:
+        """Let the worker finish, then run what it posted, on this thread:
+        what the window's pump does every 100 ms."""
+        if self.panel._thread is not None:
+            self.panel._thread.join(timeout)
+        self.assertFalse(self.panel.busy, "the worker did not finish")
+        while True:
+            try:
+                fn, args = self.posted.get_nowait()
+            except queue.Empty:
+                break
+            fn(*args)
+        self.root.update_idletasks()
+
+    def state(self, button) -> str:
+        return str(button.cget("state"))
+
+    def test_baseline_check_accept_from_the_tab(self):
+        panel = self.panel
+        self.assertIn("No baseline yet", panel.summary_var.get())
+        self.assertFalse(panel.check(), "nothing to check against yet")
+        self.assertIn("No baseline", panel.status_var.get())
+
+        self.assertTrue(panel.start_baseline(self.tree))
+        self.assertEqual(self.state(panel.check_btn), "disabled")
+        self.assertEqual(self.state(panel.cancel_btn), "normal")
+        self.wait()
+        self.assertEqual(self.state(panel.check_btn), "normal")
+        self.assertEqual(self.state(panel.cancel_btn), "disabled")
+        self.assertIn("7 file(s) baselined", panel.summary_var.get())
+        self.assertIn("Baselined 7 file(s)", panel.status_var.get())
+        self.assertEqual(self.store.verify_integrity(), fim.INTEGRITY_OK)
+
+        self.assertTrue(panel.check())
+        self.wait()
+        self.assertEqual(panel.changes, [])
+        self.assertIn("No changes", panel.status_var.get())
+
+        target = self.tree / "f3.txt"
+        target.write_bytes(b"edited")
+        self.assertTrue(panel.check())
+        self.wait()
+        self.assertEqual([(c.kind, c.path) for c in panel.changes], [("modified", str(target))])
+        row = panel.tree.item(panel.tree.get_children()[0], "values")
+        self.assertEqual((row[0], row[1]), ("MODIFIED", "f3.txt"),
+                         "shown relative to its root; the event carries the full path")
+        self.assertIn("1 modified, 0 added, 0 removed", panel.status_var.get())
+        self.assertEqual([e.level for e in self.events.read(kinds={"fim"})], ["modified"])
+        self.assertEqual(target.read_bytes(), b"edited", "a check moves nothing")
+
+        with mock.patch.object(self.fimpanel.Messagebox, "show_info") as info:
+            self.assertFalse(panel.accept_selected(), "nothing selected")
+        info.assert_called_once()
+        panel.tree.selection_set(panel.tree.get_children())
+        with mock.patch.object(self.fimpanel.Messagebox, "yesno", return_value="No"):
+            self.assertFalse(panel.accept_selected(), "declined")
+        self.assertEqual(len(panel.changes), 1)
+        with mock.patch.object(self.fimpanel.Messagebox, "yesno", return_value="Yes"):
+            self.assertTrue(panel.accept_selected())
+        self.wait()
+        self.assertEqual(panel.changes, [])
+        self.assertIn("Accepted 1 change(s)", panel.status_var.get())
+        self.assertTrue(self.store.check().clean, "the accepted change is the baseline now")
+        self.assertEqual(self.store.verify_integrity(), fim.INTEGRITY_OK, "and it was re-signed")
+
+    def test_a_tampered_baseline_turns_the_summary_red(self):
+        self.baseline()
+        data = bytearray(self.store.db_path.read_bytes())
+        data[-1] ^= 0xFF
+        self.store.db_path.write_bytes(bytes(data))
+        self.assertTrue(self.panel.check())
+        self.wait()
+        self.assertIn("SIGNATURE TAMPERED", self.panel.summary_var.get())
+        self.assertIn("danger", str(self.panel.summary.cget("style")))
+        self.assertIn("BASELINE: the baseline database was modified outside AVGuard",
+                      self.panel.status_var.get())
+        self.assertEqual([e.level for e in self.events.read(kinds={"fim"})], ["tampered"])
+
+    def _slow_check(self, started: "threading.Event", gate: "threading.Event"):
+        """A check that waits at the gate, then runs for real."""
+        real = self.store.check
+
+        def check(**kwargs):
+            started.set()
+            while not gate.is_set() and not kwargs["should_stop"]():
+                time.sleep(0.01)
+            return real(**kwargs)
+        return check
+
+    def test_cancel_stops_a_running_check_and_records_nothing(self):
+        self.baseline()
+        (self.tree / "f0.txt").write_bytes(b"changed")
+        started, gate = threading.Event(), threading.Event()
+        with mock.patch.object(self.store, "check", self._slow_check(started, gate)):
+            self.assertTrue(self.panel.check())
+            self.assertTrue(started.wait(10))
+            self.panel.cancel()
+            self.wait()
+        self.assertIn("cancelled", self.panel.status_var.get())
+        self.assertIn("nothing recorded", self.panel.status_var.get())
+        self.assertEqual(self.events.read(kinds={"fim"}), [])
+        self.assertEqual(self.state(self.panel.cancel_btn), "disabled")
+        self.assertEqual(self.state(self.panel.check_btn), "normal")
+
+    def test_one_operation_at_a_time_and_stop_at_shutdown(self):
+        self.baseline()
+        started, gate = threading.Event(), threading.Event()
+        with mock.patch.object(self.store, "check", self._slow_check(started, gate)):
+            self.assertTrue(self.panel.check())
+            self.assertTrue(started.wait(10))
+            with mock.patch.object(self.fimpanel.Messagebox, "show_info") as info:
+                self.assertFalse(self.panel.check())
+                self.assertFalse(self.panel.start_baseline(self.tree))
+            self.assertEqual(info.call_count, 2)
+            self.panel.stop(timeout=10)       # what the window does at shutdown
+            self.assertFalse(self.panel.busy)
+            self.wait()
+        self.assertIn("cancelled", self.panel.status_var.get())
+
+    def test_the_tab_fits_beside_the_quarantine(self):
+        """The right pane is two fifths of a 1,100 px window: about 430 px."""
+        self.panel.update_idletasks()
+        width, height = self.panel.winfo_reqwidth(), self.panel.winfo_reqheight()
+        self.assertLessEqual(width, 430, f"the Integrity tab asks for {width} x {height} px")
+        self.assertLessEqual(height, 420, f"the Integrity tab asks for {width} x {height} px")
+
+
+class TestWhatTheHealthRowSays(FimCase):
+    def test_the_health_row_names_the_tab(self):
+        """AVGuardApp._describe_fim needs no window; hand it what it reads."""
+        try:
+            from avguard import gui
+        except ImportError:
+            self.skipTest("GUI dependencies are not installed")
+        from types import SimpleNamespace
+        fake = SimpleNamespace(_fim_store=lambda: self.store)
+        text = gui.AVGuardApp._describe_fim(fake)
+        self.assertIn("No baseline yet", text)
+        self.assertIn("Integrity tab", text)
+        self.assertIn("--fim-baseline", text)
+        self.baseline()
+        text = gui.AVGuardApp._describe_fim(fake)
+        self.assertIn("7 file(s) baselined", text)
+        self.assertIn("Signature holds", text)
+        self.assertIn("Integrity tab", text)
+        self.assertIn("--fim-check", text)

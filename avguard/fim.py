@@ -66,6 +66,22 @@ INTEGRITY_UNSIGNED = "unsigned"
 INTEGRITY_KEY_UNREADABLE = "key-unreadable"
 INTEGRITY_NO_BASELINE = "no-baseline"
 
+# What each failed integrity state means, in the words the event, the CLI and
+# the Integrity tab all use.
+INTEGRITY_MESSAGES = {
+    INTEGRITY_TAMPERED: "the baseline database was modified outside AVGuard: "
+                        "its signature no longer matches",
+    INTEGRITY_UNSIGNED: "the baseline has no signature file; it was created or "
+                        "copied without AVGuard",
+    INTEGRITY_KEY_UNREADABLE: "the baseline's signing key cannot be read (another "
+                              "user's, or damaged); the signature cannot be checked",
+}
+
+# Hooks for a front end: progress(done, total) after each file, should_stop()
+# polled before each one. The CLI passes neither; the Integrity tab passes both.
+ProgressHook = Callable[[int, int], None]
+StopHook = Callable[[], bool]
+
 
 # ------------------------------------------------------------------ DPAPI
 
@@ -167,6 +183,7 @@ class BaselineReport:
     skipped: int = 0
     errors: list[str] = field(default_factory=list)
     seconds: float = 0.0
+    cancelled: bool = False      # stopped early; nothing was written
 
 
 @dataclass
@@ -178,6 +195,7 @@ class CheckReport:
     integrity: str = INTEGRITY_OK
     fast: bool = False
     seconds: float = 0.0
+    cancelled: bool = False      # stopped early; nothing was recorded
 
     def of(self, kind: str) -> list[Change]:
         return [c for c in self.changes if c.kind == kind]
@@ -196,20 +214,12 @@ class CheckReport:
 
     @property
     def clean(self) -> bool:
-        return not self.changes and self.integrity == INTEGRITY_OK
+        return not self.changes and self.integrity == INTEGRITY_OK and not self.cancelled
 
     def integrity_event(self) -> Event | None:
         if self.integrity in (INTEGRITY_OK, INTEGRITY_NO_BASELINE):
             return None
-        messages = {
-            INTEGRITY_TAMPERED: "the baseline database was modified outside AVGuard: "
-                                "its signature no longer matches",
-            INTEGRITY_UNSIGNED: "the baseline has no signature file; it was created or "
-                                "copied without AVGuard",
-            INTEGRITY_KEY_UNREADABLE: "the baseline's signing key cannot be read (another "
-                                      "user's, or damaged); the signature cannot be checked",
-        }
-        return Event(kind="fim", level="tampered", reasons=[messages[self.integrity]],
+        return Event(kind="fim", level="tampered", reasons=[INTEGRITY_MESSAGES[self.integrity]],
                      detail={"integrity": self.integrity})
 
 
@@ -344,27 +354,43 @@ class FimStore:
 
     # ------------------------------------------------------------ baseline
 
-    def baseline(self, roots: Iterable[Path]) -> BaselineReport:
-        """Record what the roots hold now. A root already recorded is replaced."""
+    def baseline(self, roots: Iterable[Path], progress: ProgressHook | None = None,
+                 should_stop: StopHook | None = None) -> BaselineReport:
+        """Record what the roots hold now. A root already recorded is replaced.
+
+        The roots are walked first and hashed second, so `progress` knows the
+        total from its first call. A stop before the end writes nothing: the
+        baseline on disk, if there is one, stays exactly what it was.
+        """
         started = time.monotonic()
         report = BaselineReport()
         rows: list[tuple[str, bytes, int, int, float]] = []
         now = time.time()
         wanted = [Path(os.path.abspath(str(root))) for root in roots]
+        pending: list[Path] = []
         for root in wanted:
             if not root.is_dir():
                 report.errors.append(f"not a directory: {root}")
                 continue
             report.roots.append(str(root))
-            for path in self._walk(root, report.errors):
-                try:
-                    sha, size, mtime_ns = hash_file(path)
-                except OSError as exc:
-                    report.errors.append(f"{path}: {exc}")
-                    report.skipped += 1
-                    continue
+            pending.extend(self._walk(root, report.errors))
+        for done, path in enumerate(pending, 1):
+            if should_stop is not None and should_stop():
+                report.cancelled = True
+                report.seconds = time.monotonic() - started
+                log.info("baseline cancelled after %d of %d file(s); nothing was written",
+                         done - 1, len(pending))
+                return report
+            try:
+                sha, size, mtime_ns = hash_file(path)
+            except OSError as exc:
+                report.errors.append(f"{path}: {exc}")
+                report.skipped += 1
+            else:
                 rows.append((str(path), bytes.fromhex(sha), size, mtime_ns, now))
                 report.bytes += size
+            if progress is not None:
+                progress(done, len(pending))
         if not report.roots:
             return report
 
@@ -390,12 +416,18 @@ class FimStore:
 
     # --------------------------------------------------------------- check
 
-    def check(self, fast: bool = False, events: EventStore | None = None) -> CheckReport:
+    def check(self, fast: bool = False, events: EventStore | None = None,
+              progress: ProgressHook | None = None,
+              should_stop: StopHook | None = None) -> CheckReport:
         """What differs from the baseline. Records events; moves nothing.
 
         `fast` trusts an unchanged size and mtime and skips the read. That
         is exactly what an attacker restoring a file's timestamp defeats,
         which is why it is not the default.
+
+        A stop before the end returns what was found so far, marked
+        cancelled, and records none of it: a partial check is not a result,
+        and an event is a claim.
         """
         started = time.monotonic()
         report = CheckReport(fast=fast)
@@ -428,51 +460,53 @@ class FimStore:
         for stored_path, sha, size, mtime_ns in rows:
             known[_key(stored_path)] = (stored_path, sha.hex(), int(size), int(mtime_ns))
 
-        for stored_path, old_sha, old_size, old_mtime in known.values():
-            path = Path(stored_path)
-            if self._excluded(path):
-                # Excluded since the baseline: neither checked nor reported
-                # as removed. The user said "never look here".
-                continue
-            report.examined += 1
-            try:
-                st = path.stat()
-            except FileNotFoundError:
-                report.changes.append(Change("removed", stored_path, old_sha256=old_sha,
-                                             old_size=old_size))
-                continue
-            except OSError as exc:
-                report.errors.append(f"{stored_path}: {exc}")
-                continue
-            if fast and st.st_size == old_size and st.st_mtime_ns == old_mtime:
-                continue
-            try:
-                new_sha, new_size, _ = hash_file(path)
-            except OSError as exc:
-                report.errors.append(f"{stored_path}: {exc}")
-                continue
-            report.hashed += 1
-            if new_sha != old_sha:
-                report.changes.append(Change("modified", stored_path, old_sha256=old_sha,
-                                             new_sha256=new_sha, old_size=old_size,
-                                             new_size=new_size))
-
+        # Excluded since the baseline: neither checked nor reported as
+        # removed. The user said "never look here".
+        candidates = [entry for entry in known.values() if not self._excluded(Path(entry[0]))]
+        # The roots are walked before anything is hashed, so the total is
+        # known from the first progress call; the walk is the cheap part.
+        fresh: list[Path] = []
         for root in roots:
             root_path = Path(root)
             if not root_path.is_dir():
                 report.errors.append(f"root no longer exists: {root}")
                 continue
-            for path in self._walk(root_path, report.errors):
-                if _key(path) in known:
-                    continue
-                try:
-                    new_sha, new_size, _ = hash_file(path)
-                except OSError as exc:
-                    report.errors.append(f"{path}: {exc}")
-                    continue
+            fresh.extend(path for path in self._walk(root_path, report.errors)
+                         if _key(path) not in known)
+        total = len(candidates) + len(fresh)
+        done = 0
+
+        def stopped() -> bool:
+            if should_stop is None or not should_stop():
+                return False
+            report.cancelled = True
+            report.seconds = time.monotonic() - started
+            log.info("integrity check cancelled after %d of %d file(s); nothing was recorded",
+                     done, total)
+            return True
+
+        for entry in candidates:
+            if stopped():
+                return report
+            self._examine(report, *entry, fast=fast)
+            done += 1
+            if progress is not None:
+                progress(done, total)
+
+        for path in fresh:
+            if stopped():
+                return report
+            try:
+                new_sha, new_size, _ = hash_file(path)
+            except OSError as exc:
+                report.errors.append(f"{path}: {exc}")
+            else:
                 report.hashed += 1
                 report.changes.append(Change("added", str(path), new_sha256=new_sha,
                                              new_size=new_size))
+            done += 1
+            if progress is not None:
+                progress(done, total)
 
         report.seconds = time.monotonic() - started
         if events is not None:
@@ -485,6 +519,33 @@ class FimStore:
                  report.examined, report.hashed, len(report.changes), report.integrity,
                  report.seconds)
         return report
+
+    def _examine(self, report: CheckReport, stored_path: str, old_sha: str,
+                 old_size: int, old_mtime: int, fast: bool) -> None:
+        """One baselined file against the disk: removed, modified, or as it was."""
+        path = Path(stored_path)
+        report.examined += 1
+        try:
+            st = path.stat()
+        except FileNotFoundError:
+            report.changes.append(Change("removed", stored_path, old_sha256=old_sha,
+                                         old_size=old_size))
+            return
+        except OSError as exc:
+            report.errors.append(f"{stored_path}: {exc}")
+            return
+        if fast and st.st_size == old_size and st.st_mtime_ns == old_mtime:
+            return
+        try:
+            new_sha, new_size, _ = hash_file(path)
+        except OSError as exc:
+            report.errors.append(f"{stored_path}: {exc}")
+            return
+        report.hashed += 1
+        if new_sha != old_sha:
+            report.changes.append(Change("modified", stored_path, old_sha256=old_sha,
+                                         new_sha256=new_sha, old_size=old_size,
+                                         new_size=new_size))
 
     # -------------------------------------------------------------- accept
 

@@ -465,6 +465,11 @@ hash, records each as an event, and moves nothing: changed is not the same as
 malicious. `--fim-accept PATH` re-baselines a change you have looked at, so
 the alert stops repeating; accepting is always a person's action.
 
+The same thing from the window: the Integrity tab, beside Quarantine, records
+a folder, checks it with a progress bar and a Cancel button, lists every
+change with both hashes, and accepts the rows you select. A check from the
+tab records the same events as `--fim-check`, and moves nothing either.
+
 The default check hashes every file. `--fast` trusts an unchanged size and
 mtime and skips the read, which is exactly what an attacker restoring a
 file's timestamp defeats — so the help text says so, and a test proves the

@@ -479,30 +479,36 @@ class TestTheLinuxSimulationActuallySimulates(unittest.TestCase):
                         "only find_spec is consulted by the import system")
 
 
-_GUI_ROOT = None
+# One withdrawn Window for the whole process, shared with every other test
+# module that opens widgets: tests/guiroot.py says why there can be only one.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from guiroot import gui_root as _gui_root  # noqa: E402
 
 
-def _gui_root():
-    """One withdrawn ttkbootstrap Window for the whole module.
+class TestEveryWidgetNameTheGuiUsesExists(unittest.TestCase):
+    """The main window called `tb.PanedWindow` from v1 until 2026-09-24.
+    ttkbootstrap 1.x exported it (re-exporting tkinter.ttk, which has the
+    alias); 2.x exports only `Panedwindow`, and requirements.txt's
+    `>=1.14.0` resolves to 2.x on a fresh install, where the window never
+    opened. The dialogs' tests did not catch it because nothing built the
+    main window. This reads every `tb.<Name>` the GUI modules use and asks
+    the installed ttkbootstrap for each one; it needs no display."""
 
-    ttkbootstrap's Style is a singleton that remembers the interpreter it
-    registered its layouts with; a second Window in the same process raised
-    "Layout Round.Toggle not found". Created on first use, destroyed at exit.
-    """
-    global _GUI_ROOT
-    if _GUI_ROOT is None:
-        import atexit
-        import ttkbootstrap as tb
-        _GUI_ROOT = tb.Window(themename="darkly")
-        _GUI_ROOT.withdraw()
-
-        def _close() -> None:
-            try:
-                _GUI_ROOT.destroy()
-            except Exception:
-                pass
-        atexit.register(_close)
-    return _GUI_ROOT
+    def test_every_tb_attribute_the_gui_modules_use_is_exported(self):
+        try:
+            import ttkbootstrap as tb
+        except ImportError:
+            self.skipTest("GUI dependencies are not installed")
+        import ast
+        package = Path(__file__).resolve().parent.parent / "avguard"
+        missing = []
+        for name in ("gui.py", "dialogs.py", "fimpanel.py"):
+            tree = ast.parse((package / name).read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                        and node.value.id == "tb" and not hasattr(tb, node.attr)):
+                    missing.append(f"{name}: tb.{node.attr}")
+        self.assertEqual(missing, [], f"not in ttkbootstrap {getattr(tb, '__version__', '?')}")
 
 
 class TestTheSettingsWindowFitsOnAScreen(unittest.TestCase):

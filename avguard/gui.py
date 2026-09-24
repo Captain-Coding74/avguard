@@ -26,7 +26,7 @@ from ttkbootstrap.constants import (
 )
 from ttkbootstrap.dialogs import Messagebox
 
-from . import config, dialogs, logsetup, scheduling
+from . import config, dialogs, fimpanel, logsetup, scheduling
 from .events import Event, EventStore
 from .cloud import VirusTotalClient
 from . import iocs as iocs_module
@@ -180,7 +180,9 @@ class AVGuardApp(tb.Window):
         self.banner = tb.Label(outer, textvariable=self.banner_var, bootstyle="inverse-secondary",
                                padding=8, anchor="w")
 
-        panes = tb.PanedWindow(outer, orient=HORIZONTAL)
+        # Panedwindow, not PanedWindow: ttkbootstrap 2.x exports only the
+        # first, and 1.x exports both. With the alias the window never opened.
+        panes = tb.Panedwindow(outer, orient=HORIZONTAL)
         panes.pack(fill=BOTH, expand=True)
         self._panes = panes
 
@@ -203,13 +205,16 @@ class AVGuardApp(tb.Window):
         for tag, colour in LEVEL_TAGS.values():
             self.log_text.tag_configure(tag, foreground=colour)
 
-        # --- quarantine --------------------------------------------------
+        # --- quarantine and integrity ------------------------------------
         right = tb.Frame(panes, padding=(8, 0, 0, 0))
         panes.add(right, weight=2)
-        tb.Label(right, text="Quarantine", font=("Segoe UI", 11, "bold")).pack(fill=X, pady=(0, 4))
+        self.tabs = tb.Notebook(right)
+        self.tabs.pack(fill=BOTH, expand=True)
+        quarantine = tb.Frame(self.tabs, padding=(0, 8, 0, 0))
+        self.tabs.add(quarantine, text="Quarantine")
 
         self.tree = tb.Treeview(
-            right, columns=("detected", "when"), show="tree headings", selectmode="browse",
+            quarantine, columns=("detected", "when"), show="tree headings", selectmode="browse",
         )
         self.tree.heading("#0", text="File")
         self.tree.heading("detected", text="Detected as")
@@ -219,7 +224,7 @@ class AVGuardApp(tb.Window):
         self.tree.column("when", width=130, anchor="w")
         self.tree.pack(fill=BOTH, expand=True)
 
-        qbtns = tb.Frame(right, padding=(0, 8))
+        qbtns = tb.Frame(quarantine, padding=(0, 8))
         qbtns.pack(fill=X)
         tb.Button(qbtns, text="Restore", bootstyle="success-outline",
                   command=self._restore_selected).pack(side=LEFT, expand=True, fill=X, padx=2)
@@ -228,8 +233,16 @@ class AVGuardApp(tb.Window):
         tb.Button(qbtns, text="Delete", bootstyle="danger-outline",
                   command=self._delete_selected).pack(side=LEFT, expand=True, fill=X, padx=2)
 
-        tb.Button(right, text="Export everything...", bootstyle="secondary-outline",
+        tb.Button(quarantine, text="Export everything...", bootstyle="secondary-outline",
                   command=self._export_all).pack(fill=X, pady=(0, 4))
+
+        # The file-integrity baseline, beside the quarantine because both are
+        # things the user comes back to look at. Its work runs on a thread of
+        # its own and reports through self.post, like a scan.
+        self.integrity = fimpanel.IntegrityPanel(
+            self.tabs, store_factory=self._fim_store, events=self.events, post=self.post,
+            padding=(0, 8, 0, 0))
+        self.tabs.add(self.integrity, text="Integrity")
 
         # --- controls ----------------------------------------------------
         controls = tb.Frame(outer, padding=(0, 10, 0, 0))
@@ -971,19 +984,10 @@ class AVGuardApp(tb.Window):
 
     def _describe_fim(self) -> str:
         store = self._fim_store()
+        _ok, text = fimpanel.summarize(store)
         if not store.exists():
-            return ("no baseline. Record one from a terminal: "
-                    "avguard --fim-baseline <folder>")
-        try:
-            when = datetime.fromtimestamp(store.baselined_at()).strftime("%Y-%m-%d %H:%M")
-        except (ValueError, OSError):
-            when = "unknown"
-        integrity = store.verify_integrity()
-        state = ("signature holds" if integrity == fim_module.INTEGRITY_OK
-                 else f"SIGNATURE {integrity.upper()} - the baseline was changed outside AVGuard")
-        roots = store.roots()
-        return (f"{store.file_count():,} file(s) under {len(roots)} root(s), baselined {when}; "
-                f"{state}. Check with: avguard --fim-check")
+            return text + " (the Integrity tab, or: avguard --fim-baseline <folder>)"
+        return text + " Check it on the Integrity tab, or with: avguard --fim-check"
 
     def _packs_ok(self) -> bool:
         """Red if any pack is broken or has vanished from disk."""
@@ -1077,6 +1081,10 @@ class AVGuardApp(tb.Window):
             log.exception("error stopping the monitor")
         if self._scan_thread is not None and self._scan_thread.is_alive():
             self._scan_thread.join(timeout=5)
+        try:
+            self.integrity.stop(timeout=5)
+        except Exception:
+            log.exception("error stopping the integrity worker")
         try:
             self.cache.save()
             self.cloud.save_cache()

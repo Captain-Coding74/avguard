@@ -359,7 +359,7 @@ histogram, vectorised" below.)
 | Item | Result |
 |---|---|
 | 1. IOC hash blocklist | SQLite, one lookup per file: 7 µs against a million rows, and no measurable cost inside a scan (551 µs against 550 µs, warm). Manual import, an opt-in MalwareBazaar feed (1,484 hashes in 1 s live; a truncated download changes nothing), and the list is part of the detection generation. Tests 377 → **400** |
-| 2. File integrity monitoring | A signed SQLite baseline (HMAC-SHA256, key under DPAPI) of every file under chosen roots; a check names modified, added and removed files with old and new hashes, records events, and never moves anything. Default hashes everything, `--fast` trusts size and mtime and says what that trades away; both asserted against a file whose mtime was put back. 2,000 files / 596 MB: baseline 1.0 s warm, check 0.73 s, `--fast` 0.21 s. Tests 400 → **421** |
+| 2. File integrity monitoring | A signed SQLite baseline (HMAC-SHA256, key under DPAPI) of every file under chosen roots; a check names modified, added and removed files with old and new hashes, records events, and never moves anything. Default hashes everything, `--fast` trusts size and mtime and says what that trades away; both asserted against a file whose mtime was put back. 2,000 files / 596 MB: baseline 1.0 s warm, check 0.73 s, `--fast` 0.21 s. Tests 400 → **421**. The GUI tab the plan asked for came two days later ("The Integrity tab", below). Tests 491 → **506** |
 | 3. Event bridge to Network Watchdog | Every recorded event is POSTed as JSON (schema 1, frozen) to a URL that is empty by default and set only past a yes/no naming what leaves the machine. A bounded queue and a daemon thread: `record()` is 170 µs without a forwarder, 258 µs with a dead endpoint; 601 events into a blocked endpoint kept the newest 500. Tests 431 → **437** |
 | 4. Explorer right-click scan | Two per-user registry keys, no administrator rights, tested against a fake of winreg; `--pause` keeps the result on screen, in a window when there is no console. **Not yet checked on a real Explorer**: writing to the user's registry was left to the user. Tests 437 → **449** |
 | 5. Fuzzy hashing with TLSH | Built without the dependency, two days after being set aside for want of it. `avguard/tlsh.py` is the digest in Python -- `bytes.translate` for the Pearson gathers, numpy for the histogram -- and it is bit-identical to the reference C++ on every input and chunking tried (the reference was built from source here to check). 16.5 MB/s with numpy, 2.4 MB/s without, 119 MB/s if `py-tlsh` happens to be importable, so each backend has a size cap that keeps one digest near 100 ms. A hand-seeded reference table in the blocklist database; the nearest reference is one soft finding. The thresholds were measured, not inherited: 30 for a near variant stands, the far band moves from 60 to 40, because at 60 one clean executable in thirty would be tagged per hundred references. Tests 449 → **481** |
@@ -500,6 +500,40 @@ scan: before, `Examined 3000, Clean 1326, Skipped 2, Errors 1672`; after,
 no traceback either time. Six tests, one replacing the old "error or skip"
 one and one a tree scan that empties the folder from inside its own
 callback. Tests 486 → **491**.
+
+**The Integrity tab, 2026-09-24.** Item 2's text said "CLI first, GUI tab
+after it works". The tab is `avguard/fimpanel.py`, a page beside Quarantine
+in the main window: the baseline's state on one line, the changes with both
+hashes, Check now, Accept selected, Cancel, Baseline a folder, and the
+`--fast` trade as a switch with its cost written next to it. It runs the
+same `FimStore` as the CLI on a worker thread and reports through the
+window's `post()`, so no widget is touched off the GUI thread. The engine
+gained two optional hooks for it, `progress(done, total)` and
+`should_stop()`, and now walks the roots before it hashes anything so the
+total is known from the first call. Measured over 2,000 files / 131 MB,
+warm: baseline 0.53 s without the hooks and 0.52 s with them, a check
+0.45 s either way, `--fast` 0.06 s either way; five or six progress posts
+per run, because the hook is rate-limited to ten a second (the window's
+pump drains 200 callables a tick, and a post per file would have left the
+bar minutes behind the work); the pre-walk is 30 ms of that check; the
+refresh the tab does on the GUI thread after each operation (count, roots,
+date and the HMAC over a 384 KB baseline) is 2 ms. A cancelled baseline
+writes nothing and a cancelled check records nothing, both asserted.
+
+Two things the window found. The tab's first layout asked for 439 px of
+height, and at the window's minimum size that pushed the scan buttons off
+the bottom; it asks for five list rows now, not ten, and wraps its text to
+the width the pane gives (418 px at 900 x 560, everything visible). And
+`tb.PanedWindow`, which the main window had used since v1, is not a name
+ttkbootstrap 2.x exports: 1.x re-exported tkinter.ttk, which has the
+alias, 2.x exports only `Panedwindow`, and `requirements.txt`'s `>=1.14.0`
+resolves to 2.x on a fresh install today, where the window never opened.
+Nothing had caught it because no test built the main window; one now reads
+every `tb.<Name>` the GUI modules use and asks the installed ttkbootstrap
+for each. The tab was driven on a real window under Xvfb here (baseline,
+three changes, check, accept; Health and History opened beside it) and the
+suite's window tests run on the Windows CI runner, which has a display. Not
+yet on the owner's desktop.
 
 **The manual test plan, 2026-09-24.** Ten tests, written by the project's
 owner, of what a user would do to a scanner. Tests 1 to 3 were run on
