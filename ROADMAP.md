@@ -501,6 +501,36 @@ no traceback either time. Six tests, one replacing the old "error or skip"
 one and one a tree scan that empties the folder from inside its own
 callback. Tests 486 → **491**.
 
+**The manual test plan, 2026-09-24.** Ten tests, written by the project's
+owner, of what a user would do to a scanner. Tests 1 to 3 were run on
+their Windows machine with the GUI and recorded as passed in their plan;
+the Activity log they shared shows test 2 (an EICAR zip detected inside
+`eicar_com2.zip!eicar_com.zip!eicar.com` and quarantined). Tests 4 to 8
+and 10 were run here, on Linux, through the CLI against the code on main;
+test 9 needs the Windows desktop and was not run here. The fixtures come
+from `tools/make_testplan_kit.py`, which writes one folder per test and a
+README with the expected output; EICAR and the selftest marker are
+assembled from bytes there, because the first version of that script
+carried the marker verbatim and real-time protection quarantined the
+download of the script itself, which is test 1 passing in an
+inconvenient place.
+
+| # | Test | Expected | Result |
+|---|---|---|---|
+| 1 | Selftest marker | THREAT | Passed (owner's run): hard signature |
+| 2 | EICAR zip under real-time protection | THREAT, quarantined | Passed (owner's run): the archive is inspected in memory and moved |
+| 3 | Synthetic injector PE | SUSPICIOUS | Passed (owner's run): a medium PE heuristic, never MALICIOUS alone |
+| 4 | EICAR in a nested zip | THREAT | Passed: two and three levels deep are MALICIOUS, the member path printed as `outer.zip!inner.zip!eicar.com`. A fourth level is not opened (`MAX_DEPTH` in `archives.py`); the kit's four-deep zip scans clean by design |
+| 5 | Zip of clean files | CLEAN | Passed: 12 members of 7 kinds, a nested zip among them, all inspected, exit 0 |
+| 6 | Clean PowerShell build script | CLEAN | Passed: `-NoProfile`, `-ExecutionPolicy Bypass`, `-WindowStyle Hidden`, `Invoke-WebRequest` and `Start-Process` together score nothing; the same context plus an encoded-command flag is SUSPICIOUS (medium), and stays short of MALICIOUS |
+| 7 | Random 64 KB blob | CLEAN | Passed as `.bin`, `.exe` and `.dll`: entropy alone is 25 and SUSPICIOUS starts at 50 |
+| 8 | Modify a detected file | re-scanned | Passed: MALICIOUS, the marker line removed → CLEAN, put back → MALICIOUS. The cache is keyed on path, size and mtime |
+| 9 | Rename a detected file under real-time protection | THREAT | Not run here. A rename arrives as a `moved` event and the destination name is what is scanned; the destination is a new path, so the cache cannot answer for it |
+| 10 | Delete files during a scan | graceful skip | Failed as written before `23b2e12`: a vanished file was an ERROR. Now a skip; 2,000 of 3,000 files deleted under a running scan gives `Examined 3000, Clean 1093, Skipped 1907, Errors 0`, exit 0, no traceback |
+
+The plan found one thing to change (test 10) and one thing to know
+(the nesting limit in test 4). The other expectations held as written.
+
 ## Deliberately not doing
 
 - **Real-time process, memory or kernel monitoring.** Needs a driver and admin
