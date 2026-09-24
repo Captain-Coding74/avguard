@@ -253,9 +253,83 @@ class TestScanner(TempCase):
     def test_empty_file_is_clean(self):
         self.assertIs(self.scanner.scan(self.write("empty.txt", b"")).level, Level.CLEAN)
 
-    def test_missing_file_reports_error_not_crash(self):
+    def test_a_missing_file_is_a_skip_with_a_reason_not_an_error(self):
+        """Seen in the Activity log: a browser's download being renamed and
+        a restore's own working file, both listed by the watcher and gone
+        by the time the scan reached them, each a red 'cannot stat' line.
+        The world changing under the scan is not a failure of the scan."""
         verdict = self.scanner.scan(self.tmp / "nope.txt")
-        self.assertIn(verdict.level, (Level.ERROR, Level.SKIPPED))
+        self.assertIs(verdict.level, Level.SKIPPED)
+        self.assertIn("vanished", verdict.reasons[0])
+
+    def test_a_file_that_vanishes_between_the_guard_and_the_stat_is_skipped(self):
+        target = self.write("blink.txt", b"here for a moment")
+
+        def guard_then_unlink(path):
+            target.unlink()
+            return None
+
+        with mock.patch.object(self.scanner, "_guard", guard_then_unlink):
+            verdict = self.scanner.scan(target)
+        self.assertIs(verdict.level, Level.SKIPPED)
+        self.assertIn("vanished", verdict.reasons[0])
+
+    def test_a_file_that_vanishes_while_being_read_is_skipped(self):
+        target = self.write("blink.txt", b"here for a moment")
+        real_read = self.scanner._read_facts
+
+        def unlink_then_read(path, size, mtime_ns, want_tlsh=None):
+            target.unlink()
+            return real_read(path, size, mtime_ns, want_tlsh)
+
+        with mock.patch.object(self.scanner, "_read_facts", unlink_then_read):
+            verdict = self.scanner.scan(target)
+        self.assertIs(verdict.level, Level.SKIPPED)
+        self.assertIn("vanished while", verdict.reasons[0])
+
+    def test_a_file_that_vanishes_during_yara_or_archive_inspection_is_skipped(self):
+        """A file over the buffer limit is opened again for YARA, and an
+        archive is opened again to be inspected."""
+        target = self.write("blink.zip", b"PK\x03\x04" + b"\x00" * 200)
+        for stage in ("_yara_matches", "_archive_findings"):
+            with self.subTest(stage=stage), \
+                    mock.patch.object(self.scanner, stage,
+                                      side_effect=FileNotFoundError(2, "gone", str(target))):
+                verdict = self.scanner.scan(target, use_cache=False)
+            self.assertIs(verdict.level, Level.SKIPPED)
+            self.assertIn("vanished while", verdict.reasons[0])
+
+    def test_a_file_that_cannot_be_read_for_another_reason_is_still_an_error(self):
+        target = self.write("locked.txt", b"still here, still unreadable")
+        with mock.patch.object(self.scanner, "_read_facts",
+                               side_effect=PermissionError(13, "Permission denied", str(target))):
+            verdict = self.scanner.scan(target)
+        self.assertIs(verdict.level, Level.ERROR)
+        self.assertIn("cannot read", verdict.reasons[0])
+
+    def test_a_tree_scan_counts_vanished_files_as_skipped(self):
+        """Delete files under a running scan, as a user emptying a folder
+        does: every one is a skip, none an error, and the walk finishes."""
+        folder = self.tmp / "emptying"
+        folder.mkdir()
+        for i in range(60):
+            (folder / f"f{i:02d}.txt").write_text(f"file {i}\n" * 50)
+        levels: list[Level] = []
+        seen = 0
+
+        def report(verdict):
+            nonlocal seen
+            levels.append(verdict.level)
+            seen += 1
+            if seen == 5:
+                for leftover in folder.glob("f*.txt"):
+                    leftover.unlink()
+
+        self.scanner.scan_tree(folder, on_verdict=report)
+        self.assertEqual(len(levels), 60)
+        self.assertNotIn(Level.ERROR, levels)
+        self.assertIn(Level.SKIPPED, levels)
+        self.assertIn(Level.CLEAN, levels)
 
     def test_cache_prevents_a_second_read(self):
         target = self.write("cached.txt", "hello world")

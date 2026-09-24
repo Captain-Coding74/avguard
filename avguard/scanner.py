@@ -113,6 +113,14 @@ RECENT_WRITE_NS = 2 * 10**9
 # change of mind. One stat, and only when a scan happens.
 PACKS_CHECK_INTERVAL = 2.0
 
+# A file that disappears between being listed and being read is a SKIPPED
+# verdict with one of these reasons, not an ERROR. Editors, browsers and this
+# program's own quarantine all create files that live for a moment; under
+# real-time protection every one of them reached the scan, and each one
+# was a red "cannot stat: [WinError 2]" line in the Activity log.
+VANISHED_BEFORE = "vanished before it could be scanned"
+VANISHED_DURING = "vanished while it was being scanned"
+
 # Heuristics never add up to a condemnation, however many of them agree.
 #
 # Found the hard way: cygwin1.dll trips the process-injection rule (medium, 50)
@@ -1073,6 +1081,13 @@ class Scanner:
 
         try:
             stat = path.lstat()
+        except FileNotFoundError:
+            # Listed a moment ago, gone now: an editor's temp file, a
+            # browser's download being renamed, a restore's own working
+            # file. Seen in the Activity log as red "cannot stat: [WinError
+            # 2]" lines for files this program itself had just moved. That
+            # is the world changing under the scan, not a failure of it.
+            return Verdict(path, Level.SKIPPED, [VANISHED_BEFORE])
         except OSError as exc:
             return Verdict(path, Level.ERROR, [f"cannot stat: {exc}"])
 
@@ -1084,6 +1099,8 @@ class Scanner:
             return Verdict(path, Level.SKIPPED, ["reparse point, not followed"])
 
         if not os.path.isfile(path):
+            if not os.path.lexists(path):
+                return Verdict(path, Level.SKIPPED, [VANISHED_BEFORE])
             return Verdict(path, Level.SKIPPED, ["not a regular file"])
 
         if stat.st_size == 0:
@@ -1380,7 +1397,12 @@ class Scanner:
         ruleset = self._ruleset
         cache = self.cache
         references = self._tlsh_refs
-        stat = path.stat()
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            return Verdict(path, Level.SKIPPED, [VANISHED_BEFORE])
+        except OSError as exc:
+            return Verdict(path, Level.ERROR, [f"cannot stat: {exc}"])
         size, mtime_ns = stat.st_size, stat.st_mtime_ns
 
         if use_cache:
@@ -1391,6 +1413,8 @@ class Scanner:
         try:
             facts = self._read_facts(path, size, mtime_ns,
                                      want_tlsh=self._wants_tlsh(size, references))
+        except FileNotFoundError:
+            return Verdict(path, Level.SKIPPED, [VANISHED_DURING])
         except (OSError, MemoryError) as exc:
             return Verdict(path, Level.ERROR, [f"cannot read: {exc}"])
 
@@ -1424,9 +1448,14 @@ class Scanner:
             findings.append(Finding("signature", name, WEIGHT_SIGNATURE,
                                     f"matched the byte signature for {name}", hard=True))
 
-        findings.extend(self._yara_matches(facts, ruleset))
-        findings.extend(self._pe_findings(facts))
-        findings.extend(self._archive_findings(facts, ruleset))
+        # A file over the buffer limit is opened again for YARA, and an
+        # archive is opened again to be inspected; either can find it gone.
+        try:
+            findings.extend(self._yara_matches(facts, ruleset))
+            findings.extend(self._pe_findings(facts))
+            findings.extend(self._archive_findings(facts, ruleset))
+        except FileNotFoundError:
+            return Verdict(path, Level.SKIPPED, [VANISHED_DURING])
 
         # Similarity to a known sample: the nearest reference, if it is near
         # enough. One finding, however many references are close -- ten

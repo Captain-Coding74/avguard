@@ -480,6 +480,27 @@ the old 0.25 s tick having rounded it up; an idle pool and debouncer cost
 the workers make to a blocking one, and another gives three workers a
 one-slot queue and checks all three leave. Tests 482 → **486**.
 
+**A file that vanishes under the scan is a skip, not an error.** The
+Activity log during the manual test plan showed red `cannot stat:
+[WinError 2]` lines for a browser download being renamed out from under
+the watcher and for a restore's own `.restoring` working file: files this
+program or the user had just moved, reported as failures of the scan.
+Editors, browsers and the quarantine all create files that live for a
+moment, and under real-time protection every one reaches a worker. Now
+`FileNotFoundError` at any point -- the guard's `lstat`, the `stat` before
+the read, the read itself, or the second open a large file gets for YARA
+and an archive gets for inspection -- is a SKIPPED verdict with the reason
+"vanished before it could be scanned" or "vanished while it was being
+scanned". The GUI logs a skip at debug, so the red lines are gone; every
+other `OSError` (a lock, a permission) is still an error, and a test says
+so. Not a detection change and not cached, so no version bump. Measured
+with the test plan's fixture, 2,000 of 3,000 files deleted under a running
+scan: before, `Examined 3000, Clean 1326, Skipped 2, Errors 1672`; after,
+`Examined 3000, Clean 1093, Skipped 1907, Errors 0`, exit 0 both times,
+no traceback either time. Six tests, one replacing the old "error or skip"
+one and one a tree scan that empties the folder from inside its own
+callback. Tests 486 → **491**.
+
 ## Deliberately not doing
 
 - **Real-time process, memory or kernel monitoring.** Needs a driver and admin
