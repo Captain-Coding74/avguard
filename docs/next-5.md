@@ -124,3 +124,21 @@ The one mechanism that produces "exit 1, no annotation" is the reporter
 raising while printing a failure message the runner's cp1252 console could
 not encode, which the UTF-8 change closes. If a later run fails, its
 annotation will say what.
+
+*Later (2026-09-24):* a second mechanism, and probably the real one. Run
+#34, the push of the TLSH commit to main, failed on Windows with exit 1
+and no annotation after the same tree had passed the full suite on its
+pull request eight minutes earlier. The log shows not a test failure but
+the interpreter dying: `Fatal Python error: _PySemaphore_Wakeup:
+parking_lot: ReleaseSemaphore failed (error: 6)` -- ERROR_INVALID_HANDLE
+-- in the main thread inside `queue.put_nowait` → `Condition.notify`, as a
+test's cleanup stopped a realtime monitor whose two workers were parked in
+`queue.get(timeout=0.5)`. That is CPython 3.13's threading internals on
+Windows (a timed wait racing a wake-up), in `watcher.py`, which the commit
+did not touch; a fatal error prints to stderr and produces no annotation,
+which is exactly run #29's shape. What this program can do about it is
+stop the workers without a timed wait -- `queue.get()` blocking on a
+sentinel, or `Queue.shutdown()` on 3.13 -- and that is a change to the
+watcher's stop protocol to be made and measured on its own, not folded
+into an unrelated commit. Until then a run that dies this way is re-run
+once, and the second run is the answer.

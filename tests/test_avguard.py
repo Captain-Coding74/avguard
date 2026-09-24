@@ -17,6 +17,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -67,6 +68,7 @@ if _os.environ["AVGUARD_DATA"] == _test_data:
 
 
 from avguard import config
+from avguard import scanner as scanner_module
 from avguard.allowlist import Allowlist
 from avguard.cloud import TokenBucket, VirusTotalClient
 from avguard.protection import SelfProtection, matches_excluded_glob
@@ -327,6 +329,29 @@ class TestScanner(TempCase):
         self.assertAlmostEqual(shannon_entropy([10], 10), 0.0)
         flat = [4] * 256
         self.assertAlmostEqual(shannon_entropy(flat, 1024), 8.0, places=6)
+
+    def test_the_byte_counts_are_the_same_with_numpy_and_without(self):
+        """numpy counts the bytes of each chunk in one call; the byte loop is
+        the fallback for an install without it. Same counts, so the same
+        entropy, on a file with every byte value, an uneven mix, and more
+        than one 64 KB chunk so the counts have to accumulate."""
+        data = bytes(range(256)) * 300 + bytes(1000) + bytes(range(255, 127, -1)) * 7
+        target = self.write("bytes.bin", data)
+        stat = target.stat()
+        with_numpy = self.scanner._read_facts(target, stat.st_size, stat.st_mtime_ns,
+                                              want_tlsh=False)
+        with mock.patch.object(scanner_module, "np", None):
+            with_loop = self.scanner._read_facts(target, stat.st_size, stat.st_mtime_ns,
+                                                 want_tlsh=False)
+        counts = [0] * 256
+        for byte in data:
+            counts[byte] += 1
+        expected = shannon_entropy(counts, len(data))
+        self.assertEqual(with_loop.entropy, expected)
+        self.assertEqual(with_numpy.entropy, expected,
+                         "the numpy path must produce exactly the loop's counts")
+        self.assertEqual(with_numpy.sha256, with_loop.sha256)
+        self.assertEqual(with_numpy.signature_hits, with_loop.signature_hits)
 
 
 # --------------------------------------------------------------- quarantine

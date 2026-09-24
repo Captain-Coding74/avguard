@@ -351,9 +351,10 @@ disaster now.
 
 [docs/improvements.md](docs/improvements.md) is a five-item plan handed to
 this project on 2026-09-22; each item lands here with what was measured. (Its
-preface says a numpy histogram shipped separately. It did not: nothing in
+preface says a numpy histogram shipped separately. It had not: nothing in
 `avguard/` imported numpy until item 5, which uses it when present and works
-without it.)
+without it. The histogram followed in the commit after item 5; see "The
+histogram, vectorised" below.)
 
 | Item | Result |
 |---|---|
@@ -423,13 +424,35 @@ and the README says to keep the set to the families that matter.
 **What the digest costs, and what it does not.** `_read_facts` on a 2 MB
 file: 139 ms without the digest, 259 ms with it; on 64 MB, 4.2 s against
 8.5 s, which is why 64 MB is over the cap and gets no digest. The facts
-pass itself runs at 16 MB/s because the entropy histogram is a Python loop
-over every byte -- the numpy histogram the plan's preface calls shipped is
-the obvious next step now that numpy is listed, and it is a separate item.
+pass itself ran at 16 MB/s because the entropy histogram was a Python loop
+over every byte -- the numpy histogram the plan's preface calls shipped was
+the obvious next step once numpy was listed, and it is the next entry.
 Nothing is digested until a reference exists: an empty table costs nothing,
 which is the state every install starts in. Matching is one vectorised pass:
 10,000 references cost 2.5 ms per digested file with numpy and 53 ms
 without.
+
+**The histogram, vectorised.** The one-pass read behind every verdict
+counted bytes with `for byte in chunk: histogram[byte] += 1`, and that loop
+was most of the pass. Replaced with `np.bincount` over each chunk when numpy
+is importable; the loop stays as the fallback and a test holds both to the
+same 256 counts on a file with every byte value across more than one chunk.
+Not a detection change: the counts are identical integers, so the entropy
+is bit-identical and `DETECTION_VERSION` stays at 15. Measured with the
+same files, best of three, `_read_facts` alone:
+
+| file | byte loop | `np.bincount` | speedup |
+|---|---|---|---|
+| 64 MB | 3.73 s, 18 MB/s | 0.32 s, 207 MB/s | 11.5× |
+| 2 MB | 120 ms | 14 ms | 8.8× |
+| 256 KB | 13 ms | 1 ms | 9.0× |
+
+A whole scan, cache off, of 978 shared libraries (220 MB) with YARA and
+everything else in the pipeline: 15.9 s with the loop, 2.5 s with numpy,
+14 against 92 MB/s. The TLSH digest's own cost is unchanged (its 16 MB/s
+is the checksum chain, not the histogram), so its size caps stand; a
+digested 2 MB file now costs 14 ms of facts plus 120 ms of digest rather
+than 120 plus 120. Tests 481 → **482**.
 
 ## Deliberately not doing
 
