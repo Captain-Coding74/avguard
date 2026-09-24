@@ -77,6 +77,17 @@ write("4-nested/eicar-four-deep.zip",
 write("4-nested/marker-in-zip-in-zip.zip",
       zipped({"inner.zip": zipped({"marker.txt": MARKER + b"\n"})}))
 
+# 5. A zip of ordinary files with a zip inside it: every member is inspected
+#    in memory and nothing is found.
+write("5-clean/clean-files.zip", zipped({
+    "readme.txt": b"Ordinary text in an ordinary zip.\n",
+    "config.json": b'{"expect": "clean", "items": [1, 2, 3]}\n',
+    "data.csv": b"id,value\n" + b"".join(f"{i},{i * i}\n".encode() for i in range(100)),
+    "script.py": b"print('hello from the clean zip')\n",
+    "random.bin": chain(16_384, b"testplan-clean-random"),
+    "inner.zip": zipped({"inner/notes.md": b"# Notes\nA text file inside the nested zip.\n"}),
+}))
+
 # 6. PowerShell. A realistic build script uses every "scary" flag and must
 #    scan CLEAN; the rule needs a PowerShell context AND an encoded payload.
 write("6-powershell/build.ps1", b"""# Build script: the flags every installer and CI runner uses.
@@ -122,8 +133,8 @@ Scan a folder with:   python -m avguard --scan <folder> -v
 result: exit 0 with no threats, exit 1 when something is MALICIOUS.)
 
 4  Recursive archive scanning
-   4-nested/eicar-in-zip-in-zip.zip     [MALICIOUS]  "matched the byte signature for
-                                        EICAR-Test-File inside ...!inner.zip!eicar.com"
+   4-nested/eicar-in-zip-in-zip.zip     [MALICIOUS]  "matched the byte signature for EICAR-Test-File
+                                        inside eicar-in-zip-in-zip.zip!inner.zip!eicar.com"
    4-nested/eicar-three-deep.zip        [MALICIOUS]  "... inside ...!level2.zip!level3.zip!eicar.com"
    4-nested/marker-in-zip-in-zip.zip    [MALICIOUS]  same as the first, with AVGuard's own
                                         marker (use it if Defender eats the EICAR zips)
@@ -133,7 +144,9 @@ result: exit 0 with no threats, exit 1 when something is MALICIOUS.)
                                         If a deeper limit is wanted, that is a settings
                                         decision, not a bug.
 
-5  Clean zip                            use avguard-clean-scan.zip: 12 of 12 [clean], exit 0
+5  Clean zip
+   5-clean/clean-files.zip              [clean]      six ordinary members, a zip among them,
+                                        all inspected in memory; Threats : 0, exit 0
 
 6  PowerShell false positives
    6-powershell/build.ps1               [clean]      -NoProfile, -ExecutionPolicy Bypass,

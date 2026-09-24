@@ -68,15 +68,51 @@ lot.
 
 Real antivirus is tested with the EICAR file, but Windows Defender deletes an
 EICAR file before your own scanner can open it. So AVGuard also recognises a
-harmless marker of its own that nothing else reacts to:
+harmless marker of its own that nothing else reacts to. Write it outside
+AVGuard's own folder: the program never scans its own directory, so a file
+written into the project tree is reported as skipped, not found. The
+commands below run from the project folder and use the folder beside it:
 
 ```bash
-python -c "from avguard.scanner import SELFTEST_MARKER; open('selftest.txt','wb').write(SELFTEST_MARKER)"
-python -m avguard --scan selftest.txt
+python -c "from avguard.scanner import SELFTEST_MARKER; open('../selftest.txt','wb').write(SELFTEST_MARKER)"
+python -m avguard --scan ../selftest.txt
 ```
 
-That should report `[MALICIOUS] selftest.txt` with reason
-`signature AVGuard-Selftest-Marker`.
+That should report `[MALICIOUS] ../selftest.txt` with the reason
+`matched the byte signature for AVGuard-Selftest-Marker`.
+
+### The test kit
+
+For a fuller check there is a kit: `tools/make_testplan_kit.py` writes a
+folder of fixtures for tests 4 to 10 of the manual plan whose results are in
+ROADMAP.md (tests 1 to 3 are done in the GUI with files of your own), with a
+README that says what each scan must print. Its first argument is where to
+write; point it beside the project folder, outside the tree AVGuard refuses
+to scan, and scan it there:
+
+```bash
+python tools/make_testplan_kit.py ../avguard-testplan
+python -m avguard --scan ../avguard-testplan -v
+```
+
+What is in it, and the verdict each part exists to produce:
+
+| folder | what it holds | expected |
+|---|---|---|
+| `4-nested/` | EICAR two and three zips deep, and the selftest marker two deep | MALICIOUS, naming the member: `eicar-in-zip-in-zip.zip!inner.zip!eicar.com`. A four-deep zip is there too and scans clean by design: a zip inside a zip inside a zip is opened, a fourth level is not |
+| `5-clean/` | a zip of six ordinary files with a zip inside it | CLEAN, every member inspected in memory |
+| `6-powershell/` | a build script with every flag installers use, and one launching an encoded payload | the build script CLEAN; the encoded launch SUSPICIOUS, never MALICIOUS |
+| `7-entropy/` | 64 KB of random bytes as `.bin`, `.exe` and `.dll` | all CLEAN: entropy alone scores 25 and SUSPICIOUS starts at 50 |
+| `8-cache/` | a marker file to scan, edit, and scan again | MALICIOUS, then CLEAN with the marker line removed, then MALICIOUS with it back |
+| `9-rename/` | a marker file to rename while real-time protection watches | detected under its new name |
+| `10-delete/` | 3,000 files to delete while a scan runs | every vanished file a skip, none an error, exit 0 |
+
+EICAR and the marker are assembled from bytes inside the script, so the
+script itself scans clean and real-time protection leaves a download of it
+alone. The files it writes are samples: Windows Defender will take the EICAR
+ones unless the folder is excluded, and the marker-in-zip fixture is there so
+that test 4 can still be run once they are gone. Nothing in the kit is moved
+unless you pass `--quarantine` or have automatic quarantine on.
 
 ## What it actually detects
 
