@@ -925,10 +925,13 @@ class AVGuardApp(tb.Window):
                 feed = "daily feed on, not fetched yet"
         else:
             feed = "daily feed off - nothing is fetched"
+        references = store.tlsh_count()
+        similarity = (f"; {references:,} TLSH reference(s) for similarity"
+                      if references else "")
         if not total:
-            return f"empty; {feed}. Import hashes with: avguard --iocs-import <file>"
+            return f"empty; {feed}{similarity}. Import hashes with: avguard --iocs-import <file>"
         by_source = ", ".join(f"{n:,} from {source}" for source, n in store.sources().items())
-        return f"{total:,} hash(es) ({by_source}); {feed}"
+        return f"{total:,} hash(es) ({by_source}); {feed}{similarity}"
 
     def _update_blocklist_feed(self) -> None:
         """The daily feed check: off the GUI thread, and only when opted in.

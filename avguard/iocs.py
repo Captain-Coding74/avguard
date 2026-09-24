@@ -25,6 +25,13 @@ list. Why a transaction and not "build beside and os.replace": Windows will
 not replace a file another handle has open, and the running GUI holds one.
 A transaction gives the same guarantee -- a bad download changes nothing --
 without the file dance.
+
+The same database holds a second, smaller table: TLSH digests of known
+samples, for the similarity match in `avguard/tlsh.py`. A line of
+`--iocs-import` that looks like a TLSH digest ("T1" + 70 hex, an optional
+",family" after it) lands there instead of in the hash table. Those rows are
+detection state too, so they are part of the generation token, and a change
+to them is noticed by a running scanner the same way a hash import is.
 """
 
 from __future__ import annotations
@@ -41,6 +48,7 @@ from pathlib import Path
 from typing import Iterable
 
 from . import config
+from . import tlsh as tlsh_module
 
 log = logging.getLogger(__name__)
 
@@ -61,6 +69,16 @@ USER_AGENT = "AVGuard (https://github.com/Captain-Coding74/avguard)"
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
+# Past this many TLSH references the similarity match starts crying wolf.
+# Measured with tools/tlsh_calibration.py: every 1,000 references mark about
+# 1% of clean executables (5% of files of every kind) SUSPICIOUS on
+# resemblance alone, because the chance that SOME reference sits within
+# distance 30 of an unrelated file grows with the set. The set is meant to
+# be seeded by hand with families that matter here, not with a feed. Logged
+# once, at load. (Cost is not the limit: 10,000 references measured 2.5 ms
+# per digested file with numpy, 53 ms without.)
+TLSH_WARN_REFERENCES = 1_000
+
 
 class IocError(RuntimeError):
     """Something the blocklist could not do; the list is unchanged."""
@@ -77,11 +95,27 @@ class ImportResult:
     added: int = 0
     already_known: int = 0
     rejected: int = 0
+    tlsh_added: int = 0
+    tlsh_known: int = 0
 
     def describe(self) -> str:
-        return (f"{self.added:,} new hash(es) from source '{self.source}'; "
+        text = (f"{self.added:,} new hash(es) from source '{self.source}'; "
                 f"{self.already_known:,} already known, {self.rejected:,} line(s) "
-                f"rejected (not a SHA-256)")
+                f"rejected (not a SHA-256 or a TLSH digest)")
+        if self.tlsh_added or self.tlsh_known:
+            text += (f"; {self.tlsh_added:,} new TLSH reference(s), "
+                     f"{self.tlsh_known:,} already known")
+        return text
+
+
+@dataclass
+class ParsedLines:
+    """What an import file held: hashes, TLSH references, and the rest."""
+
+    hashes: list[bytes]
+    tlsh: list[tuple[str, str]]   # (canonical digest, family)
+    rejected: int
+    seen: int
 
 
 @dataclass
@@ -97,7 +131,20 @@ def parse_hashes(lines: Iterable[str]) -> tuple[list[bytes], int, int]:
     Defensive on purpose: `#` comments, quotes, a trailing comma or a CSV
     tail are all stripped; what is left must be exactly 64 hex characters.
     """
+    parsed = parse_lines(lines)
+    return parsed.hashes, parsed.rejected + len(parsed.tlsh), parsed.seen
+
+
+def parse_lines(lines: Iterable[str]) -> ParsedLines:
+    """Every line is a SHA-256, a TLSH digest with an optional family, or rejected.
+
+    A TLSH line is "T1" + 70 hex characters (the bare 70 are accepted too),
+    then optionally a comma and the family name -- what MalwareBazaar calls
+    the signature. Anything after a second comma is ignored, so a CSV row
+    pasted from a report parses as long as the digest comes first.
+    """
     digests: list[bytes] = []
+    references: list[tuple[str, str]] = []
     rejected = 0
     seen = 0
     for raw in lines:
@@ -105,12 +152,18 @@ def parse_hashes(lines: Iterable[str]) -> tuple[list[bytes], int, int]:
         if not line or line.startswith("#"):
             continue
         seen += 1
-        token = line.split(",", 1)[0].strip().strip("\"'").lower()
-        if _HEX64.match(token):
+        first, _, rest = line.partition(",")
+        token = first.strip().strip("\"'")
+        if _HEX64.match(token.lower()):
             digests.append(bytes.fromhex(token))
-        else:
-            rejected += 1
-    return digests, rejected, seen
+            continue
+        canonical = tlsh_module.normalize(token)
+        if canonical is not None:
+            family = rest.split(",", 1)[0].strip().strip("\"'")
+            references.append((canonical, family))
+            continue
+        rejected += 1
+    return ParsedLines(digests, references, rejected, seen)
 
 
 class IocStore:
@@ -137,6 +190,10 @@ class IocStore:
                 "digest BLOB PRIMARY KEY, source TEXT NOT NULL, added_at REAL NOT NULL"
                 ") WITHOUT ROWID")
             conn.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS tlsh("
+                "digest TEXT PRIMARY KEY, family TEXT NOT NULL, source TEXT NOT NULL, "
+                "added_at REAL NOT NULL) WITHOUT ROWID")
             conn.commit()
             self._local.conn = conn
         return conn
@@ -211,8 +268,81 @@ class IocStore:
 
         Skip this and a file cached CLEAN before a feed update replays CLEAN
         forever -- the DETECTION_VERSION incident with a different trigger.
+        The TLSH references count too: a file cached CLEAN before a family's
+        digest was imported must be measured against it.
         """
-        return f"{self.version()}:{self.count()}"
+        return f"{self.version()}:{self.count()}:{self.tlsh_count()}"
+
+    # ----------------------------------------------------------------- tlsh
+
+    def tlsh_count(self) -> int:
+        try:
+            return int(self._conn().execute("SELECT COUNT(*) FROM tlsh").fetchone()[0])
+        except sqlite3.Error:
+            return 0
+
+    def tlsh_references(self) -> "tlsh_module.ReferenceSet":
+        """Every reference digest, as the object the scanner matches against.
+
+        Loaded whole: the table is hand-seeded and small, and the match is a
+        vectorised pass over all of it. Never raises; a broken table is an
+        empty set and one warning.
+        """
+        try:
+            rows = self._conn().execute(
+                "SELECT digest, family, source FROM tlsh ORDER BY digest").fetchall()
+        except sqlite3.Error as exc:
+            if not self._warned:
+                self._warned = True
+                log.warning("TLSH references could not be read; similarity is off "
+                            "until they can: %s", exc)
+            return tlsh_module.ReferenceSet()
+        references = tlsh_module.ReferenceSet(
+            tlsh_module.Reference(str(d), str(f), str(s)) for d, f, s in rows)
+        if len(references) > TLSH_WARN_REFERENCES:
+            log.warning("%s TLSH references loaded; measured on this program's benign "
+                        "corpus, every 1,000 references mark about 1%% of clean "
+                        "executables SUSPICIOUS on resemblance alone. Keep the set to "
+                        "the families that matter here.", f"{len(references):,}")
+        return references
+
+    def import_tlsh(self, references: Iterable[tuple[str, str]], source: str) -> ImportResult:
+        """Add (digest, family) pairs under one source. One transaction."""
+        source = (source or "manual").strip() or "manual"
+        rows = []
+        for digest, family in references:
+            canonical = tlsh_module.normalize(digest)
+            if canonical is not None:
+                rows.append((canonical, (family or "").strip(), source))
+        result = ImportResult(source=source, lines=len(rows))
+        with self._write_lock:
+            conn = self._conn()
+            before = conn.total_changes
+            now = time.time()
+            with conn:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO tlsh(digest, family, source, added_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    ((d, f, s, now) for d, f, s in rows))
+                added = conn.total_changes - before
+                if added:
+                    self._set_meta(conn, "version", str(self.version() + 1))
+        result.tlsh_added = added
+        result.tlsh_known = len(rows) - added
+        return result
+
+    def remove_tlsh(self, digest: str) -> bool:
+        canonical = tlsh_module.normalize(digest)
+        if canonical is None:
+            return False
+        with self._write_lock:
+            conn = self._conn()
+            with conn:
+                cursor = conn.execute("DELETE FROM tlsh WHERE digest = ?", (canonical,))
+                removed = cursor.rowcount > 0
+                if removed:
+                    self._set_meta(conn, "version", str(self.version() + 1))
+        return removed
 
     # -------------------------------------------------------------- writing
 
@@ -237,14 +367,18 @@ class IocStore:
         return result
 
     def import_lines(self, lines: Iterable[str], source: str = "manual") -> ImportResult:
-        digests, rejected, seen = parse_hashes(lines)
-        result = self.import_digests(digests, source)
-        result.lines = seen
-        result.rejected = rejected
+        parsed = parse_lines(lines)
+        result = self.import_digests(parsed.hashes, source)
+        if parsed.tlsh:
+            references = self.import_tlsh(parsed.tlsh, source)
+            result.tlsh_added = references.tlsh_added
+            result.tlsh_known = references.tlsh_known
+        result.lines = parsed.seen
+        result.rejected = parsed.rejected
         return result
 
     def import_file(self, path: Path | str, source: str = "manual") -> ImportResult:
-        """One hex SHA-256 per line; `#` starts a comment."""
+        """One hex SHA-256 or one TLSH digest per line; `#` starts a comment."""
         text = Path(path).read_text(encoding="utf-8", errors="replace")
         return self.import_lines(text.splitlines(), source)
 
@@ -270,7 +404,10 @@ class IocStore:
                 removed = cursor.rowcount
                 if removed:
                     self._bump(conn, -removed)
-        return removed
+                references = conn.execute("DELETE FROM tlsh WHERE source = ?", (source,)).rowcount
+                if references and not removed:
+                    self._set_meta(conn, "version", str(self.version() + 1))
+        return removed + references
 
     # ----------------------------------------------------------------- feed
 

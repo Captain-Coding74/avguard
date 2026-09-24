@@ -351,8 +351,9 @@ disaster now.
 
 [docs/improvements.md](docs/improvements.md) is a five-item plan handed to
 this project on 2026-09-22; each item lands here with what was measured. (Its
-preface says a numpy histogram shipped separately. Nothing in `avguard/`
-imports numpy, and nothing in the plan depends on it.)
+preface says a numpy histogram shipped separately. It did not: nothing in
+`avguard/` imported numpy until item 5, which uses it when present and works
+without it.)
 
 | Item | Result |
 |---|---|
@@ -360,7 +361,7 @@ imports numpy, and nothing in the plan depends on it.)
 | 2. File integrity monitoring | A signed SQLite baseline (HMAC-SHA256, key under DPAPI) of every file under chosen roots; a check names modified, added and removed files with old and new hashes, records events, and never moves anything. Default hashes everything, `--fast` trusts size and mtime and says what that trades away; both asserted against a file whose mtime was put back. 2,000 files / 596 MB: baseline 1.0 s warm, check 0.73 s, `--fast` 0.21 s. Tests 400 → **421** |
 | 3. Event bridge to Network Watchdog | Every recorded event is POSTed as JSON (schema 1, frozen) to a URL that is empty by default and set only past a yes/no naming what leaves the machine. A bounded queue and a daemon thread: `record()` is 170 µs without a forwarder, 258 µs with a dead endpoint; 601 events into a blocked endpoint kept the newest 500. Tests 431 → **437** |
 | 4. Explorer right-click scan | Two per-user registry keys, no administrator rights, tested against a fake of winreg; `--pause` keeps the result on screen, in a window when there is no console. **Not yet checked on a real Explorer**: writing to the user's registry was left to the user. Tests 437 → **449** |
-| 5. Fuzzy hashing with TLSH | **Not built.** No `py-tlsh` wheel for Python 3.13 on Windows, the sdist needs a compiler this machine does not have, and a pure-Python digest measures at 0.9 MB/s against the plan's own 200 MB/s floor. The design is in [docs/improvements.md](docs/improvements.md); the digest is the blocker |
+| 5. Fuzzy hashing with TLSH | Built without the dependency, two days after being set aside for want of it. `avguard/tlsh.py` is the digest in Python -- `bytes.translate` for the Pearson gathers, numpy for the histogram -- and it is bit-identical to the reference C++ on every input and chunking tried (the reference was built from source here to check). 16.5 MB/s with numpy, 2.4 MB/s without, 119 MB/s if `py-tlsh` happens to be importable, so each backend has a size cap that keeps one digest near 100 ms. A hand-seeded reference table in the blocklist database; the nearest reference is one soft finding. The thresholds were measured, not inherited: 30 for a near variant stands, the far band moves from 60 to 40, because at 60 one clean executable in thirty would be tagged per hundred references. Tests 449 → **481** |
 
 **The baseline's signature has a stated limit.** Code running as the same
 user can call the same DPAPI and re-sign a doctored baseline. It defends
@@ -372,6 +373,63 @@ way it says the quarantine masking is masking.
 `os.replace`". Windows refuses to replace a file another handle has open, and
 the running GUI holds the database open; a SQLite transaction gives the same
 guarantee without that fight.
+
+**The TLSH blocker was the loop, not the algorithm.** The first attempt at
+item 5 measured a byte-at-a-time Python digest at 0.9 MB/s and stopped.
+The digest is six Pearson-table gathers per byte plus a histogram, and the
+interpreter already has both at C speed: `bytes.translate` is the gather,
+big-int XOR is the XOR, `np.bincount` is the histogram. The one piece that
+stays a loop is the one-byte checksum chain, where each step depends on the
+last; it caps the whole thing at about 30 MB/s and is why the numpy path
+lands at 16.5 MB/s rather than 100. Correctness was not taken on trust: the
+reference library was built from its sdist on this machine (a Linux box with
+a compiler) and every backend was checked against it on random data, text,
+low-variety input, real files, and chunk sizes from 1 byte to 1 MB, digest
+for digest and distance for distance. One thing that check found was in the
+reference: its own streaming `update()` gives a different digest from its
+one-shot `hash()` when fed chunks shorter than its five-byte window, so the
+native backend batches its input.
+
+**The thresholds were folklore, and one of them was wrong.**
+`tools/tlsh_calibration.py` digests the software installed on the machine,
+scores every pair of files from different directories, and patches each
+file three ways to see what a variant scores. This machine is Linux, so the
+corpus is ELF; on Windows the same command takes the plan's Program Files
+and System32 roots, and re-running it there is one command.
+
+| distance | unrelated executable pairs (of 976,529) | unrelated pairs, all kinds (of 1,963,623) | clean executables tagged per 100 references |
+|---|---|---|---|
+| ≤ 10 | 9 | 15 | 0.09% |
+| ≤ 20 | 10 | 73 | 0.10% |
+| ≤ 30 | 10 | 98 | 0.10% |
+| ≤ 40 | 12 | 143 | 0.12% |
+| ≤ 50 | 55 | 272 | 0.56% |
+| ≤ 60 | 323 | 627 | 3.25% |
+| ≤ 80 | 3,302 | 4,261 | 28.7% |
+
+Every executable pair under 30 is the same code in two places (perl's
+modules and perl-base's copies of them); the first genuinely unrelated pair
+scores 35, two 14 KB programs that are mostly ELF boilerplate, and past 50
+that is what the band is made of. A copy with one byte changed scores 5 at
+most; one byte changed per 4 KB, 18 at most; 1% of the bytes overwritten, a
+median of 10 and a 90th percentile of 25. So the near band stays at 30 and
+the far band ends at 40, where it is as clean as the near band; at the
+plan's 60 a hundred references would tag one clean executable in thirty
+with a finding that, together with the entropy of a packed file, reaches
+SUSPICIOUS. The rate grows with the set -- every 1,000 references, about 1%
+of clean executables on resemblance alone -- so the store warns at 1,000
+and the README says to keep the set to the families that matter.
+
+**What the digest costs, and what it does not.** `_read_facts` on a 2 MB
+file: 139 ms without the digest, 259 ms with it; on 64 MB, 4.2 s against
+8.5 s, which is why 64 MB is over the cap and gets no digest. The facts
+pass itself runs at 16 MB/s because the entropy histogram is a Python loop
+over every byte -- the numpy histogram the plan's preface calls shipped is
+the obvious next step now that numpy is listed, and it is a separate item.
+Nothing is digested until a reference exists: an empty table costs nothing,
+which is the state every install starts in. Matching is one vectorised pass:
+10,000 references cost 2.5 ms per digested file with numpy and 53 ms
+without.
 
 ## Deliberately not doing
 
