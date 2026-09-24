@@ -58,7 +58,15 @@ jobs:
       - name: Install dependencies
         # No pystray or Pillow: the tray icon is Windows-only here and pulls in
         # GTK on Linux for no benefit.
-        run: pip install yara-python watchdog requests pefile
+        run: pip install yara-python watchdog requests pefile numpy
+
+      - name: Build the TLSH reference, if this runner can
+        # py-tlsh has no wheel anywhere and needs a C++ compiler; this runner
+        # has one, a user's machine does not. With it importable the suite
+        # also checks avguard/tlsh.py against the reference implementation,
+        # digest for digest. Without it that one test skips and the rest of
+        # the TLSH tests run against recorded reference digests.
+        run: pip install py-tlsh || echo "py-tlsh did not build here; the reference comparison will skip"
 
       - name: Import every module
         # AVGuard only does anything useful on Windows, but it must still
@@ -70,7 +78,7 @@ jobs:
           import importlib
           modules = ["config", "protection", "scanner", "quarantine", "cloud",
                      "watcher", "logsetup", "instance", "archives", "peinfo",
-                     "events", "signing", "scheduling"]
+                     "events", "signing", "scheduling", "tlsh", "iocs"]
           for name in modules:
               importlib.import_module(f"avguard.{name}")
               print(f"  ok  avguard.{name}")

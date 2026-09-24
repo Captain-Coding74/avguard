@@ -353,7 +353,7 @@ the fake. The manual check is one right-click away.
 
 ---
 
-## 5. Fuzzy hashing with TLSH  (effort: M, a day plus calibration)  — NOT BUILT
+## 5. Fuzzy hashing with TLSH  (effort: M, a day plus calibration)  — DONE
 
 ### Why
 
@@ -415,7 +415,41 @@ unrelated), TNULL handling, the soft cap keeping a lone match below
 MALICIOUS, generation change on reference update, and a skip marker when
 `py-tlsh` is absent so bare installs stay green.
 
-### Not built  (2026-09-22), and why
+### Built  (2026-09-24)
+
+`avguard/tlsh.py`: the digest, the distance and the vectorised match, with
+no compiled dependency; a `tlsh` table in the blocklist database, filled by
+`--iocs-import` from lines of `T1` + 70 hex with an optional `,family`;
+`--tlsh PATH...` to print digests for seeding; the nearest reference as one
+soft finding in `scan()`; `--iocs-status` and the Health row report the
+count; `tests/test_tlsh.py` (32 tests); `tools/tlsh_calibration.py` for the
+thresholds. The measurements and the table are in ROADMAP.md.
+
+Five deviations from the text above, each for a measured reason:
+
+- **No `py-tlsh`.** It has no wheel for any interpreter on any platform and
+  its sdist needs a compiler. The digest is written here instead, from the
+  reference source, and checked against the reference built from that
+  source: bit-identical on every backend and every chunking tried. If
+  `py-tlsh` is importable anyway it is used (119 MB/s); numpy is listed in
+  `requirements.txt` as the accelerator (16.5 MB/s against 2.4 MB/s).
+- **A size cap per backend, and no digest without a reference.** 200 MB/s
+  was never on the table: the facts pass itself runs at 16 MB/s. The cap
+  keeps one digest near 100 ms (16 MB native, 2 MB numpy, 256 KB plain), and
+  nothing is digested until the reference table has a row, so an install
+  that never seeds one pays nothing.
+- **The far band is 40, not 60.** At 60, one clean executable in thirty is
+  tagged per hundred references, and the pairs are unrelated modules that
+  share only ELF boilerplate; at 40 the band is as clean as the near band.
+- **The warning is about false positives, not cost.** With the match
+  vectorised, 10,000 references cost 2.5 ms per file; what grows with the
+  set is the chance that some reference sits near an unrelated file, about
+  1% of clean executables per 1,000 references. The store warns at 1,000.
+- **The corpus was ELF.** This session ran on Linux, so the calibration
+  used the software here. The tool takes the plan's Windows roots by default
+  on Windows, and re-running it there is one command.
+
+### First attempt  (2026-09-22): not built, and why
 
 Measured, in the order the text asks for:
 
@@ -437,6 +471,10 @@ What would unblock it: a `py-tlsh` wheel for the interpreter in
 CI and shipped with the executable. Both are a packaging decision, not an
 afternoon. The reference-set table, the `--iocs-import` extension and the
 soft-finding semantics are designed and small; the digest is the blocker.
+
+*(What unblocked it, two days later: the 0.9 MB/s was the byte loop, not
+the algorithm. Written with the interpreter's vectorised primitives the same
+digest runs at 16.5 MB/s; see above.)*
 
 ---
 

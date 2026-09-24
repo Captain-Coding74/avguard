@@ -8,3 +8,7 @@ requests>=2.32.0        # VirusTotal lookups (optional feature, still imported)
 ttkbootstrap>=1.14.0    # themed Tkinter widgets
 pystray>=0.19.0         # system tray icon
 Pillow>=10.0.0          # tray icon image, required by pystray
+numpy>=1.26             # TLSH similarity digest: 16 MB/s with it, 2.4 MB/s without;
+                        # the scanner runs without it, with a smaller size cap.
+# py-tlsh is NOT listed: it has no wheel for any interpreter and needs a C++
+# compiler. If it is importable anyway, avguard/tlsh.py uses it (120 MB/s).

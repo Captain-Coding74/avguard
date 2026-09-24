@@ -50,6 +50,7 @@ Other flags:
 | `--iocs-import FILE` | add SHA-256 hashes to the local blocklist |
 | `--iocs-update` | fetch the MalwareBazaar blocklist once (`--iocs-full` for the full export) |
 | `--iocs-status` | what the blocklist holds, and when the feed was last checked |
+| `--tlsh PATH...` | print each file's TLSH digest, the line an import file takes for similarity matching |
 | `--fim-baseline ROOT...` | record every file's hash under ROOT as the integrity baseline |
 | `--fim-check` | report what changed since (`--fast` trusts size and mtime) |
 | `--fim-accept PATH...` | re-baseline a change you have looked at |
@@ -375,6 +376,42 @@ error page, anything with fewer than 100 valid hashes — is refused whole and
 changes nothing. The list is part of the detection generation, so a file
 cached CLEAN before an import is judged again, and a running AVGuard notices
 an import made from a terminal within seconds.
+
+## Similarity to a known sample
+
+A SHA-256 matches identical bytes and nothing else. Changing one byte
+defeats the blocklist, and changing one byte is the cheapest thing an
+attacker does to a sample. TLSH is a locality-sensitive hash: similar files
+score a small *distance* apart, so a family's next variant can be caught by
+the digest of its last one.
+
+```bash
+python -m avguard --tlsh sample.exe             # prints  T1...  # sample.exe
+python -m avguard --iocs-import references.txt  # lines of  T1...,FamilyName
+```
+
+References are seeded by hand: the digest of a sample you have, or the TLSH
+value from a MalwareBazaar sample page, one per line with an optional family
+name after a comma, in the same import file as SHA-256 hashes. Nothing is
+fetched. Once at least one reference exists, files up to the size cap are
+digested in the same read that computes the SHA-256, and the nearest
+reference is measured: distance 30 or under is reported as a near variant,
+which is SUSPICIOUS on its own; 31 to 40 as a loose resemblance, which is
+supporting evidence only. Similarity is a guess about a family, never a fact
+about the bytes, so it can never on its own make a file MALICIOUS or move it,
+and a trusted publisher's signature sets it aside like every other
+heuristic.
+
+The digest is computed here, in Python (`py-tlsh` ships no wheel and needs a
+compiler). It matches the reference implementation byte for byte and runs at
+16 MB/s with numpy, 2.4 MB/s without, so a size cap keeps one digest near a
+tenth of a second: files above 2 MB (256 KB without numpy) are scanned
+without one, and `--iocs-status` says which. The thresholds were measured on
+this machine's own software with `tools/tlsh_calibration.py`; the table is
+in ROADMAP.md, and the short version is that every 1,000 references mark
+about 1% of clean executables SUSPICIOUS on resemblance alone, so keep the
+set to the families that matter to you. A change to the references is part
+of the detection generation, like a hash import.
 
 ## File integrity
 

@@ -12,7 +12,7 @@ import logging
 import sys
 from pathlib import Path
 
-from . import fim, iocs, shellext
+from . import fim, iocs, shellext, tlsh
 from . import config, logsetup, scheduling
 from .cloud import VirusTotalClient
 from .instance import InstanceLock
@@ -373,7 +373,8 @@ def _iocs_command(args) -> int:
             print(f"Could not read {args.iocs_import}: {exc}", file=sys.stderr)
             return 1
         print(result.describe())
-        print(f"The blocklist holds {store.count():,} hash(es). A running AVGuard "
+        print(f"The blocklist holds {store.count():,} hash(es) and "
+              f"{store.tlsh_count():,} TLSH reference(s). A running AVGuard "
               "picks this up within a few seconds.")
         return 0
 
@@ -398,6 +399,13 @@ def _iocs_command(args) -> int:
     print(f"Blocklist: {store.count():,} hash(es) in {store.path}")
     for source, count in store.sources().items():
         print(f"    {source:<16} {count:,}")
+    references = store.tlsh_count()
+    cap = tlsh.size_cap()
+    print(f"TLSH references: {references:,} "
+          f"({tlsh.backend()} backend; files up to {cap // 1024:,} KB are digested)"
+          if references else
+          "TLSH references: none, so no file is digested. Seed one with --tlsh "
+          "and --iocs-import.")
     state = store.feed_state()
     if state["checked_at"]:
         try:
@@ -408,6 +416,34 @@ def _iocs_command(args) -> int:
     else:
         print("Feed: never fetched. Turn it on in Settings, or run --iocs-update once.")
     return 0
+
+
+def _tlsh_command(paths: list[Path]) -> int:
+    """Digests to paste into an import file: one per file, the path after it."""
+    def files_under(root: Path):
+        if root.is_dir():
+            for dirpath, dirnames, filenames in os.walk(root):
+                dirnames.sort()
+                for name in sorted(filenames):
+                    yield Path(dirpath) / name
+        else:
+            yield root
+
+    failed = 0
+    for target in paths:
+        for path in files_under(target):
+            try:
+                digest = tlsh.hash_file(path)
+            except OSError as exc:
+                print(f"# {path}: cannot read: {exc}", file=sys.stderr)
+                failed += 1
+                continue
+            if digest is None:
+                print(f"# {path}: no digest (fewer than {tlsh.MIN_BYTES} bytes, "
+                      "or too uniform to measure)")
+            else:
+                print(f"{digest}  # {path}")
+    return 1 if failed else 0
 
 
 def _clean_corpus(limit: int = 400, roots: list[Path] | None = None,
@@ -559,6 +595,11 @@ def _main(argv: list[str] | None = None) -> int:
     parser.add_argument("--iocs-status", action="store_true",
                         help="how many hashes the blocklist holds, from where, and when "
                              "the feed was last checked")
+    parser.add_argument("--tlsh", metavar="PATH", nargs="+", type=Path,
+                        help="print the TLSH digest of each PATH (a folder means every "
+                             "file under it): the line to put in an --iocs-import file, "
+                             "with an optional ,family after it, so a family's next "
+                             "variant is reported as SUSPICIOUS")
     parser.add_argument("--fim-baseline", metavar="ROOT", nargs="+",
                         help="record the hash of every file under ROOT (repeatable) as the "
                              "baseline for --fim-check; a root already recorded is replaced")
@@ -633,6 +674,9 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.iocs_import or args.iocs_update or args.iocs_status:
         return _iocs_command(args)
+
+    if args.tlsh:
+        return _tlsh_command(args.tlsh)
 
     if args.install_context_menu or args.remove_context_menu:
         ok, detail = (shellext.install() if args.install_context_menu

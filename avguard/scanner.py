@@ -24,6 +24,7 @@ from typing import Callable, Iterable, Iterator, Sequence
 
 from . import allowlist as allowlist_module
 from . import iocs as iocs_module
+from . import tlsh as tlsh_module
 from . import archives, config, peinfo, rulepacks, signing
 from .protection import SelfProtection, matches_excluded_glob
 
@@ -94,7 +95,7 @@ SUSPICIOUS_AT = 50
 # Learned by shipping it: the archive inspector stopped calling large resource
 # packs "hostile", and the machine kept reporting the old verdict because the
 # generation hash only covered the rule file.
-DETECTION_VERSION = 14
+DETECTION_VERSION = 15
 
 # The ruleset compiled last time, kept between runs. See _adopt_compiled_cache.
 COMPILED_RULES_PATH = config.DATA_DIR / "rules.compiled"
@@ -134,6 +135,24 @@ SEVERITY_WEIGHTS: dict[str, int] = {
 # A rule that does not declare a severity is not trusted to condemn on its own.
 WEIGHT_UNLABELLED = 25
 
+# Similarity to a known sample (TLSH distance, see avguard/tlsh.py) is a guess
+# about a family, never a fact about these bytes, so both findings are soft:
+# a match alone reaches SUSPICIOUS and never MALICIOUS.
+#
+# The plan said 30 and 60. Measured with tools/tlsh_calibration.py on this
+# machine's own software (1,547 distinct executables and 1,984 files of every
+# kind, pairs from different directories): up to distance 40 about one pair
+# in 100,000 executables collides, so a hundred references would mark 0.1%
+# of clean binaries; at 60 it is one in 3,000 and 3% of clean binaries per
+# hundred references, and the pairs are unrelated 14 KB modules sharing
+# nothing but ELF boilerplate. A copy with one byte changed scores 5 at
+# most; one with a byte per 4 KB changed, 18 at most; one with 1% of its
+# bytes overwritten, a median of 10. So 40, not 60, for the far band.
+TLSH_NEAR = 30
+TLSH_FAR = 40
+WEIGHT_TLSH_NEAR = 50      # SUSPICIOUS on its own
+WEIGHT_TLSH_FAR = 25       # supporting evidence, like entropy
+
 
 @dataclass(frozen=True)
 class Finding:
@@ -166,6 +185,10 @@ class FileFacts:
     entropy: float
     signature_hits: tuple[str, ...] = ()
     data: bytes | None = None  # kept only for files small enough to buffer
+    # The TLSH digest, computed only when there are references to match it
+    # against and the file is under the backend's size cap; None otherwise,
+    # and None for a file too small or too uniform to digest.
+    tlsh: str | None = None
 
 
 @dataclass(frozen=True)
@@ -460,6 +483,10 @@ class Scanner:
         self.iocs = iocs if iocs is not None else iocs_module.IocStore()
         self._iocs_version = self.iocs.version()
         self._iocs_checked_at = 0.0
+        # The similarity references, loaded whole and swapped as one object
+        # when the blocklist changes, like the ruleset. Empty means no file
+        # is digested at all.
+        self._tlsh_refs = self.iocs.tlsh_references()
         self.broken_packs: dict[str, str] = {}
         # Rules each pack contributed to the loaded ruleset, counted from its
         # compiled object. The pack index's rule_count is what was measured at
@@ -573,6 +600,11 @@ class Scanner:
         # before an import replays CLEAN for the rest of the cache's life --
         # the DETECTION_VERSION incident with a different trigger.
         digest.update(f"iocs={self.iocs.generation_token()}".encode())
+        # The similarity thresholds decide verdicts, and so does the size cap:
+        # installing numpy raises the cap, and a 1 MB file cached CLEAN under
+        # the smaller one has never been measured against the references.
+        digest.update(f"tlsh={TLSH_NEAR}|{TLSH_FAR}|{WEIGHT_TLSH_NEAR}|{WEIGHT_TLSH_FAR}"
+                      f"|cap={tlsh_module.size_cap()}".encode())
         for path in self.rule_files():
             # The sha256 of the contents, not (name, size, mtime). An earlier
             # version hashed the stat, and CI caught two genuinely different
@@ -1020,6 +1052,7 @@ class Scanner:
             if version == self._iocs_version:
                 return
             self._iocs_version = version
+            self._tlsh_refs = self.iocs.tlsh_references()
             self.rekey_cache()
             log.info("blocklist changed on disk (version %d); cache rebuilt", version)
 
@@ -1059,12 +1092,25 @@ class Scanner:
 
     # ------------------------------------------------------------ the read
 
-    def _read_facts(self, path: Path, size: int, mtime_ns: int) -> FileFacts:
+    @staticmethod
+    def _wants_tlsh(size: int, references: "tlsh_module.ReferenceSet | None") -> bool:
+        """Digest only what can be matched, and only what the backend can afford.
+
+        No references, no digest: a machine that never imports one pays
+        nothing. Above the backend's cap (2 MB with numpy, measured at
+        16 MB/s; 256 KB without, at 2.4 MB/s) the file scans without one.
+        """
+        return (bool(references) and tlsh_module.MIN_BYTES <= size
+                <= tlsh_module.size_cap())
+
+    def _read_facts(self, path: Path, size: int, mtime_ns: int,
+                    want_tlsh: bool | None = None) -> FileFacts:
         """One pass over the file producing hash, signature hits and entropy.
 
         Signatures are matched across chunk boundaries by carrying the tail of
         each chunk forward. The old build compared each chunk in isolation, so
-        a signature straddling a 4 KB boundary was missed.
+        a signature straddling a 4 KB boundary was missed. The TLSH digest,
+        when wanted, joins the same pass: the file is still read once.
         """
         digest = hashlib.sha256()
         histogram = [0] * 256
@@ -1072,12 +1118,17 @@ class Scanner:
         overlap = b""
         carry = max(self._max_signature - 1, 0)
         buffered = bytearray() if size <= config.YARA_BUFFER_MAX else None
+        if want_tlsh is None:
+            want_tlsh = self._wants_tlsh(size, self._tlsh_refs)
+        similarity = tlsh_module.Hasher() if want_tlsh else None
 
         with open(path, "rb") as handle:
             while chunk := handle.read(config.CHUNK_SIZE):
                 digest.update(chunk)
                 if buffered is not None:
                     buffered.extend(chunk)
+                if similarity is not None:
+                    similarity.update(chunk)
                 for byte in chunk:
                     histogram[byte] += 1
                 window = overlap + chunk
@@ -1094,7 +1145,19 @@ class Scanner:
             entropy=shannon_entropy(histogram, size),
             signature_hits=tuple(sorted(hits)),
             data=bytes(buffered) if buffered is not None else None,
+            tlsh=similarity.final() if similarity is not None else None,
         )
+
+    @staticmethod
+    def _tlsh_finding(match: "tlsh_module.Match") -> Finding:
+        near = match.distance <= TLSH_NEAR
+        family = match.reference.family or "known-bad"
+        return Finding(
+            "tlsh", match.reference.family or "unnamed",
+            WEIGHT_TLSH_NEAR if near else WEIGHT_TLSH_FAR,
+            f"resembles a {family} sample: TLSH distance {match.distance} "
+            f"({'a near variant' if near else 'a loose resemblance'}; "
+            f"reference from {match.reference.source})")
 
     # ---------------------------------------------------------------- rules
 
@@ -1298,6 +1361,7 @@ class Scanner:
         # generation that means something else.
         ruleset = self._ruleset
         cache = self.cache
+        references = self._tlsh_refs
         stat = path.stat()
         size, mtime_ns = stat.st_size, stat.st_mtime_ns
 
@@ -1307,7 +1371,8 @@ class Scanner:
                 return Verdict(path, Level(cached["level"]), list(cached["reasons"]))
 
         try:
-            facts = self._read_facts(path, size, mtime_ns)
+            facts = self._read_facts(path, size, mtime_ns,
+                                     want_tlsh=self._wants_tlsh(size, references))
         except (OSError, MemoryError) as exc:
             return Verdict(path, Level.ERROR, [f"cannot read: {exc}"])
 
@@ -1344,6 +1409,14 @@ class Scanner:
         findings.extend(self._yara_matches(facts, ruleset))
         findings.extend(self._pe_findings(facts))
         findings.extend(self._archive_findings(facts, ruleset))
+
+        # Similarity to a known sample: the nearest reference, if it is near
+        # enough. One finding, however many references are close -- ten
+        # digests of one family are one piece of evidence, not ten.
+        if facts.tlsh and references:
+            match = references.nearest(facts.tlsh)
+            if match is not None and match.distance <= TLSH_FAR:
+                findings.append(self._tlsh_finding(match))
 
         # Entropy is supporting evidence only. On its own a high-entropy file is
         # usually a zip, a JPEG or an installer, so it can raise a file to
