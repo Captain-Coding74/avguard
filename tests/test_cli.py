@@ -299,6 +299,36 @@ class TestTheAccount(CliCase):
         self.assertIn("no quarantined file", output)
 
 
+class TestStartupCommands(CliCase):
+    def test_status_and_changes_with_no_snapshot_exit_zero_and_say_how_to_take_one(self):
+        for flag in ("--autoruns-status", "--autoruns-changes"):
+            code, output = self.run_cli(flag)
+            self.assertEqual(code, 0, output)
+            self.assertIn("No snapshot. Take one with", output)
+
+    @unittest.skipIf(sys.platform == "win32", "on Windows the collectors read the real machine")
+    def test_a_snapshot_that_collects_nothing_exits_two_and_records_nothing(self):
+        code, output = self.run_cli("--autoruns-snapshot", "-v")
+        self.assertEqual(code, 2, output)
+        self.assertIn("No snapshot was taken", output)
+        self.assertIn("service", output, "the per-collector table printed")
+        code, output = self.run_cli("--autoruns-status")
+        self.assertIn("No snapshot", output)
+
+    @unittest.skipUnless(sys.platform == "win32", "a real snapshot needs Windows")
+    def test_a_real_snapshot_then_status_then_changes(self):
+        code, output = self.run_cli("--autoruns-snapshot", "-v")
+        self.assertEqual(code, 0, output)
+        self.assertIn("first snapshot", output)
+        code, output = self.run_cli("--autoruns-status")
+        self.assertEqual(code, 0, output)
+        self.assertIn("Last snapshot:", output)
+        code, output = self.run_cli("--autoruns-snapshot")
+        self.assertIn(code, (0, 1), output)
+        code, output = self.run_cli("--autoruns-changes")
+        self.assertIn(code, (0, 1), output)
+
+
 class TestRuleCommands(CliCase):
 
     def test_reload_rules_exits_zero_and_names_the_files(self):

@@ -232,6 +232,7 @@ def _run(work: Path) -> int:
     for args, label in (
         (("--reload-rules",), "--reload-rules exits 0"),
         (("--schedule", "status"), "--schedule status exits 0"),
+        (("--autoruns-status",), "--autoruns-status exits 0 with no snapshot"),
     ):
         code, output = run(*args)
         check(label, code == 0, f"exit {code}: {output[-300:]}")

@@ -526,6 +526,31 @@ and re-sign a doctored baseline. The signature defends against other tools,
 casual edits and a copied-in baseline — not against an attacker who already
 owns the account.
 
+## What starts with Windows
+
+The Startup tab, and `--autoruns-snapshot` in a terminal, read the places
+commodity malware uses to survive a reboot: the Run and RunOnce keys for
+the user and the machine (both registry views), the two Startup folders,
+every scheduled task, and every service and driver with an image path. A
+snapshot is kept, signed like the integrity baseline, and the tab shows
+what differs from the previous one: new, changed (the command, the
+arguments, enabled or not, a task's triggers and run level, a service's
+start type) or gone. A task's last-run time, a registration date or a
+description is not a change. Every change is a History event; one whose
+target is a trusted-signed program under the Windows folder is listed in
+grey and recorded, never announced, because that is what an update looks
+like a dozen times a month. `--autoruns-schedule on` takes a snapshot daily
+through the Task Scheduler, unattended; it records and changes nothing.
+
+The limits, stated plainly. It reads configuration at a point in time, as
+Sysinternals Autoruns does as a standard user: no driver, no elevation, no
+hooks, no process telemetry. Something that registers itself and removes
+the registration between two snapshots is not seen. It names what is set
+to start, not whether it is bad; the quiet rule is a filter on noise, not a
+verdict. Nothing here produces a Finding, and nothing can move or disable
+a startup item: the way to act on one is yours, and the entry's location
+and name are in the row.
+
 ## Event forwarding
 
 Off by default. With a URL set in Settings, every recorded event — a

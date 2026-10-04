@@ -13,7 +13,7 @@ import sys
 import threading
 from pathlib import Path
 
-from . import fim, iocs, shellext, tlsh
+from . import autoruns, fim, iocs, shellext, tlsh
 from . import config, logsetup, scheduling
 from .cloud import VirusTotalClient
 from .instance import InstanceLock
@@ -482,6 +482,83 @@ def _paste_check(source: Path) -> int:
     return 1 if match.tier == clipguard.WARNING else 0
 
 
+def _autoruns_command(args) -> int:
+    """What starts with Windows, from a terminal. Records; changes nothing."""
+    from datetime import datetime
+    from .events import EventStore
+    store = autoruns.AutorunsStore()
+
+    if args.autoruns_snapshot:
+        collected = autoruns.collect()
+        report = store.snapshot(collected, events=EventStore())
+        if args.verbose or report.snapshot is None:
+            for kind in autoruns.KINDS:
+                print(f"  {kind:8} {collected.counts.get(kind, 0):5} in {collected.seconds.get(kind, 0) * 1e3:7.0f} ms")
+        for note in report.errors:
+            print(f"  note: {note}", file=sys.stderr)
+        integrity = report.integrity_event()
+        if integrity is not None:
+            print(f"SNAPSHOTS: {integrity.reasons[0]}")
+            print()
+        for change in report.changes:
+            quiet = "" if change.worth_a_look() else "   (under the Windows folder; recorded, not announced)"
+            print(f"  {change.describe()}{quiet}")
+        if report.changes:
+            print()
+        print(autoruns.describe_report(report))
+        if report.snapshot is None:
+            return 2
+        if report.changes:
+            print("Nothing was moved or changed; a snapshot never does. Each change is in History.")
+        if integrity is not None:
+            return 3
+        return 1 if report.changes else 0
+
+    if args.autoruns_changes:
+        changes = store.last_changes()
+        if not store.exists():
+            print("No snapshot. Take one with:  python -m avguard --autoruns-snapshot")
+            return 0
+        if not changes:
+            print("Nothing changed between the last two snapshots.")
+            return 0
+        for change in changes:
+            print(f"  {change.describe()}")
+        return 1
+
+    if args.autoruns_schedule:
+        if args.autoruns_schedule == "status":
+            print("Daily startup snapshot scheduled: "
+                  f"{'yes' if scheduling.scheduled_autoruns_snapshot_exists() else 'no'}")
+            return 0
+        if args.autoruns_schedule == "on":
+            ok, detail = scheduling.enable_scheduled_autoruns_snapshot()
+            print(f"Daily startup snapshot: {detail if ok else 'FAILED - ' + detail}")
+            print("It records what is new since the day before and changes nothing.")
+            return 0 if ok else 1
+        ok, detail = scheduling.disable_scheduled_autoruns_snapshot()
+        print("Removed." if ok else f"Not removed: {detail}")
+        return 0 if ok else 1
+
+    # --autoruns-status
+    latest = store.latest()
+    if latest is None:
+        print("No snapshot. Take one with:  python -m avguard --autoruns-snapshot")
+        return 0
+    ok, text = autoruns.summarize(store)
+    print(("OK   " if ok else "BAD  ") + text)
+    when = datetime.fromtimestamp(latest.taken_at).strftime("%Y-%m-%d %H:%M")
+    print(f"Last snapshot: {when}, {latest.entries:,} entries, {latest.seconds:.1f}s")
+    kinds = {}
+    for entry in store.entries():
+        kinds[entry.kind] = kinds.get(entry.kind, 0) + 1
+    for kind in autoruns.KINDS:
+        print(f"  {kind:8} {kinds.get(kind, 0):5}")
+    changes = store.last_changes()
+    print(f"Changes between the last two snapshots: {len(changes)}")
+    return 0 if ok else 3
+
+
 def _tlsh_command(paths: list[Path]) -> int:
     """Digests to paste into an import file: one per file, the path after it."""
     def files_under(root: Path):
@@ -691,6 +768,16 @@ def _main(argv: list[str] | None = None) -> int:
                              "so the alert stops repeating")
     parser.add_argument("--fim-status", action="store_true",
                         help="what the baseline covers and whether its signature holds")
+    parser.add_argument("--autoruns-snapshot", action="store_true",
+                        help="record what starts with Windows (Run keys, Startup folders, scheduled "
+                             "tasks, services) and print what changed since the previous snapshot; "
+                             "with -v, each collector's count and time")
+    parser.add_argument("--autoruns-status", action="store_true",
+                        help="the last startup snapshot: when, how many entries of each kind")
+    parser.add_argument("--autoruns-changes", action="store_true",
+                        help="what differed between the last two startup snapshots")
+    parser.add_argument("--autoruns-schedule", choices=["status", "on", "off"],
+                        help="a daily startup snapshot through the Task Scheduler")
     parser.add_argument("--fim-schedule", choices=["status", "on", "off"],
                         help="a daily unattended --fim-check (records only)")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -778,6 +865,8 @@ def _main(argv: list[str] | None = None) -> int:
     if (args.fim_baseline or args.fim_check or args.fim_accept or args.fim_status
             or args.fim_schedule):
         return _fim_command(args)
+    if args.autoruns_snapshot or args.autoruns_status or args.autoruns_changes or args.autoruns_schedule:
+        return _autoruns_command(args)
 
     if args.reload_rules:
         cfg = config.Config.load()

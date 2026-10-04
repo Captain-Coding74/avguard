@@ -41,6 +41,7 @@ class ScheduleStatus:
     starts_with_windows: bool = False
     scheduled_scan: bool = False
     scheduled_fim_check: bool = False
+    scheduled_autoruns_snapshot: bool = False
     detail: str = ""
 
 
@@ -197,6 +198,37 @@ def disable_scheduled_fim_check() -> tuple[bool, str]:
     return True, "removed"
 
 
+AUTORUNS_TASK_NAME = "AVGuard startup snapshot"
+
+
+def scheduled_autoruns_snapshot_exists() -> bool:
+    ok, _ = _run(["schtasks", "/Query", "/TN", AUTORUNS_TASK_NAME])
+    return ok
+
+
+def enable_scheduled_autoruns_snapshot(time_of_day: str = "12:45") -> tuple[bool, str]:
+    """A daily snapshot of what starts with Windows, unattended. It records
+    what changed since the previous one and changes nothing itself."""
+    if sys.platform != "win32":
+        return False, "only supported on Windows"
+    runner, _ = _launcher()
+    command = f'"{runner}" -m avguard --autoruns-snapshot'
+    ok, output = _run(["schtasks", "/Create", "/F", "/SC", "DAILY",
+                       "/TN", AUTORUNS_TASK_NAME, "/TR", command, "/ST", time_of_day])
+    if not ok:
+        return False, output or "schtasks refused to create the task"
+    log.info("scheduled a daily startup snapshot at %s", time_of_day)
+    return True, f"daily at {time_of_day}"
+
+
+def disable_scheduled_autoruns_snapshot() -> tuple[bool, str]:
+    ok, output = _run(["schtasks", "/Delete", "/F", "/TN", AUTORUNS_TASK_NAME])
+    if not ok and "cannot find" not in output.lower():
+        return False, output
+    log.info("removed the scheduled startup snapshot")
+    return True, "removed"
+
+
 def status() -> ScheduleStatus:
     if sys.platform != "win32":
         return ScheduleStatus(detail="scheduling is only supported on Windows")
@@ -204,4 +236,5 @@ def status() -> ScheduleStatus:
         starts_with_windows=starts_with_windows(),
         scheduled_scan=scheduled_scan_exists(),
         scheduled_fim_check=scheduled_fim_check_exists(),
+        scheduled_autoruns_snapshot=scheduled_autoruns_snapshot_exists(),
     )

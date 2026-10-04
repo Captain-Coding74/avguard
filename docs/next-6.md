@@ -87,7 +87,15 @@ rule 3 gives. **Measure first:** count the owner's real events with level
 malicious or suspicious and score 0, and reproduce the 100-then-0 in a
 test before the change and 100-then-100 after. Effort M, no dependency.
 
-## 3. Persistence diff (what starts with Windows) — build
+## 3. Persistence diff (what starts with Windows) — DONE
+
+Built the same day as the account; the record is in ROADMAP.md under
+"What starts with Windows". As shaped below, with two departures: there is
+no Settings toggle (the integrity baseline has none either; the tab and
+the schedule verb are the switches), and the quiet rule without a
+signature checker is "under the Windows folder" alone, stated as the trade
+until the owner's fourteen days of changes are in. What was planned:
+
 
 **Why it fits.** Of the seven, the repository is already most of the way
 to this one: `fim.py` is the diff engine with its events, HMAC-signed

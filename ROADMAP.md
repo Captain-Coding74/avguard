@@ -969,6 +969,71 @@ unchanged by a second constructor; a rule note reaching the finding from a
 scan; a confidence note left out; ASCII-safe JSON; every fixture against
 four thresholds. Green on 3.13 (GUI hidden) and 3.12 with a display.
 
+**What starts with Windows, 2026-10-04.** The persistence diff from
+docs/next-6.md, and Phase 4's "persistence diff" in docs/suite-roadmap.md.
+`avguard/autoruns.py` reads the places commodity malware uses to survive a
+reboot, at a point in time and as a standard user: the Run and RunOnce
+keys for the user and the machine (the machine's in both registry views,
+with Task Manager's enabled flag from StartupApproved applied), the two
+Startup folders (each file hashed, so a rewritten shortcut counts), every
+scheduled task through `schtasks /Query /XML ONE` (decoded with the
+console code page; the XML header's UTF-16 claim is not what the console
+writes), and every service and driver with an image path, from the
+registry. Each is an `Entry` whose key is where it is and what it is
+called, and whose fingerprint is what counts: the command, the arguments,
+enabled or not, a task's triggers and run level, a service's start type.
+A last-run time, a registration date or a description sits in `detail`
+and never reaches the fingerprint. Snapshots live in a signed SQLite store
+under the data directory (`AutorunsStore`, the integrity baseline's key,
+signature and tamper states reused by name), thirty kept, and each new one
+is diffed against the previous: added, modified with old and new, removed.
+Every change is an event of kind `autoruns`; a change whose target is a
+trusted-signed program under the system root is a grey row and a History
+event, never a banner, because that is what an update looks like a dozen
+times a month. Without a signature checker the system root alone keeps a
+change quiet, stated as the trade until the owner's fourteen days of
+changes say whether it holds. Surfaces: a Startup tab beside Integrity
+(`avguard/startuppanel.py`, the Integrity tab's design: a worker thread,
+`post()`, the last diff on open, Snapshot now), a Health row,
+`--autoruns-snapshot` (with `-v` a per-collector table of counts and
+milliseconds), `--autoruns-status`, `--autoruns-changes` and
+`--autoruns-schedule on|off|status`, which registers a daily snapshot
+with the Task Scheduler in the records-only pattern of the integrity
+check. No Settings toggle, as the baseline has none: the tab and the
+schedule verb are the switches. Every Windows call is behind an
+injectable (the registry module, the Startup folders, the `schtasks`
+runner), so the whole module runs on Linux against a dict-backed registry
+and a `schtasks` fixture, and the collectors run for real on the Windows
+runner, where a test takes two snapshots seconds apart and requires them
+to differ in nothing.
+
+It produces no Finding, never moves or disables anything, needs no
+elevation, driver or hook, and reads nothing that is not configuration:
+the recorded "no process monitoring" decision is not reopened, and the
+suite roadmap says when it will be (Phase 3). Nothing is stored when
+nothing at all was collected, because an empty snapshot would report every
+entry as gone the next day; a collector that fails is noted and the others
+still run.
+
+Measured here (Linux, the fakes): a snapshot database of 20,480 bytes
+after one snapshot of 8 entries and 114,688 bytes after thirty, the
+collectors and the diff in well under a millisecond on the fixture, so the
+real cost is the registry walk and `schtasks`, which only the Windows
+runner can time; its per-collector table (counts and milliseconds), its
+database size after two snapshots of a real machine's entries, and whether
+two snapshots seconds apart agree are printed by the runner's test and
+belong in the next paragraph of this entry. Tests 640 -> 667: the
+collectors against the fake in both registry views with the disabled flag,
+services and drivers with the start and type words, the Startup folders
+with the hash and the skipped desktop.ini, the tasks from the fixture with
+triggers, run level and the uncounted date and description, console
+decoding in four encodings, a failing collector isolated, the diff rules,
+the quiet rule with and without a checker, the store's first snapshot,
+second snapshot, empty collection, pruning, tamper and re-signing, the tab
+through its button on the shared root with the quiet row grey, and the
+console verbs. Not yet on the owner's desktop: a fortnight of real daily
+diffs, which is what decides whether the quiet rule is enough.
+
 ## Deliberately not doing
 
 The paste guard (above) is the one input that is not a file; it watches a user-mode clipboard buffer through documented calls, with no driver, no hook and no process telemetry, so it does not reopen the first decision here. The EDR-shaped extensions of it are refused by name: no keyboard hook to see Win+R, no automation of the Run dialog, no watching what the user then runs.

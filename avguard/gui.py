@@ -26,7 +26,7 @@ from ttkbootstrap.constants import (
 )
 from ttkbootstrap.dialogs import Messagebox, Querybox
 
-from . import clipguard, config, dialogs, explain, fimpanel, logsetup, scheduling
+from . import autoruns, clipguard, config, dialogs, explain, fimpanel, logsetup, scheduling, startuppanel
 from .events import Event, EventStore
 from .cloud import VirusTotalClient
 from . import iocs as iocs_module
@@ -267,6 +267,14 @@ class AVGuardApp(tb.Window):
             self.tabs, store_factory=self._fim_store, events=self.events, post=self.post,
             padding=(0, 8, 0, 0))
         self.tabs.add(self.integrity, text="Integrity")
+
+        # What starts with Windows, beside the integrity baseline: the same
+        # design applied to configuration. A snapshot reads and compares;
+        # it moves nothing and cannot.
+        self.startup = startuppanel.StartupPanel(
+            self.tabs, store_factory=self._autoruns_store, events=self.events, post=self.post,
+            trusted=self._startup_trusted(), on_report=self._startup_report, padding=(0, 8, 0, 0))
+        self.tabs.add(self.startup, text="Startup")
 
         # --- controls ----------------------------------------------------
         controls = tb.Frame(outer, padding=(0, 10, 0, 0))
@@ -1247,6 +1255,47 @@ class AVGuardApp(tb.Window):
     def _fim_store(self):
         return fim_module.FimStore(excluded_globs=self.cfg.excluded_globs)
 
+    # ------------------------------------------------------------ startup
+
+    def _autoruns_store(self):
+        return autoruns.AutorunsStore()
+
+    def _startup_trusted(self):
+        """Answers whether a startup item's target is a trusted-signed
+        program, through the scanner's Authenticode checker; None where
+        there is none, and then only the system root keeps a change quiet."""
+        checker = self.scanner.signatures
+        if not getattr(checker, "available", False):
+            return None
+
+        def trusted(target: str) -> bool:
+            path = Path(target)
+            stat = path.stat()
+            return bool(checker.check(path, stat.st_size, stat.st_mtime_ns).is_trusted)
+        return trusted
+
+    def _startup_report(self, report) -> None:
+        """After a snapshot from the tab: one banner for what is worth a look.
+        Everything is in the tab and History whether or not it is announced."""
+        trusted = self._startup_trusted()
+        loud = [c for c in report.changes if c.worth_a_look(trusted=trusted)]
+        if not loud:
+            return
+        first = loud[0].describe()
+        more = f" and {len(loud) - 1} more" if len(loud) > 1 else ""
+        self._banner(f"Startup change worth a look: {first}{more}. Nothing was changed; "
+                     "see the Startup tab.", "inverse-warning")
+
+    def _autoruns_ok(self) -> bool:
+        store = self._autoruns_store()
+        return not store.exists() or store.verify_integrity() == autoruns.INTEGRITY_OK
+
+    def _describe_autoruns(self) -> str:
+        _ok, text = autoruns.summarize(self._autoruns_store())
+        if not self._autoruns_store().exists():
+            return text + " (the Startup tab, or: avguard --autoruns-snapshot)"
+        return text
+
     def _fim_ok(self) -> bool:
         """Red only when a baseline exists and its signature does not hold."""
         store = self._fim_store()
@@ -1292,6 +1341,7 @@ class AVGuardApp(tb.Window):
             ("Hash blocklist", True, self._describe_iocs()),
             ("Paste guard", *self._describe_paste_guard()),
             ("File integrity", self._fim_ok(), self._describe_fim()),
+            ("Startup items", self._autoruns_ok(), self._describe_autoruns()),
             ("Event forwarding", True,
              f"on -> {self.forwarder.url}: {self.forwarder.describe()}"
              if self.forwarder is not None else "off - nothing is sent"),
@@ -1356,6 +1406,10 @@ class AVGuardApp(tb.Window):
             self.integrity.stop(timeout=5)
         except Exception:
             log.exception("error stopping the integrity worker")
+        try:
+            self.startup.stop(timeout=5)
+        except Exception:
+            log.exception("error stopping the startup snapshot")
         try:
             self.cache.save()
             self.cloud.save_cache()
