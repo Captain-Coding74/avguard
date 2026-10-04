@@ -1,0 +1,1 @@
+start ms-appinstaller:?source=https://example.invalid/app.msix

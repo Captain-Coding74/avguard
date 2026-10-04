@@ -669,7 +669,52 @@ inconvenient place.
 The plan found one thing to change (test 10) and one thing to know
 (the nesting limit in test 4). The other expectations held as written.
 
+**The paste guard, 2026-10-04.** The first thing AVGuard watches that is
+not a file. The ClickFix scam (and FileFix) copies a command to the
+clipboard and talks the user into pressing Win+R and pasting it; no file is
+written until the user has already run it, so every file stage is blind to
+it. `avguard/clipguard.py` reads the clipboard when its sequence number
+moves (one `user32.GetClipboardSequenceNumber` call per 500 ms tick, the
+clipboard opened only on a change) and classifies the text: a launcher
+program (powershell, mshta, cmd, wscript, rundll32, regsvr32, msiexec,
+certutil, bitsadmin, curl, a protocol handler) together with a signal an
+honestly pasted command has no reason for (an encoded blob, a remote .hta
+or .msi or a share at an address, a hidden window with remote content, a
+program dropped under a temp folder and run, a fake-verification comment
+tail, the FileFix padded comment, char-code obfuscation) is a warning; a
+launcher that merely fetches and runs is a quieter notice, because that is
+the shape of the install one-liners developers paste. It is advisory and
+outside the scoring model: no Finding, no Verdict, `detection_generation()`
+unchanged with and without it (a test asserts this), so `DETECTION_VERSION`
+is not bumped, for the reason the numpy histogram and the vanished-file skip
+were not. It keeps none of the text (the event carries the signals, the
+host and the owning program, never the command), sends nothing, reads
+nothing while off, nothing present at startup, and nothing an application
+marked private (the two formats KeePass and 1Password set). On the Tk
+thread through `after()`, no worker and no timed wait, for the reason in
+"The watcher waits without a timeout". Off in the config; the first-run
+dialog offers it pre-ticked, an existing install is offered it once, and
+Settings states the trade.
+
+Measured here on Linux (the classifier is pure and runs anywhere):
+`classify()` 32 us on a lure, 13 us on an ordinary command, 0.8 ms over
+16 KB of non-matching text. Over the fixture corpora, 22 of 22 ClickFix and
+FileFix shapes reach warning and 0 of 29 legitimate one-liners do, with 3
+of those (the bun, uv and pnpm install lines) landing at notice and counted.
+The two first-draft mistakes the project's own history predicted are
+fixtures that must not warn: a hidden window alone (the install.bat shape
+from Finding 1) and a local .hta or .msi. The ctypes clipboard reader and
+the owner attribution run only on Windows; the Linux import job asserts
+`WindowsClipboard().available` is false. Not yet measured on the owner's
+desktop: the cost of the live tick over a session, what `GetClipboardOwner`
+resolves to when a browser's JavaScript writes the clipboard, and which
+password managers set which private-format marker. Until those run the
+first-run default stays pre-ticked on the strength of the corpus, and the
+ROADMAP says "not yet on the owner's desktop". Tests 516 -> 547.
+
 ## Deliberately not doing
+
+The paste guard (above) is the one input that is not a file; it watches a user-mode clipboard buffer through documented calls, with no driver, no hook and no process telemetry, so it does not reopen the first decision here. The EDR-shaped extensions of it are refused by name: no keyboard hook to see Win+R, no automation of the Run dialog, no watching what the user then runs.
 
 - **Real-time process, memory or kernel monitoring.** Needs a driver and admin
   rights. Out of scope for a Python hobby tool, and the honest version of this

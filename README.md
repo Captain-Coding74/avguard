@@ -2,7 +2,7 @@
 
 [![tests](https://github.com/Captain-Coding74/avguard/actions/workflows/tests.yml/badge.svg)](https://github.com/Captain-Coding74/avguard/actions/workflows/tests.yml)
 
-A small file scanner for Windows: local signatures, YARA rules, an optional
+A small file scanner for Windows, plus one check on the clipboard: local signatures, YARA rules, an optional
 VirusTotal lookup, real-time folder monitoring, and a quarantine you can
 actually undo.
 
@@ -134,6 +134,14 @@ antivirus your operating system already runs, and it is not built to catch live
 malware — that needs a maintained signature corpus, which is a different
 project. Turning on VirusTotal lookups is what gives it real detection, and
 that is your decision to make.
+
+## The paste guard
+
+One thing AVGuard watches that is not a file: the clipboard. The ClickFix scam (and its FileFix cousin) is a fake CAPTCHA or "fix this error" page that copies a command for you and tells you to press Win+R, paste, and Enter. No file is downloaded until you have already run it, so a file scanner never sees it coming. When the guard is on, AVGuard looks at text you copy, on this PC, for the shape of such a command, a launcher like PowerShell or mshta together with an encoded blob, a remote script, a hidden window or one of the tell-tale "I am not a robot" comment tails, and warns you in the seconds before you paste.
+
+It is advisory and nothing more. It produces no verdict and can never move a file. It keeps none of the text: the warning and the History event carry the shape of the command, the host it names and the program that put it on the clipboard, never the command itself. It sends nothing. It does not read the clipboard when it is off, does not read what was already there when AVGuard started, and does not read text an application has marked private, which is what password managers like KeePass and 1Password do. A command you use yourself can be silenced with one button.
+
+The limits, stated plainly. It warns, it cannot block the paste or the Run box. It knows the shapes seen so far, not every shape. The honest install one-liners developers paste (`irm https://astral.sh/uv/install.ps1 | iex` and the like) share the shape, so they are shown as a quieter notice, not a warning, and counted. It is off until you choose it, in the first-run dialog or in Settings, and `python -m avguard --paste-check FILE` runs the same classifier over a file without touching the clipboard.
 
 ## Tests
 

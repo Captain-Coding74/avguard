@@ -418,6 +418,27 @@ def _iocs_command(args) -> int:
     return 0
 
 
+def _paste_check(source: Path) -> int:
+    """The paste guard's classifier over a file, for tests and the curious."""
+    from . import clipguard
+    try:
+        if str(source) == "-":
+            text = sys.stdin.read()
+        else:
+            text = source.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        print(f"cannot read {source}: {exc}", file=sys.stderr)
+        return 2
+    match = clipguard.classify(text)
+    if match is None:
+        print("No paste-and-run shape: the guard would say nothing.")
+        return 0
+    print(f"{match.tier.upper()}: {', '.join(match.signals)}")
+    print(f"  launcher {match.launcher}" + (f", host {match.host}" if match.host else ""))
+    print("  " + match.sentence(None))
+    return 1 if match.tier == clipguard.WARNING else 0
+
+
 def _tlsh_command(paths: list[Path]) -> int:
     """Digests to paste into an import file: one per file, the path after it."""
     def files_under(root: Path):
@@ -595,6 +616,10 @@ def _main(argv: list[str] | None = None) -> int:
     parser.add_argument("--iocs-status", action="store_true",
                         help="how many hashes the blocklist holds, from where, and when "
                              "the feed was last checked")
+    parser.add_argument("--paste-check", metavar="FILE", type=Path,
+                        help="classify the text in FILE ('-' for stdin) as the paste guard "
+                             "would: exit 1 for a warning, 0 otherwise; the clipboard itself "
+                             "is never read from the command line")
     parser.add_argument("--tlsh", metavar="PATH", nargs="+", type=Path,
                         help="print the TLSH digest of each PATH (a folder means every "
                              "file under it): the line to put in an --iocs-import file, "
@@ -675,6 +700,8 @@ def _main(argv: list[str] | None = None) -> int:
     if args.iocs_import or args.iocs_update or args.iocs_status:
         return _iocs_command(args)
 
+    if args.paste_check is not None:
+        return _paste_check(args.paste_check)
     if args.tlsh:
         return _tlsh_command(args.tlsh)
 

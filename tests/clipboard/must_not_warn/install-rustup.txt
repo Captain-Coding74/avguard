@@ -1,0 +1,1 @@
+powershell -c "irm https://win.rustup.rs/x86_64 -OutFile rustup-init.exe"

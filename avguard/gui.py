@@ -26,7 +26,7 @@ from ttkbootstrap.constants import (
 )
 from ttkbootstrap.dialogs import Messagebox, Querybox
 
-from . import config, dialogs, fimpanel, logsetup, scheduling
+from . import clipguard, config, dialogs, fimpanel, logsetup, scheduling
 from .events import Event, EventStore
 from .cloud import VirusTotalClient
 from . import iocs as iocs_module
@@ -50,6 +50,9 @@ MAX_DRAIN_PER_TICK = 200
 # status check could not see it.
 HEALTH_TICK_MS = 30_000
 FEED_TICK_MS = 5_000          # the daily blocklist check, once the window is up
+# The paste guard's poll: one user32 call per tick, the clipboard opened only
+# when its sequence number has moved. On the Tk thread, no worker.
+CLIPBOARD_TICK_MS = 500
 
 LEVEL_TAGS = {
     logging.ERROR: ("error", "#ff6b6b"),
@@ -118,6 +121,11 @@ class AVGuardApp(tb.Window):
         self.lock = InstanceLock()
         self.has_lock = self.lock.acquire()
 
+        # The paste guard reads the clipboard only while cfg.paste_guard_enabled
+        # is set; the tick checks that before touching the source.
+        self.pasteguard = clipguard.PasteGuard(clipguard.WindowsClipboard(), self.events,
+                                               notify=self._paste_warning)
+
         self._shutting_down = False
         self._scan_thread: threading.Thread | None = None
         self._cancel = threading.Event()
@@ -130,6 +138,7 @@ class AVGuardApp(tb.Window):
         self.after(UI_TICK_MS, self._pump)
         self.after(HEALTH_TICK_MS, self._check_realtime_health)
         self.after(FEED_TICK_MS, self._update_blocklist_feed)
+        self.after(CLIPBOARD_TICK_MS, self._tick_clipboard)
         self._refresh_quarantine()
 
         if not self.scanner.rules:
@@ -147,8 +156,13 @@ class AVGuardApp(tb.Window):
 
         if not self.cfg.onboarding_completed:
             self.after(300, self._ask_first_run)
-        elif self.cfg.realtime_enabled:
-            self._start_realtime()
+        else:
+            if self.cfg.realtime_enabled:
+                self._start_realtime()
+            if not self.cfg.paste_guard_offered:
+                # An existing install: offered once, never switched on behind
+                # the user's back.
+                self.after(600, self._offer_paste_guard)
 
     # ------------------------------------------------------------- widgets
 
@@ -395,10 +409,20 @@ class AVGuardApp(tb.Window):
             ),
         ).pack(anchor="w", pady=(10, 16))
 
+        paste_var = tk.BooleanVar(value=True)
+        tb.Checkbutton(
+            body, variable=paste_var, bootstyle="round-toggle",
+            text="Also warn when the clipboard holds a paste-and-run command",
+        ).pack(anchor="w", pady=(0, 2))
+        tb.Label(body, bootstyle="secondary", wraplength=520, justify="left",
+                 text=("The fake-CAPTCHA scam copies a command and tells you to paste it into "
+                       "the Run box. AVGuard would look at text you copy, on this PC, for that "
+                       "shape; it keeps none of it and sends nothing.")).pack(anchor="w", pady=(0, 14))
+
         def finish(auto: bool) -> None:
             window.grab_release()
             window.destroy()
-            self._apply_first_run(auto)
+            self._apply_first_run(auto, paste_var.get())
 
         buttons = tb.Frame(body)
         buttons.pack(fill=X)
@@ -410,17 +434,97 @@ class AVGuardApp(tb.Window):
         # Closing the window without choosing is the cautious answer.
         window.protocol("WM_DELETE_WINDOW", lambda: finish(False))
 
-    def _apply_first_run(self, auto_quarantine: bool) -> None:
+    def _apply_first_run(self, auto_quarantine: bool, paste_guard: bool = False) -> None:
         self.cfg.auto_quarantine = auto_quarantine and self.has_lock
         self.cfg.onboarding_completed = True
+        self.cfg.paste_guard_enabled = bool(paste_guard)
+        self.cfg.paste_guard_offered = True
         try:
             self.cfg.save()
         except OSError as exc:
             log.warning("could not save your choice: %s", exc)
-        log.info("first run: automatic quarantine is %s",
-                 "on" if self.cfg.auto_quarantine else "off (detections will be reported only)")
+        log.info("first run: automatic quarantine is %s; the paste guard is %s",
+                 "on" if self.cfg.auto_quarantine else "off (detections will be reported only)",
+                 "on" if self.cfg.paste_guard_enabled else "off")
         if self.cfg.realtime_enabled:
             self._start_realtime()
+
+    # --------------------------------------------------------- paste guard
+
+    def _tick_clipboard(self) -> None:
+        """The paste guard's poll. Nothing is touched while the guard is off.
+
+        Rescheduled from `finally` for the reason _pump is: a tick that
+        dies takes the guard with it and the Health row would still read on.
+        """
+        try:
+            if self.cfg.paste_guard_enabled and not self._shutting_down:
+                self.pasteguard.tick()
+        except Exception:
+            log.exception("the paste guard's tick failed")
+        finally:
+            if not self._shutting_down:
+                self.after(CLIPBOARD_TICK_MS, self._tick_clipboard)
+
+    def _paste_warning(self, match: clipguard.Match, clip: clipguard.ClipText) -> None:
+        """On the GUI thread (the tick runs there). Says it; moves nothing."""
+        sentence = match.sentence(clip.owner)
+        if match.tier == clipguard.WARNING:
+            log.warning("PASTE GUARD: %s", sentence)
+            self._banner(sentence, "inverse-danger")
+            for child in self.banner.winfo_children():
+                child.destroy()
+            tb.Button(self.banner, text="Don't warn about this text again",
+                      bootstyle="light-outline",
+                      command=lambda m=match: self._ignore_paste_text(m)).pack(side=RIGHT, padx=6)
+            if self.tray is not None:
+                try:
+                    self.tray.notify("A paste-and-run command is in your clipboard", "AVGuard")
+                except Exception:
+                    pass
+        else:
+            log.info("paste guard: %s", sentence)
+            self._banner(sentence, "inverse-warning")
+
+    def _ignore_paste_text(self, match: clipguard.Match) -> None:
+        try:
+            self.pasteguard.ignore(match)
+        except OSError as exc:
+            Messagebox.show_error(f"Could not record that: {exc}", "AVGuard", parent=self)
+            return
+        self._banner("That exact text will not be warned about again.", "inverse-secondary")
+
+    def _offer_paste_guard(self) -> None:
+        """One banner, once, for an install that predates the guard."""
+        self.cfg.paste_guard_offered = True
+        try:
+            self.cfg.save()
+        except OSError as exc:
+            log.warning("could not record the paste-guard offer: %s", exc)
+        self._banner("New: AVGuard can warn when the clipboard holds a paste-and-run command, "
+                     "the fake-CAPTCHA scam. It would look at text you copy, on this PC only, "
+                     "keep none of it and send nothing.", "inverse-secondary")
+        for child in self.banner.winfo_children():
+            child.destroy()
+        tb.Button(self.banner, text="Turn it on", bootstyle="light-outline",
+                  command=self._enable_paste_guard).pack(side=RIGHT, padx=6)
+
+    def _enable_paste_guard(self) -> None:
+        self.cfg.paste_guard_enabled = True
+        try:
+            self.cfg.save()
+        except OSError as exc:
+            Messagebox.show_error(f"Could not save: {exc}", "AVGuard", parent=self)
+            return
+        log.info("paste guard turned on")
+        self._banner("The paste guard is on. It can be turned off in Settings.", "inverse-success")
+
+    def _describe_paste_guard(self) -> tuple[bool, str]:
+        if not self.cfg.paste_guard_enabled:
+            return True, "off - the clipboard is never opened"
+        if not self.pasteguard.source.available:
+            return True, "unavailable on this platform"
+        return self.pasteguard.healthy, self.pasteguard.describe()
 
     # ---------------------------------------------------------- detections
 
@@ -1085,6 +1189,7 @@ class AVGuardApp(tb.Window):
              f"on, {self.cloud.spent_today} lookup(s) today" if self.cfg.cloud_enabled
              else "off - no hashes leave this machine"),
             ("Hash blocklist", True, self._describe_iocs()),
+            ("Paste guard", *self._describe_paste_guard()),
             ("File integrity", self._fim_ok(), self._describe_fim()),
             ("Event forwarding", True,
              f"on -> {self.forwarder.url}: {self.forwarder.describe()}"

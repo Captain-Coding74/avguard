@@ -1,0 +1,1 @@
+mshta C:\Program Files\App\panel.hta

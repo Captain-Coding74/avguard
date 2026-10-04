@@ -1,0 +1,1 @@
+cmd /c call .\ci\runner.cmd --stage test

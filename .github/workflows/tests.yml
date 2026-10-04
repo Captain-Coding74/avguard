@@ -78,13 +78,16 @@ jobs:
           import importlib
           modules = ["config", "protection", "scanner", "quarantine", "cloud",
                      "watcher", "logsetup", "instance", "archives", "peinfo",
-                     "events", "signing", "scheduling", "tlsh", "iocs"]
+                     "events", "signing", "scheduling", "tlsh", "iocs", "clipguard"]
           for name in modules:
               importlib.import_module(f"avguard.{name}")
               print(f"  ok  avguard.{name}")
           from avguard.signing import SignatureChecker
           assert not SignatureChecker().available, "signing must report unavailable off Windows"
           print("signature checking correctly reports unavailable")
+          from avguard.clipguard import WindowsClipboard
+          assert not WindowsClipboard().available, "the clipboard must report unavailable off Windows"
+          print("the paste guard correctly reports unavailable")
           PY
 
       - name: Run the platform-independent tests

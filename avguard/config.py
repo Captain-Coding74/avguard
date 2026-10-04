@@ -130,6 +130,15 @@ class Config:
     # Set once the first-run dialog has been answered.
     onboarding_completed: bool = False
 
+    # The paste guard (avguard/clipguard.py): read the text on the clipboard,
+    # on this PC only, for the shape of a paste-and-run scam command. Off in
+    # the file because turning clipboard reading on silently at an upgrade is
+    # the "having told the user neither" failure; the first-run dialog offers
+    # it pre-ticked with the sentence that says what it reads, and an
+    # existing install is offered it once (paste_guard_offered).
+    paste_guard_enabled: bool = False
+    paste_guard_offered: bool = False
+
     # Look inside .zip containers. Downloads is where zipped samples arrive,
     # so this is on; members are read in memory and never extracted.
     archive_scanning_enabled: bool = True

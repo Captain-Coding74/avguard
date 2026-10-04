@@ -1,0 +1,1 @@
+msiexec /i C:\downloads\app.msi /qn

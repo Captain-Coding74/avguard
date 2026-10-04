@@ -1,0 +1,1 @@
+powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File .\tools\build.ps1 -Configuration Release

@@ -200,8 +200,9 @@ class TestRulesDoNotMatchOurselves(unittest.TestCase):
             for path in base.rglob("*"):
                 if not path.is_file() or "__pycache__" in path.parts:
                     continue
-                if path.parent.name in ("must_match",):
-                    continue          # these are supposed to match
+                if path.parent.name in ("must_match", "must_warn"):
+                    continue          # these are supposed to look malicious:
+                    # must_match for the rules, must_warn for the paste guard
                 checked += 1
                 with self.subTest(path=str(path.relative_to(PROJECT))):
                     matched = [m.rule for m in self.rules.match(data=path.read_bytes())]

