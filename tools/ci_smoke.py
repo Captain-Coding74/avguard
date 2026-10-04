@@ -221,11 +221,18 @@ def _run(work: Path) -> int:
     code, output = run("--paste-check", str(lure))
     check("--paste-check warns on a paste-and-run shape", code == 1 and "WARNING" in output,
           f"exit {code}: {output[-300:]}")
+    # A launcher in command position, so the classifier is exercised rather
+    # than returning before it looks (a "winget" line proved nothing).
     safe = work / "safe.txt"
-    safe.write_text("winget install --id Git.Git", encoding="utf-8")
+    safe.write_text(r"cmd /c call .\ci\runner.cmd --stage test", encoding="utf-8")
     code, output = run("--paste-check", str(safe))
-    check("--paste-check is quiet on an ordinary command", code == 0,
-          f"exit {code}: {output[-300:]}")
+    check("--paste-check is quiet on an ordinary launcher command",
+          code == 0 and "No paste-and-run shape" in output, f"exit {code}: {output[-300:]}")
+    notice = work / "notice.txt"
+    notice.write_text('powershell -c "irm https://astral.sh/uv/install.ps1 | iex"', encoding="utf-8")
+    code, output = run("--paste-check", str(notice))
+    check("--paste-check calls an install one-liner a notice and exits 0",
+          code == 0 and "NOTICE" in output, f"exit {code}: {output[-300:]}")
 
     print()
     if failures:

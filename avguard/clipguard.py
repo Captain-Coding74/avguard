@@ -49,7 +49,6 @@ NOTICE = "notice"
 # Text longer than this is skipped and counted, never reported: a paste-and-run
 # command is a few hundred bytes, a copied log file is not our business.
 MAX_TEXT_CHARS = 32_768
-PREVIEW_CHARS = 160
 # Health goes red only after this many consecutive failed reads: one
 # collision with an application holding the clipboard is invisible, a
 # clipboard stuck open is loud.
@@ -61,8 +60,6 @@ PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 # KeePass sets the first, 1Password and others the second. Present means the
 # text is not read at all.
 EXCLUSION_FORMATS = ("Clipboard Viewer Ignore", "ExcludeClipboardContentFromMonitorProcessing")
-
-_ZERO_WIDTH = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u200e\u200f\u2060\u2061\u2062\u2063\ufeff\u00ad"))
 
 # A Run-box or address-bar command has to name a program. That is the central
 # false-positive control: an install line typed into an open shell, a
@@ -79,18 +76,45 @@ _RUNS_WHAT_IT_FETCHES = {"mshta", "msiexec", "rundll32", "regsvr32", "wscript", 
 _ENCODED = re.compile(r"(?:^|\s)[-/]e(?:c|n[a-z]*)?\s+[a-z0-9+/=]{40,}|frombase64strin[g]\s*\(|\[convert\]::frombase64")
 _FETCH = re.compile(r"\b(?:iwr|irm|invoke-webrequest|invoke-restmethod|downloadstring|downloadfile|"
                     r"downloaddata|openread|webclient|start-bitstransfer|httpclient|curl|wget|urlcache|"
-                    r"/transfer|webrequest)\b")
-_EXEC = re.compile(r"\b(?:iex|invoke-expression|start-process|saps|invoke-item|invoke-command|icm|start|call)\b"
-                   r"|\.invoke\s*\(|scriptblock\]::create|cmd\s*/[ckr]\b|\|\s*(?:cmd|powershell|pwsh|sh|bash|zsh)\b|&\s*\(")
-_URL = re.compile(r"(?:https?|ftps?|wss?)://([^\s/\"'<>()\\]+)")
+                    r"webrequest)\b|(?<!\S)/transfer\b")
+# "start" the verb, not Start-Sleep or Start-Service.
+_EXEC = re.compile(r"\b(?:iex|invoke-expression|start-process|saps|invoke-item|invoke-command|icm|call)\b"
+                   r"|\bstart\b(?!-)|\.invoke\s*\(|scriptblock\]::create|cmd\s*/[ckr]\b"
+                   r"|\|\s*(?:cmd|powershell|pwsh|sh|bash|zsh)\b|&\s*\(")
+# A program file named right after a command separator is run: the second
+# half of "fetch it, then run it" when no verb says so.
+_RUN_FILE = re.compile(r"[&;|]\s*\"?[^\s\"&|;]+\.(?:exe|bat|cmd|ps1|vbs|vbe|js|jse|wsf|hta|msi|scr|com)\"?"
+                       r"(?=[\s&|;]|$)")
+# The host stops at the first character that cannot be in one, so a lure
+# written "https://a|iex" names the host "a", not "a|iex".
+# ...and the authority ends at the first "/", "?" or "#" before the user part
+# is cut away, or "https://evil.invalid#@example.com/x" (fetched from
+# evil.invalid) would be reported as example.com.
+_URL = re.compile(r"(?:https?|ftps?|wss?)://(?:[^\s/?#@\"'<>()\\]*@)?([\w.-]+|\[[0-9a-f:.]+\])")
+_URL_TOKEN = re.compile(r"(?:https?|ftps?|wss?)://[^\s\"'<>|&;()]+")
 _BARE_HOST = re.compile(r"(?<![\w@.\\/-])((?:[a-z0-9-]+\.)+(?:[a-z]{2,}|invalid|test)|\d{1,3}(?:\.\d{1,3}){3})(?::\d{2,5})?/[^\s\"'<>()]+")
 # A share at an IP address or a WebDAV port is how a lure delivers a script;
 # a share by host name is how a company does, so only the first two count.
 _WEBDAV_UNC = re.compile(r"\\\\(\d{1,3}(?:\.\d{1,3}){3}|[a-z0-9.-]+@(?:ssl@)?\d+|[a-z0-9.-]+@ssl)(?:\\|/)")
 _INLINE_HTA = re.compile(r"mshta(?:\.exe)?\s+[\"']?(?:vbscript|javascript):")
-_HIDDEN = re.compile(r"(?:^|\s)-w(?:indowstyle|in)?\s+(?:h(?:idden)?|1)\b|\bstart\s+/min\b|--headless\b|(?:^|\s)-noni(?:nteractive)?\b")
+
+
+def _prefixes(word: str, shortest: int) -> str:
+    """PowerShell takes any unambiguous prefix of a parameter or an enum value,
+    so "-w hid", "-window Hidden" and "-noni" all mean the whole word."""
+    return "|".join(word[:n] for n in range(len(word), shortest - 1, -1))
+
+
+_HIDDEN = re.compile(rf"(?:^|\s)-(?:{_prefixes('windowstyle', 1)})\s+(?:{_prefixes('hidden', 1)}|1)\b"
+                     rf"|\bstart\s+/min\b|--headless\b|(?:^|\s)-(?:{_prefixes('noninteractive', 3)})\b")
 _DROP = re.compile(r"%(?:temp|tmp|appdata|localappdata|public|programdata)%|\$env:(?:temp|tmp|appdata|localappdata|public|programdata)\b|c:\\users\\public|\\appdata\\(?:local|roaming)\\")
-_LURE_COMMENT = re.compile(r"(?:^|\s)(?:#|rem\b)[^\n]*?(?:robot|captcha|turnstile|cloudflare|ray id|verif|human)")
+# Matched line by line: the comment and the lure words must share a line.
+# The words are the lure's, not any comment's: "# verify the server is up"
+# is a comment.
+_LURE_COMMENT = re.compile(
+    r"(?:^|\s)(?:#|rem\b)[^\n]*?(?:robot|captcha|turnstile|cloudflare|ray id|"
+    r"verif(?:y|ication) (?:you|that you|your|i am|i'm|id\b|code\b|hash\b|step\b|token\b|complete|required|success)|"
+    r"(?:are|am|a|not) human|human verification|i am not|i'm not|press enter|unusual traffic|security check)")
 _LURE_MARK = re.compile(r"[\u2705\u2714\u2713\u2611\U0001f512\U0001f6e1]")
 _PADDED_COMMENT = re.compile(r"\S[ \t]{12,}#")
 _CHARCODE = re.compile(r"\[char\]")
@@ -104,33 +128,60 @@ _COMMAND_LEADERS = {"/c", "/k", "/r", "/min", "--headless", "&&", "||", "|", ";"
                     "-command", "-c", "-file"}
 
 
-def _launcher_in_command_position(low: str) -> str:
-    """The first launcher that sits where a command sits, else empty.
+_POSITION_CHARS = "\"'\\/@&|;(=\n"
+
+
+def _in_command_position(lines: str, start: int) -> bool:
+    """Whether what begins at `start` sits where a command sits: at the start
+    of the text or of a line, after a path separator, quote or hand-off
+    character, or after a token that hands over to a command.
 
     A Run-box string begins with its program, or reaches it through a path, a
-    quote or a hand-off token. A launcher word in the middle of a sentence
-    ("open cmd and run powershell to check") is prose, and prose with a URL
-    and the word "start" in it used to earn a notice.
+    quote or a hand-off token; a lure's instructions put the command on its
+    own line. A launcher word in the middle of a sentence ("open cmd and run
+    powershell to check") is prose, and prose with a URL and the word "start"
+    in it used to earn a notice.
     """
-    for found in _LAUNCHER.finditer(low):
-        before = low[:found.start()]
-        if not before.strip():
+    before = lines[:start]
+    if not before.strip():
+        return True
+    previous = before[-1]
+    if previous in _POSITION_CHARS:
+        return True
+    if previous == " ":
+        token = before.split()[-1]
+        return token in _COMMAND_LEADERS or token.endswith(("&&", "||", "|", ";"))
+    return False
+
+
+def _launcher(lines: str) -> str:
+    """The first launcher, else the first protocol handler, in command
+    position; else empty. A launcher word inside a URL
+    (github.com/PowerShell/PowerShell) is a path, not a program."""
+    urls = [found.span() for found in _URL_TOKEN.finditer(lines)]
+
+    def inside_url(position: int) -> bool:
+        return any(start <= position < end for start, end in urls)
+
+    for found in _LAUNCHER.finditer(lines):
+        if not inside_url(found.start()) and _in_command_position(lines, found.start()):
             return found.group(1)
-        previous = before[-1]
-        if previous in "\"'\\/@&|;(=":
-            return found.group(1)
-        if previous == " ":
-            token = before.rstrip().rsplit(" ", 1)[-1]
-            if token in _COMMAND_LEADERS or token.endswith(("&&", "||", "|", ";")):
-                return found.group(1)
+    for found in _PROTOCOL.finditer(lines):
+        if not inside_url(found.start()) and _in_command_position(lines, found.start()):
+            return found.group(1) + ":"      # a URI pasted into Run is its own launcher
     return ""
+
+
+def _is_loopback(host: str) -> bool:
+    """This machine is not a remote location."""
+    return host in ("localhost", "::1", "0.0.0.0", "[::1]") or host.startswith("127.")
 
 
 _LAUNCHER_WORDS = {
     "powershell": "PowerShell", "pwsh": "PowerShell", "mshta": "mshta", "cmd": "the command prompt",
     "wscript": "Windows Script Host", "cscript": "Windows Script Host", "rundll32": "rundll32",
     "regsvr32": "regsvr32", "msiexec": "the Windows Installer", "certutil": "certutil",
-    "bitsadmin": "bitsadmin", "conhost": "a hidden console", "curl": "curl", "forfiles": "forfiles",
+    "bitsadmin": "bitsadmin", "conhost": "a console", "curl": "curl", "forfiles": "forfiles",
     "explorer": "Explorer", "wmic": "WMI", "msbuild": "MSBuild", "installutil": "InstallUtil",
 }
 
@@ -138,32 +189,39 @@ _LAUNCHER_WORDS = {
 # ------------------------------------------------------------ classifier
 
 def normalize(text: str) -> str:
-    """What the matcher sees: compatibility-folded, zero-width characters and
-    cmd caret escapes removed, blank runs kept (the padded comment needs them)."""
-    text = unicodedata.normalize("NFKC", text).translate(_ZERO_WIDTH)
+    """What the matcher sees: compatibility-folded, every Unicode format
+    character (category Cf: zero-width joiners, bidi controls, the soft
+    hyphen, tag characters) and cmd caret escapes removed, blank runs kept
+    (the padded comment needs them). Nothing in Cf can appear in a command
+    that runs; anything in Cf can hide one from a pattern."""
+    if not text.isascii():
+        # Half of a UTF-16 pair, which a clipboard can hold, has no UTF-8
+        # form and would stop the hash below; it becomes U+FFFD here.
+        text = text.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
+        text = unicodedata.normalize("NFKC", text)
+        text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
     text = re.sub(r"\^(?=[^\s^])", "", text)
     return text[:MAX_TEXT_CHARS + 1]
 
 
 @dataclass(frozen=True)
 class Match:
-    """A command the guard would warn about, and why. Carries no text beyond
-    the on-screen preview, which is never stored."""
+    """A command the guard would warn about, and why. Carries the launcher,
+    the host, the signals and a hash for the ignore list, never the text."""
     tier: str
     signals: tuple[str, ...]
     launcher: str
     host: str
     sha256: str
     chars: int
-    preview: str
 
     def does(self) -> str:
         """What the command would do, in the words of the banner."""
         who = _LAUNCHER_WORDS.get(self.launcher, self.launcher)
-        hidden = "hidden window" in self.signals
+        hidden = " in a hidden window" if "hidden window" in self.signals else ""
         where = f" from {self.host}" if self.host else ""
         if "encoded command" in self.signals:
-            return f"start {who}{' hidden' if hidden else ''} and run an encoded command{where}"
+            return f"start {who}{hidden} and run an encoded command{where}"
         if "remote HTML application" in self.signals or "inline mshta script" in self.signals:
             return f"run an HTML application{where or ' from an inline script'} through mshta"
         if "remote installer package" in self.signals:
@@ -176,48 +234,47 @@ class Match:
             return f"start {who} and run an obfuscated command{where}"
         if "protocol handler to a remote location" in self.signals:
             return f"open a remote location{where} through the {self.launcher} handler"
-        return f"start {who}{' hidden' if hidden else ''} and run code fetched{where}"
+        return f"start {who}{hidden} and run code it downloads{where}"
 
     def sentence(self, owner: str | None) -> str:
-        who = f"it was copied from {owner}" if owner else \
+        wrote = f"it was copied from {owner}" if owner else \
             "the program that put it there could not be identified"
         if self.tier == WARNING:
-            return (f"The clipboard holds a command that would {self.does()}; {who}. This is the "
+            return (f"The clipboard holds a command that would {self.does()}; {wrote}. This is the "
                     "shape of a fake-CAPTCHA or 'fix this error' scam. If you did not write this "
                     "command yourself, do not paste it.")
         where = f" from {self.host}" if self.host else ""
-        return (f"The clipboard holds a {_LAUNCHER_WORDS.get(self.launcher, self.launcher)} command "
-                f"that downloads and runs code{where}; {who}. Installers are often shared this way; "
-                "a scam page uses the same shape. Paste it only if you trust where you copied it from.")
+        return (f"The clipboard holds a command that starts "
+                f"{_LAUNCHER_WORDS.get(self.launcher, self.launcher)} and downloads and runs code"
+                f"{where}; {wrote}. Installers are often shared this way; a scam page uses the same "
+                "shape. Paste it only if you trust where you copied it from.")
 
 
 def classify(text: str) -> Match | None:
     """The shape of a paste-and-run command, or None. Pure; runs anywhere."""
     kept = normalize(text)
-    flat = re.sub(r"\s+", " ", kept).strip()
+    # `spaced` keeps line breaks (a line start is a command position, and a
+    # lure comment has to share its line with its words); `flat` is one line.
+    spaced = re.sub(r"\s*\n\s*", "\n", re.sub(r"[^\S\n]+", " ", kept)).strip()
+    flat = spaced.replace("\n", " ")
     low = flat.lower()
     if not low:
         return None
 
-    launcher = _launcher_in_command_position(low)
-    if not launcher:
-        protocol = _PROTOCOL.search(low)
-        if protocol:
-            launcher = protocol.group(1) + ":"     # a URI pasted into Run is its own launcher
+    launcher = _launcher(spaced.lower())
     if not launcher:
         return None
 
     url = _URL.search(low)
     bare = _BARE_HOST.search(low) if not url else None
-    host = ""
-    if url:
-        host = url.group(1).rsplit("@", 1)[-1].split(":", 1)[0]
-    elif bare:
-        host = bare.group(1)
+    host = url.group(1) if url else bare.group(1) if bare else ""
+    local = _is_loopback(host)
+    if local or len(host) > 253:
+        host = ""                     # this machine, or not a host name at all
     unc = _WEBDAV_UNC.search(low)
-    remote = bool(host) or bool(unc)
+    remote = (bool(url or bare) and not local) or bool(unc)
     fetch = remote or bool(_FETCH.search(low))
-    runs = bool(_EXEC.search(low)) or launcher in _RUNS_WHAT_IT_FETCHES
+    runs = bool(_EXEC.search(low)) or bool(_RUN_FILE.search(low)) or launcher in _RUNS_WHAT_IT_FETCHES
     hidden = bool(_HIDDEN.search(low))
 
     signals: list[str] = []
@@ -238,14 +295,19 @@ def classify(text: str) -> Match | None:
         signals.append("hidden window")
     if _DROP.search(low) and runs and (fetch or remote):
         signals.append("program dropped in a temporary folder")
-    if _LURE_COMMENT.search(low) or _LURE_MARK.search(kept):
-        signals.append("fake-verification comment")
-    if _PADDED_COMMENT.search(kept):
-        signals.append("padded comment")
-    if len(_CHARCODE.findall(low)) >= 3 or _OBFUSCATION.search(low):
-        signals.append("obfuscated")
     if launcher.endswith(":") and remote:
         signals.append("protocol handler to a remote location")
+    # The dressing: a comment, a checkmark, padding, obfuscation. Each is a
+    # strong sign on a command that fetches and runs or already looks wrong,
+    # and none is one on its own: "curl -I https://example.com # verify the
+    # server is up" is a comment, "1 -bxor 2" is arithmetic.
+    if signals or (fetch and runs):
+        if _LURE_COMMENT.search(spaced.lower()) or _LURE_MARK.search(kept):
+            signals.append("fake-verification comment")
+        if _PADDED_COMMENT.search(kept):
+            signals.append("padded comment")
+        if len(_CHARCODE.findall(low)) >= 3 or _OBFUSCATION.search(low):
+            signals.append("obfuscated")
 
     if signals:
         tier = WARNING
@@ -255,8 +317,7 @@ def classify(text: str) -> Match | None:
     else:
         return None
     return Match(tier=tier, signals=tuple(signals), launcher=launcher, host=host,
-                 sha256=hashlib.sha256(flat.encode("utf-8")).hexdigest(), chars=len(flat),
-                 preview=flat[:PREVIEW_CHARS])
+                 sha256=hashlib.sha256(flat.encode("utf-8")).hexdigest(), chars=len(flat))
 
 
 # ------------------------------------------------------------- sources
@@ -310,10 +371,15 @@ class FakeClipboard:
         return ClipText(self.text, self.owner, chars=len(self.text))
 
 
+def _last_error() -> int:
+    return getattr(ctypes, "get_last_error", lambda: 0)()
+
+
 class WindowsClipboard:
     """The real one, through user32 and kernel32. Reads only."""
 
     available = sys.platform == "win32"
+    unavailable_reason = "unavailable on this platform"
 
     def __init__(self) -> None:
         self._user32 = None
@@ -322,6 +388,7 @@ class WindowsClipboard:
         self._exclusion_formats: tuple[int, ...] = ()
         if self.available:
             self._bind()
+            self._register_exclusion_formats()
 
     def _bind(self) -> None:
         # `import ctypes` does not import the wintypes submodule; done here so
@@ -341,6 +408,8 @@ class WindowsClipboard:
         user32.RegisterClipboardFormatW.argtypes = [wt.LPCWSTR]
         user32.RegisterClipboardFormatW.restype = wt.UINT
         user32.GetClipboardOwner.restype = wt.HWND
+        user32.IsHungAppWindow.argtypes = [wt.HWND]
+        user32.IsHungAppWindow.restype = wt.BOOL
         user32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
         user32.GetWindowThreadProcessId.restype = wt.DWORD
         kernel32.GlobalSize.argtypes = [wt.HGLOBAL]
@@ -357,8 +426,18 @@ class WindowsClipboard:
         kernel32.CloseHandle.argtypes = [wt.HANDLE]
         kernel32.CloseHandle.restype = wt.BOOL
         self._user32, self._kernel32 = user32, kernel32
-        self._exclusion_formats = tuple(user32.RegisterClipboardFormatW(name)
-                                        for name in EXCLUSION_FORMATS)
+
+    def _register_exclusion_formats(self) -> None:
+        """The two privacy formats, by number. If either cannot be registered
+        the guard cannot honour it, so it reads nothing rather than read what
+        a password manager asked it not to."""
+        formats = tuple(int(self._user32.RegisterClipboardFormatW(name)) for name in EXCLUSION_FORMATS)
+        if not all(formats):
+            self.available = False
+            self.unavailable_reason = ("the clipboard's privacy formats could not be registered "
+                                       f"(error {_last_error()}), so the clipboard is not read")
+            log.error("paste guard: %s", self.unavailable_reason)
+        self._exclusion_formats = formats
 
     def sequence(self) -> int:
         """Changes on every clipboard write; 0 when this process may not read it."""
@@ -369,13 +448,18 @@ class WindowsClipboard:
         Raises ClipboardBusy when another application has it open."""
         user32, kernel32 = self._user32, self._kernel32
         if not user32.OpenClipboard(None):
-            raise ClipboardBusy(f"OpenClipboard failed (error {ctypes.get_last_error()})")
+            raise ClipboardBusy(f"OpenClipboard failed (error {_last_error()})")
         try:
-            owner = self._owner()
-            if any(user32.IsClipboardFormatAvailable(fmt) for fmt in self._exclusion_formats if fmt):
+            hwnd = user32.GetClipboardOwner()
+            owner = self._image_name(hwnd) if hwnd else None
+            if any(user32.IsClipboardFormatAvailable(fmt) for fmt in self._exclusion_formats):
                 return ClipText("", owner, excluded=True)
             if not user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
                 return None
+            if hwnd and user32.IsHungAppWindow(hwnd):
+                # An owner that delayed rendering and stopped answering would
+                # hold GetClipboardData, and this thread, until it recovers.
+                raise ClipboardBusy("the clipboard's owner is not responding")
             handle = user32.GetClipboardData(CF_UNICODETEXT)
             if not handle:
                 return None
@@ -386,7 +470,10 @@ class WindowsClipboard:
             if not pointer:
                 return None
             try:
-                text = ctypes.wstring_at(pointer, chars)
+                # From the raw UTF-16 bytes rather than through wchar_t: half
+                # of a surrogate pair becomes U+FFFD here, not a str that can
+                # neither be hashed nor written as UTF-8.
+                text = ctypes.string_at(pointer, chars * 2).decode("utf-16-le", "replace")
             finally:
                 kernel32.GlobalUnlock(handle)
             text = text.split("\0", 1)[0]
@@ -394,13 +481,10 @@ class WindowsClipboard:
         finally:
             user32.CloseClipboard()
 
-    def _owner(self) -> str | None:
-        """The program whose window owns the clipboard, by image name, or None."""
+    def _image_name(self, hwnd) -> str | None:
+        """The program behind a window, by image name, or None."""
         user32, kernel32 = self._user32, self._kernel32
         try:
-            hwnd = user32.GetClipboardOwner()
-            if not hwnd:
-                return None
             pid = self._wt.DWORD(0)
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
             if not pid.value:
@@ -463,13 +547,16 @@ class PasteGuard:
         """One poll. Reads the clipboard only when its sequence number moved."""
         if not getattr(self.source, "available", False):
             return None
-        sequence = self.source.sequence()
-        if sequence == 0:
-            # No access to the clipboard at all (a locked session, a service
-            # desktop). Said in Health rather than silently read as "quiet".
-            self.counters.zero_sequence = True
+        try:
+            sequence = self.source.sequence()
+        except Exception as exc:                  # a binding or OS failure: counted, not fatal
+            self._failed(exc, unexpected=True)
             return None
-        self.counters.zero_sequence = False
+        # 0 is what a window station reports before anything has been copied
+        # on it, and also what one reports to a process that may not read its
+        # clipboard. The two cannot be told apart from here, so Health says
+        # both and the number is tracked like any other.
+        self.counters.zero_sequence = sequence == 0
         if self._last_sequence is None:
             # Whatever was on the clipboard when AVGuard started is not examined.
             self._last_sequence = sequence
@@ -479,10 +566,12 @@ class PasteGuard:
         try:
             clip = self.source.read()
         except ClipboardBusy as exc:
-            self.counters.read_failures += 1
-            self.counters.consecutive_failures += 1
-            self.counters.last_error = str(exc)
+            self._failed(exc)
             return None          # the sequence stays unmoved, so the next tick retries
+        except Exception as exc:                  # a binding or OS failure: counted, not fatal
+            self._failed(exc, unexpected=True)
+            self._last_sequence = sequence        # and not retried twice a second
+            return None
         self._last_sequence = sequence
         self.counters.changes_seen += 1
         self.counters.consecutive_failures = 0
@@ -508,20 +597,42 @@ class PasteGuard:
         else:
             self.counters.notices += 1
         if self.events is not None:
+            # Recorded for History and never forwarded, whatever forwarding
+            # URL is set: "sends nothing" is the guard's promise, and a hash
+            # or length of a short command is a lookup away from the command,
+            # so neither is here either.
             self.events.record(Event(
                 kind="clipboard", path="", level=match.tier, score=0,
                 reasons=[match.sentence(clip.owner)],
-                detail={"signals": list(match.signals), "launcher": match.launcher, "host": match.host,
-                        "owner": clip.owner or "", "sha256": match.sha256, "chars": match.chars,
-                        "sequence": sequence}))
+                detail={"signals": list(match.signals), "launcher": match.launcher,
+                        "host": match.host, "owner": clip.owner or ""}), forward=False)
         if self.notify is not None:
             self.notify(match, clip)
         return match
 
+    def disarm(self) -> None:
+        """Forget where the clipboard was. Called on every tick while the guard
+        is off, so what was copied in the meantime is never examined: the
+        first tick after it comes back only records the sequence number."""
+        self._last_sequence = None
+
+    def _failed(self, exc: BaseException, unexpected: bool = False) -> None:
+        c = self.counters
+        c.read_failures += 1
+        c.consecutive_failures += 1
+        c.last_error = f"{type(exc).__name__}: {exc}" if unexpected else str(exc)
+        if unexpected:
+            # The traceback once per streak: a guard that fails on every tick
+            # must not write a hundred and twenty of them a minute.
+            (log.exception if c.consecutive_failures == 1 else log.debug)(
+                "the clipboard could not be read: %s", c.last_error)
+
     # ---------------------------------------------------------- ignore list
 
     def ignored(self) -> set[str]:
-        """SHA-256s of normalized texts the user said not to warn about again."""
+        """SHA-256s of normalized texts the user said not to warn about again.
+        Unkeyed: the file sits beside the configuration, and a key beside it
+        would protect it from nobody who can read it. It never leaves disk."""
         try:
             mtime = self.ignore_path.stat().st_mtime
         except OSError:
@@ -549,17 +660,17 @@ class PasteGuard:
 
     @property
     def healthy(self) -> bool:
-        return (not self.counters.zero_sequence
-                and self.counters.consecutive_failures < HEALTH_FAILURE_STREAK)
+        return self.counters.consecutive_failures < HEALTH_FAILURE_STREAK
 
     def describe(self) -> str:
         c = self.counters
         if c.zero_sequence:
-            return ("the clipboard cannot be read from this session (sequence number 0); "
-                    "nothing is being checked")
+            return ("waiting: the clipboard's sequence number is 0, so either nothing has been "
+                    "copied since sign-in or this session may not read the clipboard; "
+                    "nothing has been checked yet")
         if c.consecutive_failures >= HEALTH_FAILURE_STREAK:
-            return (f"the clipboard has been held open by another program for "
-                    f"{c.consecutive_failures} checks ({c.last_error}); nothing is being checked")
+            return (f"the clipboard could not be read for {c.consecutive_failures} checks in a row "
+                    f"({c.last_error}); nothing is being checked")
         skipped = c.skipped_excluded + c.skipped_not_text + c.skipped_too_long
         return (f"on: {c.changes_seen} change(s) seen, {c.texts_read} read as text, {skipped} skipped "
                 f"(private, not text or too long), {c.notices} notice(s), {c.warnings} warning(s); "

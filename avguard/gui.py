@@ -125,6 +125,7 @@ class AVGuardApp(tb.Window):
         # is set; the tick checks that before touching the source.
         self.pasteguard = clipguard.PasteGuard(clipguard.WindowsClipboard(), self.events,
                                                notify=self._paste_warning)
+        self._clipboard_tick_failed = False
 
         self._shutting_down = False
         self._scan_thread: threading.Thread | None = None
@@ -369,7 +370,8 @@ class AVGuardApp(tb.Window):
         """Show a one-line notice above the panes, replacing any previous one.
 
         Any button the previous banner carried goes with it: "Don't warn
-        about this text again" must not sit beside "Scan complete".
+        about this text again" must not sit beside "Scan complete". A caller
+        that wants a button adds it after this call.
         """
         for child in self.banner.winfo_children():
             child.destroy()
@@ -425,10 +427,10 @@ class AVGuardApp(tb.Window):
                        "the Run box. AVGuard would look at text you copy, on this PC, for that "
                        "shape; it keeps none of it and sends nothing.")).pack(anchor="w", pady=(0, 14))
 
-        def finish(auto: bool) -> None:
+        def finish(auto: bool, chosen: bool = True) -> None:
             window.grab_release()
             window.destroy()
-            self._apply_first_run(auto, paste_var.get())
+            self._apply_first_run(auto, paste_var.get() if chosen else None)
 
         buttons = tb.Frame(body)
         buttons.pack(fill=X)
@@ -437,14 +439,17 @@ class AVGuardApp(tb.Window):
         tb.Button(buttons, text="Watch and quarantine automatically", bootstyle="warning",
                   command=lambda: finish(True)).pack(side=LEFT, expand=True, fill=X)
 
-        # Closing the window without choosing is the cautious answer.
-        window.protocol("WM_DELETE_WINDOW", lambda: finish(False))
+        # Closing the window without choosing is the cautious answer for both
+        # switches: nothing is moved and nothing is read. The pre-ticked box
+        # is not a yes; the one-time banner offers the guard on the next start.
+        window.protocol("WM_DELETE_WINDOW", lambda: finish(False, chosen=False))
 
-    def _apply_first_run(self, auto_quarantine: bool, paste_guard: bool = False) -> None:
+    def _apply_first_run(self, auto_quarantine: bool, paste_guard: bool | None = False) -> None:
+        """`paste_guard` None means the dialog was dismissed without a choice."""
         self.cfg.auto_quarantine = auto_quarantine and self.has_lock
         self.cfg.onboarding_completed = True
         self.cfg.paste_guard_enabled = bool(paste_guard)
-        self.cfg.paste_guard_offered = True
+        self.cfg.paste_guard_offered = paste_guard is not None
         try:
             self.cfg.save()
         except OSError as exc:
@@ -458,7 +463,9 @@ class AVGuardApp(tb.Window):
     # --------------------------------------------------------- paste guard
 
     def _tick_clipboard(self) -> None:
-        """The paste guard's poll. Nothing is touched while the guard is off.
+        """The paste guard's poll. Nothing is touched while the guard is off,
+        and the guard forgets where the clipboard was, so text copied while
+        it was off is never examined when it comes back on.
 
         Rescheduled from `finally` for the reason _pump is: a tick that
         dies takes the guard with it and the Health row would still read on.
@@ -466,8 +473,13 @@ class AVGuardApp(tb.Window):
         try:
             if self.cfg.paste_guard_enabled and not self._shutting_down:
                 self.pasteguard.tick()
+            else:
+                self.pasteguard.disarm()
+            self._clipboard_tick_failed = False
         except Exception:
-            log.exception("the paste guard's tick failed")
+            if not getattr(self, "_clipboard_tick_failed", False):
+                log.exception("the paste guard's tick failed")
+            self._clipboard_tick_failed = True       # the traceback once, not twice a second
         finally:
             if not self._shutting_down:
                 self.after(CLIPBOARD_TICK_MS, self._tick_clipboard)
@@ -478,11 +490,6 @@ class AVGuardApp(tb.Window):
         if match.tier == clipguard.WARNING:
             log.warning("PASTE GUARD: %s", sentence)
             self._banner(sentence, "inverse-danger")
-            for child in self.banner.winfo_children():
-                child.destroy()
-            tb.Button(self.banner, text="Don't warn about this text again",
-                      bootstyle="light-outline",
-                      command=lambda m=match: self._ignore_paste_text(m)).pack(side=RIGHT, padx=6)
             if self.tray is not None:
                 try:
                     self.tray.notify("A paste-and-run command is in your clipboard", "AVGuard")
@@ -491,6 +498,10 @@ class AVGuardApp(tb.Window):
         else:
             log.info("paste guard: %s", sentence)
             self._banner(sentence, "inverse-warning")
+        # The button on both tiers: the honest install line a developer pastes
+        # every week is the notice, and that is the one worth silencing.
+        tb.Button(self.banner, text="Don't warn about this text again", bootstyle="light-outline",
+                  command=lambda m=match: self._ignore_paste_text(m)).pack(side=RIGHT, padx=6)
 
     def _ignore_paste_text(self, match: clipguard.Match) -> None:
         try:
@@ -501,7 +512,14 @@ class AVGuardApp(tb.Window):
         self._banner("That exact text will not be warned about again.", "inverse-secondary")
 
     def _offer_paste_guard(self) -> None:
-        """One banner, once, for an install that predates the guard."""
+        """One banner, once, for an install that predates the guard.
+
+        Shown only when no other banner is up (a startup warning outranks a
+        feature notice) and recorded as offered only once it has been shown;
+        otherwise the next start tries again.
+        """
+        if self.banner.winfo_ismapped() and self.banner_var.get():
+            return
         self.cfg.paste_guard_offered = True
         try:
             self.cfg.save()
@@ -510,8 +528,6 @@ class AVGuardApp(tb.Window):
         self._banner("New: AVGuard can warn when the clipboard holds a paste-and-run command, "
                      "the fake-CAPTCHA scam. It would look at text you copy, on this PC only, "
                      "keep none of it and send nothing.", "inverse-secondary")
-        for child in self.banner.winfo_children():
-            child.destroy()
         tb.Button(self.banner, text="Turn it on", bootstyle="light-outline",
                   command=self._enable_paste_guard).pack(side=RIGHT, padx=6)
 
@@ -520,7 +536,8 @@ class AVGuardApp(tb.Window):
         try:
             self.cfg.save()
         except OSError as exc:
-            Messagebox.show_error(f"Could not save: {exc}", "AVGuard", parent=self)
+            self.cfg.paste_guard_enabled = False     # what is shown is what runs
+            Messagebox.show_error(f"Could not save, so the guard stays off: {exc}", "AVGuard", parent=self)
             return
         log.info("paste guard turned on")
         self._banner("The paste guard is on. It can be turned off in Settings.", "inverse-success")
@@ -529,7 +546,7 @@ class AVGuardApp(tb.Window):
         if not self.cfg.paste_guard_enabled:
             return True, "off - the clipboard is never opened"
         if not self.pasteguard.source.available:
-            return True, "unavailable on this platform"
+            return True, getattr(self.pasteguard.source, "unavailable_reason", "unavailable on this platform")
         return self.pasteguard.healthy, self.pasteguard.describe()
 
     # ---------------------------------------------------------- detections
@@ -899,8 +916,6 @@ class AVGuardApp(tb.Window):
         Shown next to the banner rather than as a modal, so it never
         interrupts a running scan.
         """
-        for child in self.banner.winfo_children():
-            child.destroy()
         tb.Button(self.banner, text=f"Never scan {folder.name}",
                   bootstyle="light-outline",
                   command=lambda f=folder: self._exclude_folder(f)).pack(side=RIGHT, padx=6)

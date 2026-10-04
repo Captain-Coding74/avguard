@@ -725,6 +725,100 @@ or `start`, and two prose fixtures must stay silent. And a banner's button
 outlived its message, so "Don't warn about this text again" would have sat
 beside "Scan complete"; a banner now clears the previous one's button.
 
+**The paste guard, second reading, 2026-10-04.** Asked whether the code was
+right rather than whether it worked, a five-lens adversarial read (the Win32
+calls, the classifier, the window, privacy, the tests) returned 47 findings,
+several the same defect seen through two lenses. Each was reproduced against
+the shipped code before anything changed; the ones that reproduced are now
+tests, and the fixes are in `avguard/clipguard.py`, `gui.py`, `events.py`
+and `tests/test_clipguard.py`.
+
+The classifier. The dressing signals (lure comment, checkmark, padded
+comment, obfuscation) fired on a launcher alone, so `curl -I
+https://example.com # verify the server is up` was a warning; they count
+only on a command that fetches and runs or already carries a structural
+signal, the lure words are the lure's ("verify you", "not a robot", "ray
+id"), not any "verif", and a program file named after a command separator
+(`& %TEMP%\\a.exe`) counts as the run so the gate does not lose the
+fetch-then-run-by-name shape. A launcher word inside a URL path
+(`github.com/PowerShell/PowerShell`) and a protocol handler in prose were
+command positions, while a command on its own line after "press Win+R and
+paste:" was not; a URL is never a position now and a line start always is.
+The host regex admitted `|;?#&`, so `https://a|iex` named the host "a|iex",
+and it cut the user part before the fragment, so `https://evil.invalid#@
+example.com/x` (fetched from evil.invalid) was reported as example.com; the
+authority ends at `/`, `?` or `#`, the host at the first character that
+cannot be in one, loopback is not remote and 254 characters is not a host.
+`\\bstart\\b` matched `Start-Service`; `/transfer` could never match after a
+space; `-w hid` and `-window hidden` (PowerShell takes any prefix) were not
+hidden; eleven hand-picked zero-width characters were stripped where every
+Unicode format character (bidi controls, tag characters) is now; a lure
+comment matched across lines; and a lone UTF-16 surrogate, which a clipboard
+can hold, raised at the hash with the warning lost and the sequence already
+advanced (the one finding both refuters confirmed before the run hit its
+limit: the clipboard is decoded from its UTF-16 bytes with replacement, and
+`normalize()` does the same for any source). The sentences read "start a
+hidden console hidden" and "a the command prompt command".
+
+The reader. `GetClipboardData` on a delayed-rendering owner that has
+stopped answering holds the calling thread, which is the Tk thread;
+`IsHungAppWindow` is asked first and such an owner is a retry, not a wait.
+A `RegisterClipboardFormatW` that returned 0 meant a privacy format silently
+not honoured; it turns the guard off with the reason in Health. Sequence
+number 0 was read as "no access" and shown red; it is also what a window
+station reports before its first copy, so Health says both and the first
+copy is examined.
+
+The window and privacy. Turning the guard off and on again read whatever
+was copied while it was off: the guard forgets its sequence number on every
+tick it is off. Closing the first-run dialog with the X applied the
+pre-ticked box and turned clipboard reading on; dismissal turns nothing on,
+and the one-time banner offers the guard on the next start. "Sends nothing"
+was false with event forwarding on, because the clipboard event went
+through the same store; `EventStore.record(..., forward=False)` keeps it on
+this machine whatever address is set, and the consent sentence says so. The
+event carried a SHA-256 and the length of the command, a lookup away from
+the command; the detail is signals, launcher, host and owning program, and
+a test pins that set. The one-time offer replaced a startup warning
+("YARA rules failed to load") and marked itself done before it could be
+seen; it waits for an empty banner and is marked when shown. An error other
+than a busy clipboard logged a traceback twice a second and never reached
+Health; counted, logged once per streak, red after the streak. A failed
+save left the guard running while the dialog said it could not save. A
+notice could not be silenced though the README promised the button. A
+160-character preview of the text lived in memory behind the button for
+nothing. Refused: an HMAC-keyed ignore hash, because the key would sit
+beside the file it protects, the hash never leaves disk, and it is no
+longer in the event.
+
+The tests. The detection-unchanged test compared a value with itself. The
+window's off switch, the enforcement point of "reads nothing while off",
+had no test. A fixture named for a signal proved only that something warned:
+most carried `-w hidden`, and a mutation run deleted nine detector pieces
+with the corpus green. The reader's call order was untested anywhere, and
+the Windows runner test asserted tautologies. Now every must_warn fixture
+claims the signal it is named for and every signal has a fixture (five
+isolating fixtures added); the reader runs on every platform against a fake
+user32 with the call order asserted and the privacy format checked before
+the data is touched; the Windows runner writes known UTF-16 bytes to the
+clipboard and reads them back through the guard; the window's tick, Health
+row, first-run choice, offer and enable path run on a fake self and the
+banner's button on the shared withdrawn root; `unittest.main()` is at the
+end of the file; the self-match exclusion names the one directory; the
+smoke check's quiet case is a launcher line and a notice case is added.
+
+Measured here: `classify()` 32 us on the lure, 20 us on an ordinary
+launcher line, 6.5 us on a line with no launcher, 1.3 ms over 16 KB of text
+and 2.9 ms when that text is not ASCII (the format-character filter), all
+against a 500 ms tick. Corpus: 33 of 33 must_warn fixtures warn with the
+signal they are named for; 0 of 38 must_not_warn lines warn, 4 at notice
+(the bun, uv and pnpm install lines and a loopback dev server). On the
+Windows runner `GetClipboardSequenceNumber` costs 0.93 us per call over
+100,000 calls, so the idle poll is 2 us a second. Tests 551 -> 593. Still
+not measured on the owner's desktop: the live tick over a session, what
+`GetClipboardOwner` resolves to for a browser's write, which password
+managers set which marker.
+
 ## Deliberately not doing
 
 The paste guard (above) is the one input that is not a file; it watches a user-mode clipboard buffer through documented calls, with no driver, no hook and no process telemetry, so it does not reopen the first decision here. The EDR-shaped extensions of it are refused by name: no keyboard hook to see Win+R, no automation of the Run dialog, no watching what the user then runs.

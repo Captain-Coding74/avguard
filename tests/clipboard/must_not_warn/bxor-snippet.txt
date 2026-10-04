@@ -1,0 +1,1 @@
+powershell -c "1 -bxor 2"

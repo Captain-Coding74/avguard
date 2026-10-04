@@ -455,9 +455,8 @@ class SettingsDialog(tb.Toplevel):
         return Messagebox.yesno(
             f"Send scan events to {url}?" + CHR_NL + CHR_NL
             + "Every event carries the file's path, the verdict, the rule names and "
-              "the SHA-256 hash of the file; a paste-guard warning carries the program "
-              "that wrote the clipboard and the host the command names, never the text. "
-              "Nothing is sent while the address is empty.",
+              "the SHA-256 hash of the file. The paste guard's warnings stay on this "
+              "machine and are never sent. Nothing is sent while the address is empty.",
             "Forward events?", parent=self) == "Yes"
 
     def _apply_scheduling(self) -> list[str]:

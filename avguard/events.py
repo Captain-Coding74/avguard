@@ -67,8 +67,12 @@ class EventStore:
         # An EventForwarder, or None. Swapped by the GUI when the URL changes.
         self.forwarder = forwarder
 
-    def record(self, event: Event) -> None:
-        """Append one event. Never raises: history must not break a scan."""
+    def record(self, event: Event, forward: bool = True) -> None:
+        """Append one event. Never raises: history must not break a scan.
+
+        `forward=False` keeps the event on this machine whatever forwarding
+        URL is set; the paste guard records its events that way.
+        """
         payload = asdict(event)
         line = json.dumps(payload, ensure_ascii=False)
         try:
@@ -78,7 +82,7 @@ class EventStore:
                     handle.write(line + "\n")
         except OSError as exc:
             log.warning("could not record an event: %s", exc)
-        forwarder = self.forwarder
+        forwarder = self.forwarder if forward else None
         if forwarder is not None:
             try:
                 forwarder.submit(payload)   # queues and returns; never waits
