@@ -182,7 +182,10 @@ class SettingsDialog(tb.Toplevel):
                        "it as JSON: the file path, the verdict, the file's SHA-256 and the "
                        "evidence behind the verdict (each finding's source, weight, severity "
                        "and pack, a rule author's note, the counted totals and your "
-                       "quarantine threshold). Paste-guard warnings never leave. Meant for "
+                       "quarantine threshold); a startup change carries where it is and what "
+                       "it is called, its command line with its arguments, old and new, and "
+                       "the account a scheduled task runs as. Paste-guard warnings never "
+                       "leave. Meant for "
                        "a Network Watchdog server on your own network. A dead or slow "
                        "endpoint never slows a scan.")
                  ).pack(anchor="w", pady=(6, 0))
@@ -461,8 +464,10 @@ class SettingsDialog(tb.Toplevel):
             + "Every event carries the file's path, the verdict, the rule names and "
               "the SHA-256 hash of the file, and the evidence behind the verdict: each "
               "finding's source, weight, severity and pack, a rule author's note, the counted "
-              "totals and your quarantine threshold. The paste guard's warnings stay on this "
-              "machine and are never sent. Nothing is sent while the address is empty.",
+              "totals and your quarantine threshold. " + CHR_NL + CHR_NL
+            + "A startup change carries where it is and what it is called, its command line with its arguments, old and new, and the account a scheduled task runs as." + CHR_NL + CHR_NL
+            + "The paste guard's warnings stay on this machine and are never sent. Nothing is "
+              "sent while the address is empty.",
             "Forward events?", parent=self) == "Yes"
 
     def _apply_scheduling(self) -> list[str]:

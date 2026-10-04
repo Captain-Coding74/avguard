@@ -26,7 +26,7 @@ from ttkbootstrap.constants import (
 )
 from ttkbootstrap.dialogs import Messagebox, Querybox
 
-from . import autoruns, clipguard, config, dialogs, explain, fimpanel, logsetup, scheduling, startuppanel
+from . import autoruns, clipguard, config, dialogs, explain, fimpanel, logsetup, scheduling, signing, startuppanel
 from .events import Event, EventStore
 from .cloud import VirusTotalClient
 from . import iocs as iocs_module
@@ -1261,9 +1261,14 @@ class AVGuardApp(tb.Window):
         return autoruns.AutorunsStore()
 
     def _startup_trusted(self):
-        """Answers whether a startup item's target is a trusted-signed
-        program, through the scanner's Authenticode checker; None where
-        there is none, and then only the system root keeps a change quiet."""
+        """Answers whether a startup item's target under the Windows folder
+        may stay quiet, through the scanner's Authenticode checker; None
+        where there is none, and then the system root alone keeps a change
+        quiet. Only a signature that FAILS makes the change loud: most of
+        Windows is catalogue-signed, which this checker cannot verify and
+        reports as unsigned (11 of 30 System32 files verified, ROADMAP),
+        and calling that untrusted would announce most updates. The panel
+        asks on its worker; a check costs about 150 ms per cold file."""
         checker = self.scanner.signatures
         if not getattr(checker, "available", False):
             return None
@@ -1271,14 +1276,18 @@ class AVGuardApp(tb.Window):
         def trusted(target: str) -> bool:
             path = Path(target)
             stat = path.stat()
-            return bool(checker.check(path, stat.st_size, stat.st_mtime_ns).is_trusted)
+            return checker.check(path, stat.st_size, stat.st_mtime_ns).trust is not signing.Trust.UNTRUSTED
         return trusted
 
     def _startup_report(self, report) -> None:
         """After a snapshot from the tab: one banner for what is worth a look.
-        Everything is in the tab and History whether or not it is announced."""
-        trusted = self._startup_trusted()
-        loud = [c for c in report.changes if c.worth_a_look(trusted=trusted)]
+        Everything is in the tab and History whether or not it is announced.
+        The panel's worker judged the changes; the checker is not asked
+        again on this thread."""
+        loud = report.loud
+        if loud is None:
+            trusted = self._startup_trusted()
+            loud = [c for c in report.changes if c.worth_a_look(trusted=trusted)]
         if not loud:
             return
         first = loud[0].describe()

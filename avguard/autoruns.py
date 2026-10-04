@@ -58,6 +58,8 @@ AUTORUNS_DIR = config.DATA_DIR / "autoruns"
 DB_NAME = "snapshots.sqlite"
 KEY_NAME = "snapshots.key"
 SIGNATURE_NAME = "snapshots.hmac"
+LOCK_NAME = "snapshots.lock"
+LOCK_WAIT = 5.0                 # seconds a snapshot waits for another to finish
 KEEP_SNAPSHOTS = 30             # a month of daily snapshots; older ones are pruned
 MAX_STARTUP_FILE = 4 * 1024 * 1024   # a Startup-folder file larger than this is named, not hashed
 
@@ -77,8 +79,18 @@ APPROVED_FOLDER = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupAp
 SERVICES_KEY = r"SYSTEM\CurrentControlSet\Services"
 SERVICE_START = {0: "boot", 1: "system", 2: "automatic", 3: "manual", 4: "disabled"}
 SERVICE_TYPE = {1: "kernel driver", 2: "file system driver", 16: "own process", 32: "shared process",
-                80: "user service", 96: "user service", 272: "own process, interactive",
+                80: "user service", 96: "user service", 208: "user service instance",
+                224: "user service instance", 272: "own process, interactive",
                 288: "shared process, interactive"}
+# Bit 0x80 marks a per-logon instance of a user service (CDPUserSvc_3f2a1 and
+# the like): a fresh name at every sign-in, the template's image. The template
+# is collected; an instance would be NEW and GONE every day.
+SERVICE_INSTANCE_BIT = 0x80
+# Folders under the Windows folder an ordinary user can write to. A program
+# there is not what an update looks like, whatever its parent folder.
+WRITABLE_UNDER_ROOT = ("temp", "tasks", "tracing", "debug", "registration\\crmlog", "system32\\tasks",
+                       "system32\\spool\\drivers\\color", "system32\\com\\dmp", "system32\\fxstmp",
+                       "syswow64\\tasks", "syswow64\\com\\dmp", "syswow64\\fxstmp")
 TASK_NS = "{http://schemas.microsoft.com/windows/2004/02/mit/task}"
 # schtasks writes a comment naming each task before its XML. The blocks are
 # cut at those comments, not at "</Task>": a Performance Monitor task's
@@ -133,15 +145,36 @@ class Entry:
 
     @property
     def target(self) -> str:
-        return target_of(self.value)
+        """The program that would run: a Startup-folder entry is its own file,
+        an svchost-hosted service is the DLL svchost loads, else the command's
+        program."""
+        if self.kind == KIND_STARTUP:
+            return self.value
+        host = target_of(self.value)
+        dll = self.detail.get("service_dll") if isinstance(self.detail, dict) else ""
+        if dll and ntpath.basename(host).lower() == "svchost.exe":
+            return target_of(str(dll))
+        return host
+
+    def paths(self) -> list[str]:
+        """Every path-like thing in the entry: the target and any drive-rooted
+        argument (rundll32's DLL, cmd's script, powershell's -File)."""
+        if self.kind == KIND_STARTUP:
+            return [self.value]                # the file is the whole story
+        found = [self.target] if self.target else []
+        for token in _PATH_TOKENS.findall(ntpath.expandvars(self.value or "")):
+            if token.lower() not in (f.lower() for f in found):
+                found.append(token)
+        return found
 
     def describe(self) -> str:
         state = "" if self.enabled else " (disabled)"
-        return f"{self.kind} {self.location}\\{self.name}{state}: {self.value}"
+        return f"{self.kind} {ntpath.join(self.location, self.name)}{state}: {self.value}"
 
 
 _QUOTED = re.compile(r'^\s*"([^"]+)"')
-_EXECUTABLE = re.compile(r'^\s*(.+?\.(?:exe|com|bat|cmd|ps1|vbs|js|msi|scr|dll|sys))\b', re.I)
+_EXECUTABLE = re.compile(r'^\s*(.+?\.(?:exe|com|bat|cmd|ps1|vbs|vbe|js|jse|wsf|msi|scr|dll|sys|hta|lnk|url))\b', re.I)
+_PATH_TOKENS = re.compile(r'[A-Za-z]:\\[^\s",;]+')
 
 
 def target_of(command: str) -> str:
@@ -172,6 +205,13 @@ def under_system_root(target: str, system_root: str | None = None) -> bool:
     return bool(path) and (path == root or path.startswith(root + "\\"))
 
 
+def in_writable_system_folder(target: str, system_root: str | None = None) -> bool:
+    """Under the Windows folder, but in a subfolder any user can write to."""
+    root = ntpath.normcase(ntpath.normpath(system_root or os.environ.get("SystemRoot", r"C:\Windows")))
+    path = ntpath.normcase(ntpath.normpath(target or ""))
+    return any(path.startswith(root + "\\" + folder + "\\") for folder in WRITABLE_UNDER_ROOT)
+
+
 # ------------------------------------------------------------------- changes
 
 @dataclass
@@ -181,13 +221,20 @@ class Change:
     old: Entry | None = None       # for modified: what it was
 
     def describe(self) -> str:
-        where = f"{self.entry.kind} {self.entry.location}\\{self.entry.name}"
+        # ntpath.join: a task in the library's root has the location "\\"
+        # and must read "\\Name", not "\\\\Name".
+        where = f"{self.entry.kind} {ntpath.join(self.entry.location, self.entry.name)}"
         if self.kind == "added":
             state = "" if self.entry.enabled else ", disabled"
             return f"NEW       {where}: {self.entry.value}{state}"
         if self.kind == "removed":
             return f"GONE      {where}: was {self.entry.value}"
-        parts = []
+        return f"CHANGED   {where}: {'; '.join(self.parts()) or 'changed'}"
+
+    def parts(self) -> list[str]:
+        """What changed in a modified entry, as old -> new fragments; the tab
+        shows them without the sentence around them."""
+        parts: list[str] = []
         if self.old is not None:
             if self.old.value != self.entry.value:
                 parts.append(f"{self.old.value} -> {self.entry.value}")
@@ -195,24 +242,30 @@ class Change:
                 parts.append("enabled" if self.entry.enabled else "disabled")
             if self.old.extra != self.entry.extra:
                 parts.append(f"{self.old.extra or '(none)'} -> {self.entry.extra or '(none)'}")
-        return f"CHANGED   {where}: {'; '.join(parts) or 'changed'}"
+        return parts
 
     def worth_a_look(self, system_root: str | None = None, trusted: Callable[[str], bool] | None = None) -> bool:
         """Whether this deserves a banner, not only a row. A change whose
         target is a trusted-signed program under the system root is what a
-        Windows update looks like a dozen times a month; it is recorded and
+        Windows update looks like; it is recorded and
         shown, never shouted. `trusted` answers for the signature when a
         checker is available; without one, the system root alone is quiet,
         which is the measured trade until the owner's fourteen days are in."""
         if self.kind == "removed":
             return False
-        target = self.entry.target
-        if not target or not under_system_root(target, system_root):
+        paths = self.entry.paths()
+        if not paths:
             return True
+        for path in paths:
+            # Every path the command names has to be under the Windows folder
+            # and outside its user-writable corners: rundll32 is signed, the
+            # DLL it is handed under the profile is the point.
+            if not under_system_root(path, system_root) or in_writable_system_folder(path, system_root):
+                return True
         if trusted is None:
             return False
         try:
-            return not trusted(target)
+            return not trusted(paths[0])
         except Exception:                      # a checker that fails says nothing
             return True
 
@@ -229,8 +282,8 @@ class Change:
 def diff(before: Sequence[Entry], after: Sequence[Entry]) -> list[Change]:
     """What is new, gone or changed between two snapshots, keyed on where an
     entry is and what it is called; order: added, modified, removed."""
-    old = {e.key: e for e in before}
-    new = {e.key: e for e in after}
+    old = {e.key: e for e in _unique(before)}
+    new = {e.key: e for e in _unique(after)}
     changes: list[Change] = []
     for key in sorted(new.keys() - old.keys()):
         changes.append(Change("added", new[key]))
@@ -294,11 +347,12 @@ def _subkeys(registry, root_name: str, sub_key: str) -> list[str]:
 
 def _approved(registry, root_name: str, sub_key: str, view: int = 0) -> dict[str, bool]:
     """Task Manager's Startup page records an entry it disabled here: a
-    binary value whose first byte is 3 when disabled (2 when enabled)."""
+    binary value whose first byte has its low bit set when disabled (3 or 7)
+    and clear when enabled (2 or 6)."""
     out: dict[str, bool] = {}
     for name, (data, _kind) in _values(registry, root_name, sub_key, view).items():
         if isinstance(data, (bytes, bytearray)) and data:
-            out[name.lower()] = data[0] != 3
+            out[name.lower()] = not (data[0] & 1)
     return out
 
 
@@ -319,12 +373,14 @@ def collect_run_keys(registry=None, errors: list[str] | None = None) -> list[Ent
         for sub_key in RUN_KEYS:
             for view, label in (views if root_name == HKLM else [(0, "")]):
                 for name, (data, _kind) in _values(registry, root_name, sub_key, view).items():
-                    # The key's unnamed default value, or an empty one, starts nothing.
-                    if not name or not isinstance(data, str) or not data.strip():
+                    # An empty value starts nothing; a command in the key's
+                    # unnamed default value is unusual and all the more worth a row.
+                    if not isinstance(data, str) or not data.strip():
                         continue
                     location = f"{root_name}\\{sub_key}{label}"
-                    entries.append(Entry(KIND_RUN, location, name, data,
-                                         enabled=approved.get(name.lower(), True)))
+                    shown = name or "(Default)"
+                    entries.append(Entry(KIND_RUN, location, shown, data,
+                                         enabled=approved.get(shown.lower(), True)))
     return entries
 
 
@@ -341,11 +397,16 @@ def collect_startup_folders(folders: Iterable[tuple[str, Path]] | None = None, r
         for root_name in (HKCU, HKLM):
             approved.update(_approved(registry, root_name, APPROVED_FOLDER))
     entries: list[Entry] = []
+    unlisted: list[str] = []
     for label, folder in folders:
-        try:
-            names = sorted(p for p in Path(folder).iterdir() if p.is_file())
-        except OSError:
+        folder = Path(folder)
+        if not folder.is_dir():
             continue                           # no folder is not an error; a user may not have one
+        try:
+            names = sorted(p for p in folder.iterdir() if p.is_file())
+        except OSError as exc:
+            unlisted.append(f"{folder}: {exc}")  # a folder that is there and cannot be listed is
+            continue                             # not an empty one
         for path in names:
             if path.name.lower() == "desktop.ini":
                 continue
@@ -359,6 +420,8 @@ def collect_startup_folders(folders: Iterable[tuple[str, Path]] | None = None, r
                                  enabled=approved.get(path.name.lower(), True),
                                  extra=f"sha256 {digest[:16]}" if digest else f"{size} bytes",
                                  detail={"size": size, "sha256": digest}))
+    if unlisted:
+        raise CollectorFailed("a Startup folder could not be listed: " + "; ".join(unlisted))
     return entries
 
 
@@ -385,27 +448,50 @@ def collect_services(registry=None, errors: list[str] | None = None) -> list[Ent
     entries: list[Entry] = []
     for name in _subkeys(registry, HKLM, SERVICES_KEY):
         values = _values(registry, HKLM, f"{SERVICES_KEY}\\{name}")
-        image = values.get("ImagePath", ("", 0))[0]
-        if not isinstance(image, str) or not image:
-            continue
         start = values.get("Start", (3, 0))[0]
         kind = values.get("Type", (0, 0))[0]
         start = int(start) if isinstance(start, int) else 3
         kind = int(kind) if isinstance(kind, int) else 0
+        if kind & SERVICE_INSTANCE_BIT:
+            continue                           # a per-logon instance; its template is collected
+        image = values.get("ImagePath", ("", 0))[0]
+        implied = False
+        if not isinstance(image, str) or not image:
+            if kind not in (1, 2):
+                continue                       # neither an image nor a driver: not a service
+            # A driver key without an ImagePath is loaded from the default place.
+            image = f"\\SystemRoot\\System32\\drivers\\{name}.sys"
+            implied = True
         display = values.get("DisplayName", ("", 0))[0]
-        entries.append(Entry(
-            KIND_SERVICE, f"{HKLM}\\{SERVICES_KEY}", name, image, enabled=start != 4,
-            extra=f"start {SERVICE_START.get(start, start)}; type {SERVICE_TYPE.get(kind, kind)}",
-            detail={"display_name": display if isinstance(display, str) else "", "start": start,
-                    "type": kind}))
+        detail = {"display_name": display if isinstance(display, str) else "", "start": start,
+                  "type": kind, "implied": implied}
+        extra = f"start {SERVICE_START.get(start, start)}; type {SERVICE_TYPE.get(kind, kind)}"
+        # An svchost-hosted service's code is the DLL its Parameters name;
+        # the image path says only "svchost". The DLL counts, and is the target.
+        dll = _values(registry, HKLM, f"{SERVICES_KEY}\\{name}\\Parameters").get("ServiceDll", ("", 0))[0]
+        if isinstance(dll, str) and dll.strip():
+            detail["service_dll"] = dll
+            extra += f"; dll {dll}"
+        entries.append(Entry(KIND_SERVICE, f"{HKLM}\\{SERVICES_KEY}", name, image, enabled=start != 4,
+                             extra=extra, detail=detail))
     return entries
 
 
+class CollectorFailed(RuntimeError):
+    """A collector could not do its job; what it would have found is unknown,
+    which is not the same as nothing."""
+
+
 def run_schtasks() -> bytes:
-    """`schtasks /Query /XML ONE`, raw bytes: the caller decodes."""
+    """`schtasks /Query /XML ONE`, raw bytes: the caller decodes. A non-zero
+    exit with no task in the output is a failure, said with schtasks' words."""
     result = subprocess.run(["schtasks", "/Query", "/XML", "ONE"], capture_output=True,
                             timeout=120, creationflags=_NO_WINDOW)
-    return result.stdout or b""
+    out = result.stdout or b""
+    if result.returncode != 0 and b"<Task" not in out:
+        words = decode_console(result.stderr or out).strip().splitlines()
+        raise CollectorFailed(f"schtasks exited {result.returncode}: {words[0][:160] if words else 'no output'}")
+    return out
 
 
 def decode_console(raw: bytes) -> str:
@@ -418,7 +504,10 @@ def decode_console(raw: bytes) -> str:
     codepage = None
     if sys.platform == "win32":
         try:
-            codepage = ctypes.windll.kernel32.GetConsoleOutputCP()
+            # 0 when this process has no console (the window under pythonw,
+            # the scheduled run); the hidden console a child gets then uses
+            # the OEM page, so decode with that and every context agrees.
+            codepage = ctypes.windll.kernel32.GetConsoleOutputCP() or ctypes.windll.kernel32.GetOEMCP()
         except Exception:
             codepage = None
     for encoding in ([f"cp{codepage}"] if codepage else []) + ["utf-8", "mbcs" if sys.platform == "win32" else "latin-1"]:
@@ -474,8 +563,11 @@ def parse_tasks(xml_text: str, errors: list[str] | None = None) -> list[Entry]:
                 interval = _text(trigger, "Interval")
                 triggers.append(f"{tag}{'' if on else '(off)'}{'@' + start if start else ''}"
                                 f"{'/' + interval if interval else ''}")
-        run_level = _text(task, "RunLevel")
-        user = _text(task, "UserId")
+        # The account is the Principal's. A LogonTrigger carries a UserId of
+        # its own (run when this user signs in), which is not who it runs as.
+        principals = task.find(f"{TASK_NS}Principals")
+        run_level = _text(principals, "RunLevel")
+        user = _text(principals, "UserId")
         extra = "; ".join(filter(None, [", ".join(triggers), run_level, user]))
         entries.append(Entry(KIND_TASK, folder or "\\", name, " | ".join(actions) or "(no action)",
                              enabled=enabled, extra=extra,
@@ -489,14 +581,15 @@ def collect_tasks(runner: Callable[[], bytes] | None = None, errors: list[str] |
     runner = runner if runner is not None else run_schtasks
     try:
         raw = runner()
-    except (OSError, subprocess.SubprocessError) as exc:
-        errors.append(f"schtasks could not be run: {exc}")
-        return []
+    except (OSError, subprocess.SubprocessError, CollectorFailed) as exc:
+        raise CollectorFailed(f"schtasks could not be run: {exc}") from exc
     text = decode_console(raw)
     entries = parse_tasks(text, errors)
-    if not entries and raw and "<Task" not in text:
-        errors.append("schtasks returned no tasks: " + text.strip().splitlines()[0][:120] if text.strip() else
-                      "schtasks returned nothing")
+    if not entries:
+        # No machine has no tasks: an empty answer is a failed read, and a
+        # failed read must not become a snapshot in which every task is gone.
+        first = text.strip().splitlines()[0][:120] if text.strip() else "nothing"
+        raise CollectorFailed(f"schtasks returned {first!r}, no tasks")
     return entries
 
 
@@ -506,6 +599,7 @@ class Collected:
     errors: list[str] = field(default_factory=list)
     seconds: dict[str, float] = field(default_factory=dict)      # per collector
     counts: dict[str, int] = field(default_factory=dict)
+    failed: set[str] = field(default_factory=set)                # kinds whose collector could not read
 
 
 def collect(registry=None, startup_folders=None, schtasks_runner=None,
@@ -523,10 +617,20 @@ def collect(registry=None, startup_folders=None, schtasks_runner=None,
         errs: list[str] = []
         try:
             found = jobs[kind](errs)
+        except CollectorFailed as exc:
+            errs.append(f"{kind}: {exc}")
+            result.failed.add(kind)
+            found = []
         except Exception as exc:          # a collector is never allowed to take the snapshot down
             log.exception("the %s collector failed", kind)
             errs.append(f"{kind}: {exc}")
+            result.failed.add(kind)
             found = []
+        if kind == KIND_SERVICE and not found and kind not in result.failed \
+                and (registry is not None or sys.platform == "win32"):
+            # A Windows machine has services; none read means the read failed.
+            errs.append("service: the Services key could not be read")
+            result.failed.add(kind)
         result.entries.extend(found)
         result.errors.extend(errs)
         result.seconds[kind] = time.perf_counter() - started
@@ -542,6 +646,7 @@ class Snapshot:
     taken_at: float
     entries: int
     seconds: float = 0.0
+    failed: tuple[str, ...] = ()      # kinds whose collector could not read that day
 
 
 @dataclass
@@ -553,6 +658,8 @@ class SnapshotReport:
     seconds: dict[str, float] = field(default_factory=dict)
     first: bool = False                    # nothing to compare with yet
     integrity: str = INTEGRITY_OK
+    carried: dict[str, int] = field(default_factory=dict)   # kind -> entries kept from the previous snapshot
+    loud: list[Change] | None = None       # judged worth a banner by the window's worker; None: nobody judged
 
     def of(self, kind: str) -> list[Change]:
         return [c for c in self.changes if c.kind == kind]
@@ -562,6 +669,63 @@ class SnapshotReport:
             return None
         return Event(kind="autoruns", level="tampered", reasons=[INTEGRITY_MESSAGES[self.integrity]],
                      detail={"integrity": self.integrity})
+
+
+def _unique(entries: Iterable[Entry]) -> list[Entry]:
+    """One entry per key, the first kept: the one rule for the diff, the
+    stored rows and the count, so a duplicate cannot flap CHANGED."""
+    seen: dict[str, Entry] = {}
+    for entry in entries:
+        seen.setdefault(entry.key, entry)
+    return list(seen.values())
+
+
+class _Lock:
+    """One snapshot at a time across processes: the window and the daily
+    task share the database and the signature file, and a signature
+    written over another writer's database reads as tampering. An OS lock
+    on a file, so a process that dies releases it."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._handle = None
+
+    def acquire(self, timeout: float = LOCK_WAIT) -> bool:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + timeout
+        handle = open(self.path, "a+b")
+        while True:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self._handle = handle
+                return True
+            except OSError:
+                if time.monotonic() >= deadline:
+                    handle.close()
+                    return False
+                time.sleep(0.1)
+
+    def release(self) -> None:
+        handle, self._handle = self._handle, None
+        if handle is None:
+            return
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        handle.close()
 
 
 class AutorunsStore:
@@ -595,7 +759,10 @@ class AutorunsStore:
         conn = sqlite3.connect(self.db_path, timeout=5)
         conn.execute("CREATE TABLE IF NOT EXISTS snapshots("
                      "id INTEGER PRIMARY KEY AUTOINCREMENT, taken_at REAL NOT NULL, "
-                     "entries INTEGER NOT NULL, seconds REAL NOT NULL, errors TEXT NOT NULL)")
+                     "entries INTEGER NOT NULL, seconds REAL NOT NULL, errors TEXT NOT NULL, "
+                     "failed TEXT NOT NULL DEFAULT '')")
+        if "failed" not in {row[1] for row in conn.execute("PRAGMA table_info(snapshots)")}:
+            conn.execute("ALTER TABLE snapshots ADD COLUMN failed TEXT NOT NULL DEFAULT ''")
         conn.execute("CREATE TABLE IF NOT EXISTS entries("
                      "snapshot_id INTEGER NOT NULL, key TEXT NOT NULL, kind TEXT NOT NULL, "
                      "location TEXT NOT NULL, name TEXT NOT NULL, value TEXT NOT NULL, "
@@ -606,16 +773,35 @@ class AutorunsStore:
 
     # ------------------------------------------------------------ reading
 
+    def unreadable(self) -> str | None:
+        """Why SQLite cannot open the database, or None when it can (or when
+        there is none). An unreadable file is not an empty one."""
+        if not self.exists():
+            return None
+        try:
+            with closing(self._connect()) as conn:
+                conn.execute("SELECT count(*) FROM snapshots").fetchone()
+        except sqlite3.Error as exc:
+            return str(exc)
+        return None
+
     def snapshots(self) -> list[Snapshot]:
         if not self.exists():
             return []
         try:
             with closing(self._connect()) as conn:
-                rows = conn.execute("SELECT id, taken_at, entries, seconds FROM snapshots "
+                rows = conn.execute("SELECT id, taken_at, entries, seconds, failed FROM snapshots "
                                     "ORDER BY id").fetchall()
         except sqlite3.Error:
             return []
-        return [Snapshot(int(r[0]), float(r[1]), int(r[2]), float(r[3])) for r in rows]
+        out = []
+        for r in rows:
+            try:
+                kinds = tuple(str(k) for k in json.loads(r[4])) if r[4] else ()
+            except ValueError:
+                kinds = ()
+            out.append(Snapshot(int(r[0]), float(r[1]), int(r[2]), float(r[3]), kinds))
+        return out
 
     def latest(self) -> Snapshot | None:
         found = self.snapshots()
@@ -658,33 +844,78 @@ class AutorunsStore:
         """Store what was collected, diff it against the previous snapshot,
         record the changes as events, sign. Nothing is stored when nothing
         at all was collected: an empty snapshot would report everything as
-        gone next time."""
+        gone next time. One snapshot at a time: the window and the daily
+        task share the files."""
         report = SnapshotReport(errors=list(collected.errors), counts=dict(collected.counts),
                                 seconds=dict(collected.seconds))
+        report.integrity = self.verify_integrity() if self.exists() else INTEGRITY_NO_SNAPSHOT
         if not collected.entries:
             report.errors.append("nothing was collected; the snapshot was not recorded")
-            report.integrity = self.verify_integrity() if self.exists() else INTEGRITY_NO_SNAPSHOT
             return report
-        report.integrity = self.verify_integrity() if self.exists() else INTEGRITY_OK
-        previous = self.entries() if self.exists() else []
-        had_previous = self.latest() is not None
-        report.first = not had_previous
-        if had_previous:
-            report.changes = diff(previous, collected.entries)
+        lock = _Lock(self.directory / LOCK_NAME)
+        if not lock.acquire(LOCK_WAIT):
+            report.errors.append("another snapshot is being taken; this one was not recorded")
+            return report
+        try:
+            return self._snapshot(collected, events, report)
+        finally:
+            lock.release()
+
+    def _snapshot(self, collected: Collected, events: EventStore | None, report: SnapshotReport) -> SnapshotReport:
+        if not self.exists():
+            report.integrity = INTEGRITY_OK
+        broken = self.unreadable()
+        if broken is not None:
+            # SQLite cannot open the file. The signature check already says
+            # tampered unless the file was swapped and re-signed; either
+            # way nothing is compared with it or written over it, the
+            # tamper event is recorded, and the report says what could not
+            # be done instead of raising out of the daily task into nothing.
+            if report.integrity == INTEGRITY_OK:
+                report.integrity = INTEGRITY_TAMPERED
+            report.errors.append(f"the previous snapshots cannot be read ({broken}); "
+                                 "the snapshot was not recorded")
+            log.error("startup snapshot: the previous snapshots cannot be read (%s)", broken)
+            self._record(report, events)
+            return report
+        latest = self.latest()
+        previous = self.entries(latest.id) if latest is not None else []
+        report.first = latest is None
+        entries = _unique(collected.entries)
+        # A kind whose collector failed is unknown today, not empty: the
+        # previous snapshot's entries of that kind are kept, so nothing is
+        # reported gone for a read that did not happen, and said so.
+        fresh = {e.key for e in entries}
+        for kind in sorted(collected.failed):
+            kept = [e for e in previous if e.kind == kind and e.key not in fresh]
+            if kept:
+                entries.extend(kept)
+                report.carried[kind] = len(kept)
+                report.errors.append(f"{kind}: not read this time; the previous snapshot's "
+                                     f"{len(kept)} kept")
+        # A kind the previous snapshot could not read, with nothing to
+        # carry, is read for the first time now: recorded, not compared,
+        # or every task would be NEW the day after a bad first read.
+        first_read = {kind for kind in (latest.failed if latest is not None else ())
+                      if kind not in collected.failed and not any(e.kind == kind for e in previous)}
+        if latest is not None:
+            changes = diff(previous, entries)
+            for kind in sorted(first_read):
+                skipped = sum(1 for c in changes if c.entry.kind == kind)
+                if skipped:
+                    report.errors.append(f"{kind}: read for the first time; {skipped} recorded, not compared")
+            report.changes = [c for c in changes if c.entry.kind not in first_read]
 
         taken_at = time.time()
         total_seconds = sum(collected.seconds.values())
+        failed = sorted(collected.failed)
         with closing(self._connect()) as conn:
             with conn:
                 cursor = conn.execute(
-                    "INSERT INTO snapshots(taken_at, entries, seconds, errors) VALUES (?, ?, ?, ?)",
-                    (taken_at, len(collected.entries), total_seconds, json.dumps(collected.errors)))
+                    "INSERT INTO snapshots(taken_at, entries, seconds, errors, failed) VALUES (?, ?, ?, ?, ?)",
+                    (taken_at, len(entries), total_seconds, json.dumps(collected.errors), json.dumps(failed)))
                 snapshot_id = int(cursor.lastrowid)
-                seen: set[str] = set()
-                for entry in collected.entries:
-                    if entry.key in seen:
-                        continue              # the same name twice in one key cannot happen; be safe
-                    seen.add(entry.key)
+                for entry in entries:
                     conn.execute(
                         "INSERT INTO entries(snapshot_id, key, kind, location, name, value, enabled, "
                         "extra, detail, fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -701,16 +932,29 @@ class AutorunsStore:
                 conn.execute("VACUUM")
         except sqlite3.Error:
             pass
-        self._sign()
-        report.snapshot = Snapshot(snapshot_id, taken_at, len(seen), total_seconds)
-
-        if events is not None:
-            integrity = report.integrity_event()
-            if integrity is not None:
-                events.record(integrity)
-            for change in report.changes:
-                events.record(change.as_event())
+        try:
+            self._sign()
+        except (OSError, ValueError) as exc:
+            # The key is another user's or damaged. The snapshot is kept,
+            # unsigned; the report and the events still go out, and the
+            # next check says key-unreadable, which is true.
+            report.integrity = INTEGRITY_KEY_UNREADABLE
+            report.errors.append("the signing key cannot be read; the snapshot was recorded "
+                                 f"but not signed: {exc}")
+            log.error("startup snapshot: the signing key cannot be read (%s)", exc)
+        report.snapshot = Snapshot(snapshot_id, taken_at, len(entries), total_seconds, tuple(failed))
+        self._record(report, events)
         return report
+
+    @staticmethod
+    def _record(report: SnapshotReport, events: EventStore | None) -> None:
+        if events is None:
+            return
+        integrity = report.integrity_event()
+        if integrity is not None:
+            events.record(integrity)
+        for change in report.changes:
+            events.record(change.as_event())
 
     # ---------------------------------------------------------- integrity
 
@@ -748,6 +992,15 @@ class AutorunsStore:
 
 def summarize(store: AutorunsStore) -> tuple[bool, str]:
     """One line for Health and the tab: (ok, text)."""
+    if store.exists():
+        # The signature first: a file that is there and fails its check is
+        # not "no snapshot yet", whether or not SQLite can open it.
+        integrity = store.verify_integrity()
+        if integrity != INTEGRITY_OK:
+            return False, INTEGRITY_MESSAGES.get(integrity, integrity)
+        broken = store.unreadable()
+        if broken is not None:
+            return False, f"the startup snapshots cannot be read: {broken}"
     latest = store.latest()
     if latest is None:
         return True, "no snapshot yet"
@@ -761,8 +1014,12 @@ def summarize(store: AutorunsStore) -> tuple[bool, str]:
 
 
 def describe_report(report: SnapshotReport) -> str:
+    # The integrity word leads, on every surface: a snapshot over a tampered
+    # store re-signs it, and the status line is where the user would miss it.
+    integrity = report.integrity_event()
+    lead = f"SNAPSHOTS: {integrity.reasons[0]}. " if integrity is not None else ""
     if report.snapshot is None:
-        return "No snapshot was taken: " + ("; ".join(report.errors) or "nothing was collected")
+        return lead + "No snapshot was taken: " + ("; ".join(report.errors) or "nothing was collected")
     parts = [f"{report.snapshot.entries:,} startup item(s)"]
     if report.first:
         parts.append("first snapshot, nothing to compare with yet")
@@ -771,6 +1028,9 @@ def describe_report(report: SnapshotReport) -> str:
                      f"{len(report.of('removed'))} gone since the previous snapshot")
     else:
         parts.append("nothing changed since the previous snapshot")
+    if report.carried:
+        parts.append("kept from the previous snapshot because they could not be read: "
+                     + ", ".join(f"{n} {kind}" for kind, n in report.carried.items()))
     if report.errors:
         parts.append(f"{len(report.errors)} collector note(s)")
-    return "; ".join(parts) + "."
+    return lead + "; ".join(parts) + "."

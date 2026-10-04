@@ -4,8 +4,10 @@ previous snapshot. The Integrity tab's design applied to configuration.
 The snapshot runs on a thread of its own and reports through the window's
 post(), like a check; the list shows the last diff; a change whose target
 is a trusted program under the system root is a row and a History event,
-never a banner, because that is what an update looks like a dozen times a
-month. The tab moves nothing and cannot: a snapshot reads.
+never a banner, because that is what an update looks like. The window's
+signature checker is asked on the snapshot's worker, never on the GUI
+thread; the list the tab opens on is judged by the system-root rule alone.
+The tab moves nothing and cannot: a snapshot reads.
 """
 
 from __future__ import annotations
@@ -39,7 +41,7 @@ def row_for(change: autoruns.Change) -> tuple[str, str, str]:
     elif change.kind == "removed":
         detail = f"was {entry.value}"
     else:
-        detail = change.describe().split(": ", 1)[-1]
+        detail = "; ".join(change.parts()) or "changed"
     return WORDS[change.kind], what, detail
 
 
@@ -110,9 +112,9 @@ class StartupPanel(tb.Frame):
         note = tb.Label(self, bootstyle="secondary", wraplength=WRAP, justify="left",
                         text=("Run keys, the Startup folders, scheduled tasks and services, read as "
                               "they are and compared with the previous snapshot. Nothing is moved or "
-                              "changed. A change under the Windows folder from a trusted program is "
-                              "listed in grey and recorded, not announced: that is what an update "
-                              "looks like."))
+                              "changed. A change under the Windows folder is listed in grey and "
+                              "recorded, not announced, unless the program's signature fails: that "
+                              "is what an update looks like."))
         note.pack(anchor="w", padx=2, pady=(4, 0))
         self._wrapped.append(note)
         self.bind("<Configure>", self._reflow)
@@ -140,12 +142,30 @@ class StartupPanel(tb.Frame):
     def changes(self) -> list[autoruns.Change]:
         return list(self._changes)
 
-    def _show_changes(self, changes: list[autoruns.Change]) -> None:
+    def judge(self, changes: list[autoruns.Change]) -> list[autoruns.Change]:
+        """The changes worth a banner, asked with the checker: worker only,
+        at the checker's price per file."""
+        return [c for c in changes if c.worth_a_look(self._system_root, self._trusted)]
+
+    def _show_changes(self, changes: list[autoruns.Change],
+                      loud: list[autoruns.Change] | None = None) -> None:
+        """`loud` is what a worker judged worth a banner; without it the
+        system-root rule alone decides the grey, which is cheap enough for
+        this thread. A removal is never announced and still gets its own
+        colour: grey means "under the Windows folder", and a gone entry
+        from the profile was not."""
         for item in self.tree.get_children():
             self.tree.delete(item)
         self._changes = list(changes)
+        loud_ids = {id(c) for c in loud} if loud is not None else None
         for index, change in enumerate(self._changes):
-            tags = (change.kind,) if change.worth_a_look(self._system_root, self._trusted) else ("quiet",)
+            if change.kind == "removed":
+                quiet = False
+            elif loud_ids is not None:
+                quiet = id(change) not in loud_ids
+            else:
+                quiet = not change.worth_a_look(self._system_root)
+            tags = ("quiet",) if quiet else (change.kind,)
             self.tree.insert("", END, iid=str(index), values=row_for(change), tags=tags)
 
     def _set_busy(self, busy: bool) -> None:
@@ -171,6 +191,7 @@ class StartupPanel(tb.Frame):
                 started = time.monotonic()
                 collected = self._collect()
                 report = store.snapshot(collected, events=self._events)
+                report.loud = self.judge(report.changes)
                 self._post(self._finished, report, time.monotonic() - started)
             except Exception:
                 log.exception("the startup snapshot failed")
@@ -186,7 +207,10 @@ class StartupPanel(tb.Frame):
         ok, text = autoruns.summarize(store)
         self.summary_var.set(text)
         self.summary.configure(bootstyle="secondary" if ok else "danger")
-        self._show_changes(report.changes if report.snapshot is not None else store.last_changes())
+        if report.snapshot is not None:
+            self._show_changes(report.changes, report.loud)
+        else:
+            self._show_changes(store.last_changes())
         for note in report.errors:
             log.warning("startup snapshot: %s", note)
         self.status_var.set(autoruns.describe_report(report) + f" ({seconds:.1f}s)")

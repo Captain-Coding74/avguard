@@ -6,7 +6,9 @@ one to a URL is a small step that lets the two see each other. Off until a
 URL is set, and setting one names exactly what leaves the machine: the file
 path, the verdict, the file's SHA-256 and the evidence behind the verdict
 (each finding's source, weight, severity and pack, a rule author's note, the
-counted totals and the quarantine threshold). The paste guard's events are
+counted totals and the quarantine threshold); a startup change carries where
+it is and what it is called, its command line with its arguments, old and
+new, and the account a scheduled task runs as. The paste guard's events are
 recorded with forward=False and never reach this module.
 
 The rule that shapes this module is the GUI pump's: the scan path must not

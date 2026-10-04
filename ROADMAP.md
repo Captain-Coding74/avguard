@@ -987,12 +987,12 @@ and never reaches the fingerprint. Snapshots live in a signed SQLite store
 under the data directory (`AutorunsStore`, the integrity baseline's key,
 signature and tamper states reused by name), thirty kept, and each new one
 is diffed against the previous: added, modified with old and new, removed.
-Every change is an event of kind `autoruns`; a change whose target is a
-trusted-signed program under the system root is a grey row and a History
-event, never a banner, because that is what an update looks like a dozen
-times a month. Without a signature checker the system root alone keeps a
-change quiet, stated as the trade until the owner's fourteen days of
-changes say whether it holds. Surfaces: a Startup tab beside Integrity
+Every change is an event of kind `autoruns`; a change whose command names
+only programs under the system root is a grey row and a History event,
+never a banner, because that is what an update looks like. Without a
+signature checker the system root alone keeps a change quiet, stated as
+the trade until the owner's fourteen days of changes say whether it holds
+(the second reading below sharpened the rule). Surfaces: a Startup tab beside Integrity
 (`avguard/startuppanel.py`, the Integrity tab's design: a worker thread,
 `post()`, the last diff on open, Snapshot now), a Health row,
 `--autoruns-snapshot` (with `-v` a per-collector table of counts and
@@ -1039,6 +1039,95 @@ second snapshot, empty collection, pruning, tamper and re-signing, the tab
 through its button on the shared root with the quiet row grey, and the
 console verbs. Not yet on the owner's desktop: a fortnight of real daily
 diffs, which is what decides whether the quiet rule is enough.
+
+**The startup snapshot, second reading, 2026-10-04.** Four adversarial
+lenses over the working tree (the collectors; the store and the diff; the
+window and the CLI; privacy and the tests): 33 findings, 6 of them one
+defect seen from two sides, 27 distinct, each reproduced before it was
+fixed and each fixed with a test. Measured: 34 of the tests written for
+this reading fail against the previous commit (`python3.13 -m unittest
+tests.test_autoruns tests.test_cli` on a `git archive HEAD` with the new
+test files copied in: 26 failures, 8 errors; the window tests were skipped
+in that run, which had no display). What mattered most:
+
+- A collector that could not read became an empty kind. `schtasks`
+  timing out or refusing, an empty answer, or a Startup folder that cannot
+  be listed stored a snapshot with none of that kind, reported every one
+  GONE with an event each, and NEW again the day after: 208 and 208 on the
+  runner's numbers, the third-party ones loud. A failed read now raises
+  `CollectorFailed`, is carried in `Collected.failed` and in the snapshot
+  row; the previous snapshot's entries of that kind are kept and the report
+  says so; a kind read for the first time after a bad first read is
+  recorded, not compared. `run_schtasks` raises on a non-zero exit, and
+  "no tasks at all" is a failed read, because no machine has none.
+- The quiet rule judged only the host program. `rundll32`, `cmd /c`,
+  `powershell -File`, `wscript`, `regsvr32` and `mshta` handed a file under
+  the profile were grey, with or without a checker, as were programs in the
+  user-writable corners of the Windows folder (Temp, Tasks, tracing, the
+  spool colour folder). `Entry.paths()` lists every drive-rooted path in
+  the command and all of them must sit under the root and outside those
+  corners. An svchost-hosted service was judged by svchost:
+  `Parameters\ServiceDll` is now read, counted in the fingerprint and used
+  as the target, so a hijacked ServiceDll is CHANGED and a new service with
+  a DLL under the profile is loud.
+- In the window the checker made it worse, not better. `is_trusted` is
+  true only for an embedded signature and this file's own measurement is
+  11 of 30 System32 files, so most update changes would have been
+  announced. Only a signature that fails (`Trust.UNTRUSTED`) makes a
+  system-root change loud now, and the checker is asked on the snapshot's
+  worker, never on the GUI thread: the reviewer measured 40 changes with a
+  20 ms stub freezing the window for 0.81 s, which at the checker's real
+  147 ms per cold file is about six seconds. The list the tab opens on uses
+  the system-root rule alone.
+- The store raised out of the daily task on a database SQLite cannot open
+  (`DatabaseError` from `_connect`) and on a signing key it cannot
+  unprotect (after the row was written, before the events), while the tab
+  and `--autoruns-status` called the same store "no snapshot yet". Both
+  now mirror `fim.check()`: the unreadable database is reported, left
+  where it is and never written over, the tamper event recorded; the
+  unreadable key keeps the snapshot and the events and reports
+  key-unreadable; `summarize()` checks the signature before it says "no
+  snapshot yet"; the CLI exits 3 and names the file to move away.
+  `describe_report()` leads with the integrity word, so the tab no longer
+  shows a tamper vanish under "nothing changed" after the re-sign;
+  `--autoruns-changes` prints a tampered store's diff under that word and
+  exits 3; the daily task configures the log file it had not.
+- Smaller, each with its test: the window and the daily task could sign
+  over each other's writes (an OS lock on `snapshots.lock` for the whole of
+  a snapshot, five seconds' wait, then "another snapshot is being taken");
+  duplicate keys kept by one rule, first wins, for the diff, the rows and
+  the count; a task in the library root read `\\Name`; a removed entry was
+  annotated "under the Windows folder" wherever it was and greyed in the
+  tab; `StartupApproved` with a first byte of 7 read as enabled (the low
+  bit decides); a command in a Run key's unnamed default value was dropped
+  (kept as "(Default)"); per-logon user-service instances
+  (`CDPUserSvc_3f2a1`, type bit 0x80) would have been NEW and GONE at every
+  sign-in (skipped; the template is collected); a driver key without an
+  ImagePath was invisible (`\SystemRoot\System32\drivers\<name>.sys`, noted
+  as implied); a Startup file's target was `...\Windows\Start` (the file is
+  its own target); the task account was the first `UserId` in the task,
+  which a LogonTrigger can own (the Principal's now); `GetConsoleOutputCP()`
+  is 0 under pythonw, so the tab and the daily task decoded `schtasks` with
+  the ANSI page and a console run with the OEM page, and a non-ASCII task
+  name had two identities (`GetOEMCP()` when there is no console; this one
+  rests on the Win32 documentation, since the runner has a console); a
+  row's detail was cut at the first ": " inside the entry's name.
+- Consent. A startup change leaves the machine with its full command line,
+  arguments included, and the account a task runs as, and the forwarding
+  sentence did not say so. It does now in the four places it is stated
+  (the consent dialog, the Settings label, forward.py, the README), and
+  the README section says what the snapshot keeps.
+
+Numbers that moved were re-measured: the fixture's database is 118,784
+bytes after thirty snapshots (was 114,688; the ServiceDll in `extra`),
+20,480 after one; tests 668 -> 695, both suites green. "A dozen times a
+month" is gone from the README, the docstrings and this file until the
+fortnight counts it. The runner's figures above (898 entries, 687
+services) will move with the skipped instances and the implied drivers;
+the next run's printout is the record, and that test now asserts no
+collector failed and no task was unreadable instead of printing it. Not
+changed: whether the quiet rule is enough is still the owner's fourteen
+days.
 
 ## Deliberately not doing
 

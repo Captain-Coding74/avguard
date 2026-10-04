@@ -537,10 +537,25 @@ what differs from the previous one: new, changed (the command, the
 arguments, enabled or not, a task's triggers and run level, a service's
 start type) or gone. A task's last-run time, a registration date or a
 description is not a change. Every change is a History event; one whose
-target is a trusted-signed program under the Windows folder is listed in
-grey and recorded, never announced, because that is what an update looks
-like a dozen times a month. `--autoruns-schedule on` takes a snapshot daily
-through the Task Scheduler, unattended; it records and changes nothing.
+command names only programs under the Windows folder, outside its
+user-writable corners (Temp, Tasks, tracing, the spool folder), is listed
+in grey and recorded, never announced, because that is what an update
+looks like; in the window a signature that fails makes it loud again. The
+payload counts, not only the host: `rundll32`, `cmd /c`, `powershell
+-File`, `wscript`, `regsvr32` or `mshta` handed a file under the profile
+is loud, and an svchost-hosted service is judged by its ServiceDll.
+`--autoruns-schedule on` takes a snapshot daily through the Task
+Scheduler, unattended; it records and changes nothing.
+
+What is kept: every entry's command line with its arguments, a task's
+triggers, run level and the account it runs as, for the last thirty
+snapshots, under the data directory. Each change is a History event and,
+with a forwarding URL set, leaves the machine like the rest (see Event
+forwarding). A collector that could not read (schtasks refusing, a
+Startup folder that cannot be listed) keeps the previous snapshot's
+entries of that kind and says so, instead of reporting them all gone and
+all new the day after; a snapshot database SQLite cannot open is reported
+and left where it is, never written over.
 
 The limits, stated plainly. It reads configuration at a point in time, as
 Sysinternals Autoruns does as a standard user: no driver, no elevation, no
@@ -559,7 +574,9 @@ JSON, for a Network Watchdog server on your own network. Setting the URL
 asks first, and says what leaves the machine: the file path, the verdict,
 the file's SHA-256 and the evidence behind the verdict (each finding's
 source, weight, severity and pack, a rule author's note, the counted totals
-and your quarantine threshold). The paste guard's events are the
+and your quarantine threshold); a startup change carries where it is and
+what it is called, its command line with its arguments, old and new, and
+the account a scheduled task runs as. The paste guard's events are the
 exception: they are written to History and never forwarded, so its "sends
 nothing" holds whatever address is set here. A dead or slow endpoint never
 slows a scan: events go onto a bounded queue and a background thread posts

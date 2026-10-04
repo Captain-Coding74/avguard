@@ -68,6 +68,8 @@ logging.getLogger("avguard").addHandler(logging.NullHandler())
 logging.getLogger("avguard").propagate = False
 
 
+BS = chr(92)        # a backslash the Windows paths in these tests are spelled with
+
 class CliCase(unittest.TestCase):
     """Each test runs main() in-process with the data directory redirected."""
 
@@ -314,6 +316,53 @@ class TestStartupCommands(CliCase):
         self.assertIn("service", output, "the per-collector table printed")
         code, output = self.run_cli("--autoruns-status")
         self.assertIn("No snapshot", output)
+
+    def test_a_removed_entry_is_not_called_under_the_windows_folder(self):
+        from unittest import mock
+        from avguard import autoruns
+        from avguard.autoruns import Collected, Entry
+        gone = Entry("run", "HKCU" + BS + "Run", "OneDrive", "C:" + BS + "Users" + BS + "me" + BS + "OneDrive.exe")
+        kept = Entry("service", "HKLM" + BS + "Services", "Dhcp", "C:" + BS + "Windows" + BS + "System32" + BS + "svchost.exe -k x")
+        with mock.patch.object(autoruns, "collect", side_effect=[Collected(entries=[gone, kept]),
+                                                                  Collected(entries=[kept])]):
+            code, output = self.run_cli("--autoruns-snapshot")
+            self.assertEqual(code, 0, output)
+            code, output = self.run_cli("--autoruns-snapshot")
+        self.assertEqual(code, 1, output)
+        self.assertIn("GONE", output)
+        self.assertNotIn("under the Windows folder", output, "a removal is never announced; it was not under it")
+
+    def test_changes_and_status_on_a_tampered_store_say_so_and_exit_three(self):
+        from avguard import autoruns
+        from avguard.autoruns import Collected, Entry
+        store = autoruns.AutorunsStore()
+        one = Entry("run", "HKCU" + BS + "Run", "App", "C:" + BS + "a.exe")
+        store.snapshot(Collected(entries=[one]))
+        store.snapshot(Collected(entries=[one, Entry("run", "HKCU" + BS + "Run", "New",
+                                                       "C:" + BS + "Users" + BS + "me" + BS + "n.exe")]))
+        code, output = self.run_cli("--autoruns-changes")
+        self.assertEqual(code, 1, output)
+        self.assertNotIn("SNAPSHOTS:", output)
+        with open(store.db_path, "r+b") as handle:
+            handle.seek(0, 2)
+            handle.write(b"\0" * 16)
+        code, output = self.run_cli("--autoruns-changes")
+        self.assertEqual(code, 3, output)
+        self.assertIn("SNAPSHOTS:", output)
+        self.assertIn("NEW", output, "what is stored is still printed, under that word")
+        code, output = self.run_cli("--autoruns-status")
+        self.assertEqual(code, 3, output)
+        self.assertIn("BAD", output)
+
+    def test_an_unreadable_database_exits_three_and_says_how_to_start_again(self):
+        from avguard import autoruns
+        autoruns.AUTORUNS_DIR.mkdir(parents=True, exist_ok=True)
+        (autoruns.AUTORUNS_DIR / autoruns.DB_NAME).write_bytes(b"not a database" * 50)
+        for flag in ("--autoruns-status", "--autoruns-changes"):
+            code, output = self.run_cli(flag)
+            self.assertEqual(code, 3, output)
+            self.assertIn("cannot be read", output)
+            self.assertIn(autoruns.DB_NAME, output, "the file to move away is named")
 
     @unittest.skipUnless(sys.platform == "win32", "a real snapshot needs Windows")
     def test_a_real_snapshot_then_status_then_changes(self):

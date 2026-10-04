@@ -482,10 +482,25 @@ def _paste_check(source: Path) -> int:
     return 1 if match.tier == clipguard.WARNING else 0
 
 
+def _autoruns_unreadable(store) -> bool:
+    """A database SQLite cannot open is said, with the way out; it is never
+    deleted or written over by the program."""
+    broken = store.unreadable()
+    if broken is None:
+        return False
+    print(f"The snapshot database cannot be read ({broken}).")
+    print(f"To start again, move it away and take a new snapshot:  {store.db_path}")
+    return True
+
+
 def _autoruns_command(args) -> int:
     """What starts with Windows, from a terminal. Records; changes nothing."""
     from datetime import datetime
     from .events import EventStore
+    # The daily task runs this under pythonw, which has no stderr: what went
+    # wrong has to reach the log file, as the window's snapshot does.
+    logsetup.configure(level=logging.DEBUG if args.verbose else logging.INFO)
+    log = logging.getLogger("avguard.autoruns")
     store = autoruns.AutorunsStore()
 
     if args.autoruns_snapshot:
@@ -496,35 +511,43 @@ def _autoruns_command(args) -> int:
                 print(f"  {kind:8} {collected.counts.get(kind, 0):5} in {collected.seconds.get(kind, 0) * 1e3:7.0f} ms")
         for note in report.errors:
             print(f"  note: {note}", file=sys.stderr)
-        integrity = report.integrity_event()
-        if integrity is not None:
-            print(f"SNAPSHOTS: {integrity.reasons[0]}")
-            print()
+            log.warning("startup snapshot: %s", note)
         for change in report.changes:
-            quiet = "" if change.worth_a_look() else "   (under the Windows folder; recorded, not announced)"
+            # A removal is never announced, wherever it was; only a kept
+            # change under the Windows folder earns the words.
+            quiet = ("" if change.kind == "removed" or change.worth_a_look()
+                     else "   (under the Windows folder; recorded, not announced)")
             print(f"  {change.describe()}{quiet}")
         if report.changes:
             print()
         print(autoruns.describe_report(report))
         if report.snapshot is None:
-            return 2
+            return 3 if _autoruns_unreadable(store) or report.integrity_event() is not None else 2
         if report.changes:
             print("Nothing was moved or changed; a snapshot never does. Each change is in History.")
-        if integrity is not None:
+        if report.integrity_event() is not None:
             return 3
         return 1 if report.changes else 0
 
     if args.autoruns_changes:
-        changes = store.last_changes()
+        if _autoruns_unreadable(store):
+            return 3
         if not store.exists():
             print("No snapshot. Take one with:  python -m avguard --autoruns-snapshot")
             return 0
-        if not changes:
+        integrity = store.verify_integrity()
+        bad = integrity not in (autoruns.INTEGRITY_OK, autoruns.INTEGRITY_NO_SNAPSHOT)
+        if bad:
+            # The list below is read from a store that failed its check;
+            # it is printed as what is stored, under that word, not as fact.
+            print(f"SNAPSHOTS: {autoruns.INTEGRITY_MESSAGES.get(integrity, integrity)}")
+        changes = store.last_changes()
+        if not changes and not bad:
             print("Nothing changed between the last two snapshots.")
             return 0
         for change in changes:
             print(f"  {change.describe()}")
-        return 1
+        return 3 if bad else 1
 
     if args.autoruns_schedule:
         if args.autoruns_schedule == "status":
@@ -541,12 +564,16 @@ def _autoruns_command(args) -> int:
         return 0 if ok else 1
 
     # --autoruns-status
+    if _autoruns_unreadable(store):
+        return 3
     latest = store.latest()
-    if latest is None:
+    if latest is None and not store.exists():
         print("No snapshot. Take one with:  python -m avguard --autoruns-snapshot")
         return 0
     ok, text = autoruns.summarize(store)
     print(("OK   " if ok else "BAD  ") + text)
+    if latest is None:
+        return 0 if ok else 3          # a file with no snapshot in it: its signature says what it is
     when = datetime.fromtimestamp(latest.taken_at).strftime("%Y-%m-%d %H:%M")
     print(f"Last snapshot: {when}, {latest.entries:,} entries, {latest.seconds:.1f}s")
     kinds = {}

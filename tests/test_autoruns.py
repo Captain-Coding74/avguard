@@ -133,7 +133,8 @@ def populated_registry() -> FakeRegistry:
             BS + "??" + BS + "C:" + BS + "Users" + BS + "me" + BS + "AppData" + BS + "Local" + BS + "Temp" + BS + "evildrv.sys")
     reg.put("HKLM", services + BS + "evildrv", "Start", 1, kind=4)
     reg.put("HKLM", services + BS + "evildrv", "Type", 1, kind=4)
-    reg.put("HKLM", services + BS + "Dhcp" + BS + "Parameters", "ServiceDll", "dhcpcore.dll", kind=2)
+    reg.put("HKLM", services + BS + "Dhcp" + BS + "Parameters", "ServiceDll",
+            "%SystemRoot%" + BS + "system32" + BS + "dhcpcore.dll", kind=2)
     reg.put("HKLM", services + BS + "NoImage", "Start", 3, kind=4)   # no ImagePath: not an entry
     return reg
 
@@ -190,7 +191,8 @@ class TestTheCollectors(AutorunsCase):
         entries = autoruns.collect_services(self.registry)
         by_name = {e.name: e for e in entries}
         self.assertEqual(set(by_name), {"Dhcp", "evildrv"}, "a key with no ImagePath is not a service")
-        self.assertEqual(by_name["Dhcp"].extra, "start automatic; type shared process")
+        self.assertEqual(by_name["Dhcp"].extra, "start automatic; type shared process; dll %SystemRoot%"
+                         + BS + "system32" + BS + "dhcpcore.dll")
         self.assertEqual(by_name["Dhcp"].detail["display_name"], "DHCP Client")
         self.assertEqual(by_name["evildrv"].extra, "start system; type kernel driver")
         self.assertEqual(by_name["evildrv"].target, "C:" + BS + "Users" + BS + "me" + BS + "AppData" + BS
@@ -238,6 +240,25 @@ class TestTheCollectors(AutorunsCase):
         changed = autoruns.parse_tasks(text.replace("upd.exe</Command>", "upd2.exe</Command>"))
         self.assertEqual([(c.kind, c.entry.name) for c in diff(before, changed)], [("modified", "Updater")])
 
+    def test_the_account_is_the_principal_s_not_a_logon_trigger_s(self):
+        """schtasks writes Triggers before Principals, and a LogonTrigger may
+        carry a UserId of its own: whose sign-in starts it, not who it runs as."""
+        text = FIXTURE.read_text(encoding="utf-8")
+
+        def task(user: str) -> str:
+            return ('<!-- ' + BS + 'Updater2 -->\n'
+                    '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+                    '<Triggers><LogonTrigger><UserId>DESKTOP' + BS + 'me</UserId></LogonTrigger></Triggers>'
+                    '<Principals><Principal id="Author"><UserId>' + user + '</UserId>'
+                    '<RunLevel>LeastPrivilege</RunLevel></Principal></Principals>'
+                    '<Settings><Enabled>true</Enabled></Settings>'
+                    '<Actions><Exec><Command>C:' + BS + 'u.exe</Command></Exec></Actions></Task>\n')
+        before = autoruns.parse_tasks(text.replace("</Tasks>", task("DESKTOP" + BS + "me") + "</Tasks>"))
+        after = autoruns.parse_tasks(text.replace("</Tasks>", task("S-1-5-18") + "</Tasks>"))
+        self.assertIn("S-1-5-18", next(e for e in after if e.name == "Updater2").extra)
+        self.assertEqual([(c.kind, c.entry.name) for c in diff(before, after)], [("modified", "Updater2")],
+                         "running as SYSTEM instead of the user is a change")
+
     def test_a_task_whose_cdata_holds_a_task_element_is_still_read(self):
         """The Windows runner's Performance Monitor task: its ComHandler Data is
         a data-collector definition in CDATA with <Task></Task> inside, and a
@@ -274,7 +295,90 @@ class TestTheCollectors(AutorunsCase):
         self.assertEqual(collected.counts[autoruns.KIND_TASK], 0)
         self.assertTrue(any("schtasks could not be run" in e for e in collected.errors))
         self.assertEqual(collected.counts[autoruns.KIND_SERVICE], 2)
+        self.assertEqual(collected.failed, {autoruns.KIND_TASK}, "unknown today, which is not empty")
         self.assertEqual(set(collected.seconds), set(autoruns.KINDS), "every collector is timed")
+
+    def test_an_empty_or_failed_schtasks_answer_is_a_failed_read_not_an_empty_one(self):
+        with self.assertRaises(autoruns.CollectorFailed):
+            autoruns.collect_tasks(lambda: b"")
+        with self.assertRaises(autoruns.CollectorFailed) as caught:
+            autoruns.collect_tasks(lambda: b"ERROR: Access is denied.\r\n")
+        self.assertIn("Access is denied", str(caught.exception))
+        collected = self.collect(runner=lambda: b"")
+        self.assertEqual(collected.failed, {autoruns.KIND_TASK})
+        self.assertEqual(collected.counts[autoruns.KIND_TASK], 0)
+        self.assertTrue(any(e.startswith("task:") for e in collected.errors))
+
+    def test_an_svchost_hosted_service_is_its_dll(self):
+        """The image path says svchost; the code that runs is Parameters\\ServiceDll."""
+        entries = autoruns.collect_services(self.registry)
+        dhcp = {e.name: e for e in entries}["Dhcp"]
+        self.assertEqual(dhcp.target, ROOT + BS + "system32" + BS + "dhcpcore.dll")
+        self.assertEqual(dhcp.detail["service_dll"], "%SystemRoot%" + BS + "system32" + BS + "dhcpcore.dll")
+        evil = "C:" + BS + "Users" + BS + "me" + BS + "AppData" + BS + "Roaming" + BS + "evil.dll"
+        self.registry.put("HKLM", autoruns.SERVICES_KEY + BS + "Dhcp" + BS + "Parameters", "ServiceDll", evil, kind=2)
+        hijacked = diff(entries, autoruns.collect_services(self.registry))
+        self.assertEqual([(c.kind, c.entry.name) for c in hijacked], [("modified", "Dhcp")])
+        self.assertTrue(hijacked[0].worth_a_look(ROOT, trusted=lambda t: True),
+                        "svchost is signed; the DLL under the profile is the point")
+        self.assertEqual(hijacked[0].as_event().path, evil)
+        bare = Entry("service", "x", "Svc", "%SystemRoot%" + BS + "system32" + BS + "svchost.exe -k g",
+                     detail={"service_dll": "core.dll"})
+        self.assertTrue(autoruns.Change("added", bare).worth_a_look(ROOT),
+                        "a DLL named without a folder: nothing vouches for where it comes from")
+
+    def test_per_logon_service_instances_are_not_entries(self):
+        services = autoruns.SERVICES_KEY
+        image = "%SystemRoot%" + BS + "system32" + BS + "svchost.exe -k UnistackSvcGroup"
+        for name, kind in (("CDPUserSvc", 0x60), ("CDPUserSvc_3f2a1", 0xE0)):
+            self.registry.put("HKLM", services + BS + name, "ImagePath", image, kind=2)
+            self.registry.put("HKLM", services + BS + name, "Start", 2, kind=4)
+            self.registry.put("HKLM", services + BS + name, "Type", kind, kind=4)
+        names = {e.name for e in autoruns.collect_services(self.registry)}
+        self.assertIn("CDPUserSvc", names)
+        self.assertNotIn("CDPUserSvc_3f2a1", names, "a fresh name at every sign-in; its template is collected")
+        self.assertEqual(autoruns.SERVICE_TYPE[0xE0], "user service instance")
+
+    def test_a_driver_without_an_image_path_loads_from_the_drivers_folder(self):
+        self.registry.put("HKLM", autoruns.SERVICES_KEY + BS + "Beep", "Type", 1, kind=4)
+        self.registry.put("HKLM", autoruns.SERVICES_KEY + BS + "Beep", "Start", 1, kind=4)
+        by_name = {e.name: e for e in autoruns.collect_services(self.registry)}
+        self.assertIn("Beep", by_name)
+        self.assertNotIn("NoImage", by_name, "neither an image nor a driver type")
+        self.assertEqual(by_name["Beep"].value, BS + "SystemRoot" + BS + "System32" + BS + "drivers" + BS + "Beep.sys")
+        self.assertEqual(by_name["Beep"].target, ROOT + BS + "System32" + BS + "drivers" + BS + "Beep.sys")
+        self.assertTrue(by_name["Beep"].detail["implied"])
+
+    def test_task_manager_s_disabled_flag_is_the_low_bit(self):
+        for first, enabled in ((2, True), (3, False), (6, True), (7, False)):
+            with self.subTest(first=first):
+                self.registry.put("HKCU", autoruns.APPROVED_RUN, "OneDrive", bytes([first] + [0] * 11), kind=3)
+                by_name = {e.name: e for e in autoruns.collect_run_keys(self.registry)}
+                self.assertEqual(by_name["OneDrive"].enabled, enabled)
+
+    def test_a_command_in_a_run_key_s_default_value_is_an_entry(self):
+        self.registry.put("HKLM", autoruns.RUN_KEYS[0], "", "C:" + BS + "odd" + BS + "d.exe", view=0x0100)
+        by_name = {e.name: e for e in autoruns.collect_run_keys(self.registry)}
+        self.assertEqual(by_name["(Default)"].value, "C:" + BS + "odd" + BS + "d.exe")
+        self.assertNotIn("", by_name, "the empty RunOnce default is still nothing")
+
+    def test_a_startup_file_is_its_own_target(self):
+        deep = self.tmp / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+        deep.mkdir(parents=True)
+        (deep / "Vendor Tray.lnk").write_bytes(b"L\x00\x00\x00")
+        entry = autoruns.collect_startup_folders([("user", deep)], self.registry)[0]
+        self.assertEqual(entry.target, str(deep / "Vendor Tray.lnk"))
+        self.assertEqual(entry.paths(), [str(deep / "Vendor Tray.lnk")])
+        self.assertEqual(autoruns.Change("added", entry).as_event().path, str(deep / "Vendor Tray.lnk"))
+
+    def test_a_startup_folder_that_cannot_be_listed_is_a_failed_read(self):
+        from unittest import mock
+        with mock.patch.object(autoruns.Path, "iterdir", side_effect=PermissionError(13, "Access is denied")):
+            with self.assertRaises(autoruns.CollectorFailed):
+                autoruns.collect_startup_folders(self.folders, self.registry)
+            collected = self.collect()
+        self.assertEqual(collected.failed, {autoruns.KIND_STARTUP})
+        self.assertEqual(collected.counts[autoruns.KIND_TASK], 2, "the others still read")
 
     @unittest.skipIf(sys.platform == "win32", "off Windows there is no winreg to fall back to")
     def test_no_registry_means_no_registry_entries_and_no_error(self):
@@ -322,6 +426,13 @@ class TestTheDiff(unittest.TestCase):
         self.assertEqual(event.detail["old"]["value"], "C:" + BS + "app.exe")
         self.assertEqual(event.reasons, [change.describe()])
 
+    def test_a_task_in_the_library_root_reads_with_one_backslash(self):
+        change = autoruns.Change("added", Entry("task", BS, "Updater", "C:" + BS + "u.exe"))
+        self.assertIn("task " + BS + "Updater:", change.describe())
+        self.assertNotIn(BS + BS, change.describe())
+        nested = autoruns.Change("added", Entry("task", BS + "Microsoft" + BS + "Windows", "Defrag", "x"))
+        self.assertIn("task " + BS + "Microsoft" + BS + "Windows" + BS + "Defrag:", nested.describe())
+
 
 # ----------------------------------------------------------- worth a look
 
@@ -345,6 +456,31 @@ class TestWhatDeservesABanner(unittest.TestCase):
         def broken(target: str) -> bool:
             raise OSError("no signature API")
         self.assertTrue(self.change(ROOT + BS + "a.exe").worth_a_look(ROOT, trusted=broken))
+
+    def test_the_payload_counts_not_only_the_host(self):
+        sys32 = ROOT + BS + "System32" + BS
+        profile = "C:" + BS + "Users" + BS + "me" + BS + "AppData" + BS + "Roaming" + BS
+        loud = [sys32 + "rundll32.exe " + profile + "x.dll,Run",
+                '"' + sys32 + 'cmd.exe" /c ' + profile + "go.bat",
+                sys32 + "WindowsPowerShell" + BS + "v1.0" + BS + "powershell.exe -File C:" + BS + "ProgramData" + BS + "s.ps1",
+                sys32 + "wscript.exe " + profile + "a.vbs",
+                sys32 + "regsvr32.exe /s " + profile + "b.dll",
+                sys32 + "mshta.exe " + profile + "c.hta"]
+        for value in loud:
+            with self.subTest(value=value):
+                self.assertTrue(self.change(value).worth_a_look(ROOT))
+                self.assertTrue(self.change(value).worth_a_look(ROOT, trusted=lambda t: True),
+                                "the host is signed; the payload is the point")
+        quiet = sys32 + "rundll32.exe " + sys32 + "shell32.dll,Control_RunDLL"
+        self.assertFalse(self.change(quiet).worth_a_look(ROOT))
+        self.assertTrue(self.change(quiet).worth_a_look(ROOT, trusted=lambda t: False))
+
+    def test_user_writable_corners_of_the_windows_folder_are_loud(self):
+        for sub in ("Temp", "Tasks", "tracing", "System32" + BS + "Tasks",
+                    "System32" + BS + "spool" + BS + "drivers" + BS + "color"):
+            with self.subTest(sub=sub):
+                self.assertTrue(self.change(ROOT + BS + sub + BS + "x.exe").worth_a_look(ROOT, trusted=lambda t: True))
+        self.assertFalse(self.change(ROOT + BS + "System32" + BS + "x.exe").worth_a_look(ROOT, trusted=lambda t: True))
 
 
 # ----------------------------------------------------------------- store
@@ -412,8 +548,96 @@ class TestTheStore(AutorunsCase):
         tamper = [e for e in self.events.read(kinds={"autoruns"}) if e.level == "tampered"]
         self.assertEqual(len(tamper), 1)
         self.assertEqual(self.store.verify_integrity(), autoruns.INTEGRITY_OK, "re-signed by the new snapshot")
+        self.assertTrue(autoruns.describe_report(report).startswith("SNAPSHOTS: the startup snapshots were modified"),
+                        "the status line says it too, or the tab would show it vanish")
         self.store.signature_path.unlink()
         self.assertEqual(self.store.verify_integrity(), autoruns.INTEGRITY_UNSIGNED)
+
+    def test_a_failed_collector_keeps_the_previous_snapshot_s_entries(self):
+        self.store.snapshot(self.collect(), events=self.events)
+        report = self.store.snapshot(self.collect(runner=lambda: b""), events=self.events)
+        self.assertEqual(report.changes, [], "a read that did not happen is not two tasks gone")
+        self.assertEqual(report.carried, {autoruns.KIND_TASK: 2})
+        self.assertEqual(report.snapshot.entries, 8)
+        self.assertEqual(report.snapshot.failed, (autoruns.KIND_TASK,))
+        self.assertIn("kept from the previous snapshot", autoruns.describe_report(report))
+        self.assertEqual(self.events.read(kinds={"autoruns"}), [])
+        self.assertEqual(len([e for e in self.store.entries() if e.kind == "task"]), 2)
+        back = self.store.snapshot(self.collect(), events=self.events)
+        self.assertEqual(back.changes, [], "and nothing is new when schtasks answers again")
+
+    def test_a_kind_first_read_after_a_bad_first_read_is_recorded_not_compared(self):
+        first = self.store.snapshot(self.collect(runner=lambda: b""), events=self.events)
+        self.assertEqual((first.snapshot.entries, first.carried), (6, {}))
+        second = self.store.snapshot(self.collect(), events=self.events)
+        self.assertEqual(second.changes, [], "two tasks read for the first time are not two NEW rows")
+        self.assertTrue(any("read for the first time" in e for e in second.errors))
+        self.assertEqual(second.snapshot.entries, 8)
+        self.assertEqual(self.events.read(kinds={"autoruns"}), [])
+        self.registry.put("HKCU", autoruns.RUN_KEYS[0], "Dropper", "C:" + BS + "d.exe")
+        third = self.store.snapshot(self.collect(), events=self.events)
+        self.assertEqual([(c.kind, c.entry.name) for c in third.changes], [("added", "Dropper")])
+
+    def test_an_unreadable_database_is_reported_and_not_written_over(self):
+        self.store.snapshot(self.collect())
+        self.store.db_path.write_bytes(b"not a database at all" * 100)
+        self.assertIsNotNone(self.store.unreadable())
+        ok, text = autoruns.summarize(self.store)
+        self.assertFalse(ok)
+        self.assertIn("modified outside AVGuard", text)
+        report = self.store.snapshot(self.collect(), events=self.events)
+        self.assertIsNone(report.snapshot)
+        self.assertEqual(report.integrity, autoruns.INTEGRITY_TAMPERED)
+        self.assertTrue(any("cannot be read" in e for e in report.errors))
+        self.assertTrue(autoruns.describe_report(report).startswith("SNAPSHOTS:"))
+        self.assertEqual([e.level for e in self.events.read(kinds={"autoruns"})], ["tampered"])
+        self.assertEqual(self.store.db_path.read_bytes(), b"not a database at all" * 100, "left for the user")
+        self.assertEqual(self.store.snapshots(), [])
+
+    def test_an_unreadable_key_keeps_the_snapshot_and_the_events(self):
+        self.store.snapshot(self.collect())
+        self.store.key_path.write_bytes(b"garbage")
+        self.registry.put("HKCU", autoruns.RUN_KEYS[0], "Dropper", "C:" + BS + "d.exe")
+        report = self.store.snapshot(self.collect(), events=self.events)
+        self.assertIsNotNone(report.snapshot)
+        self.assertEqual(report.integrity, autoruns.INTEGRITY_KEY_UNREADABLE)
+        self.assertTrue(any("not signed" in e for e in report.errors))
+        self.assertEqual([(c.kind, c.entry.name) for c in report.changes], [("added", "Dropper")])
+        self.assertEqual(sorted(e.level for e in self.events.read(kinds={"autoruns"})), ["added", "tampered"])
+        self.assertEqual(len(self.store.snapshots()), 2)
+        self.assertEqual(self.store.verify_integrity(), autoruns.INTEGRITY_KEY_UNREADABLE)
+        self.assertIn("signing key", autoruns.describe_report(report).split(".")[0])
+
+    def test_a_file_with_no_snapshot_in_it_is_not_no_snapshot_yet(self):
+        self.store.snapshot(self.collect())
+        self.store.db_path.write_bytes(b"")
+        ok, text = autoruns.summarize(self.store)
+        self.assertFalse(ok)
+        self.assertIn("modified outside AVGuard", text, "its signature says what it is")
+
+    def test_one_snapshot_at_a_time(self):
+        self.store.snapshot(self.collect())
+        other = autoruns._Lock(self.store.directory / autoruns.LOCK_NAME)
+        self.assertTrue(other.acquire(0.1))
+        self.addCleanup(other.release)
+        self.addCleanup(setattr, autoruns, "LOCK_WAIT", autoruns.LOCK_WAIT)
+        autoruns.LOCK_WAIT = 0.3
+        report = self.store.snapshot(self.collect(), events=self.events)
+        self.assertIsNone(report.snapshot)
+        self.assertTrue(any("another snapshot" in e for e in report.errors))
+        self.assertEqual(len(self.store.snapshots()), 1)
+        self.assertEqual(self.store.verify_integrity(), autoruns.INTEGRITY_OK)
+        other.release()
+        self.assertIsNotNone(self.store.snapshot(self.collect()).snapshot)
+
+    def test_duplicate_keys_are_stored_once_and_do_not_flap(self):
+        twice = autoruns.Collected(entries=[Entry("run", "HKCU" + BS + "Run", "App", "C:" + BS + "a.exe"),
+                                            Entry("run", "HKCU" + BS + "Run", "APP", "C:" + BS + "b.exe")])
+        first = self.store.snapshot(twice)
+        self.assertEqual(first.snapshot.entries, 1)
+        self.assertEqual(self.store.latest().entries, 1)
+        self.assertEqual([e.value for e in self.store.entries()], ["C:" + BS + "a.exe"])
+        self.assertEqual(self.store.snapshot(twice).changes, [])
 
     def test_summarize_and_sizes_are_printed(self):
         self.assertEqual(autoruns.summarize(self.store), (True, "no snapshot yet"))
@@ -485,6 +709,40 @@ class TestTheTabOnAWindow(AutorunsCase):
         self.assertEqual(str(self.panel.snapshot_btn.cget("state")), "normal")
         self.assertEqual(len(self.events.read(kinds={"autoruns"})), 2)
 
+    def test_a_gone_row_keeps_its_colour_and_the_checker_is_asked_on_the_worker(self):
+        import threading
+        asked: list[str] = []
+
+        def trusted(target: str) -> bool:
+            asked.append(threading.current_thread().name)
+            return True
+        self.panel._trusted = trusted
+        self.panel.snapshot()
+        self.wait()
+        self.registry.keys[FakeRegistry._path("HKCU", autoruns.RUN_KEYS[0])].pop("OneDrive")
+        self.registry.put("HKLM", autoruns.RUN_KEYS[0], "WinHelper",
+                          ROOT + BS + "System32" + BS + "helper.exe", view=0x0100)
+        self.panel.snapshot()
+        self.wait()
+        rows = {self.panel.tree.item(iid, "values")[1]: self.panel.tree.item(iid, "tags")
+                for iid in self.panel.tree.get_children()}
+        self.assertEqual(rows, {"run: OneDrive": ("removed",), "run: WinHelper": ("quiet",)},
+                         "gone is gone, in its own colour; grey means under the Windows folder")
+        self.assertEqual(set(asked), {"avguard-autoruns"}, "the checker runs on the worker, never the GUI thread")
+        self.assertEqual(self.reports[-1].loud, [], "judged before the report reached the window")
+        before = len(asked)
+        self.panel.refresh()
+        self.assertEqual(len(asked), before, "the list the tab opens on does not ask the checker")
+        self.assertEqual({self.panel.tree.item(iid, "values")[1] for iid in self.panel.tree.get_children()},
+                         {"run: OneDrive", "run: WinHelper"})
+
+    def test_a_row_s_detail_is_built_from_the_entries_not_the_sentence(self):
+        from avguard.startuppanel import row_for
+        old = Entry("run", "HKCU" + BS + "Run", "Update: check", "C:" + BS + "a.exe")
+        new = Entry("run", "HKCU" + BS + "Run", "Update: check", "C:" + BS + "b.exe")
+        self.assertEqual(row_for(autoruns.Change("modified", new, old)),
+                         ("changed", "run: Update: check", "C:" + BS + "a.exe -> C:" + BS + "b.exe"))
+
     def test_the_tab_opens_on_the_last_diff(self):
         self.store.snapshot(self.collect())
         self.registry.put("HKCU", autoruns.RUN_KEYS[0], "Late", "C:" + BS + "late.exe")
@@ -493,6 +751,17 @@ class TestTheTabOnAWindow(AutorunsCase):
         self.assertEqual([self.panel.tree.item(i, "values")[1] for i in self.panel.tree.get_children()],
                          ["run: Late"])
 
+    def test_an_unreadable_database_shows_red_and_the_snapshot_says_why(self):
+        self.store.snapshot(self.collect())
+        self.store.db_path.write_bytes(b"not a database" * 50)
+        self.panel.refresh()
+        self.assertIn("modified outside AVGuard", self.panel.summary_var.get())
+        self.panel.snapshot()
+        self.wait()
+        self.assertTrue(self.panel.status_var.get().startswith("SNAPSHOTS:"), self.panel.status_var.get())
+        self.assertIn("not recorded", self.panel.status_var.get())
+        self.assertEqual(str(self.panel.snapshot_btn.cget("state")), "normal")
+
     def test_a_snapshot_that_collects_nothing_says_so_and_keeps_the_button(self):
         self.panel._collect = lambda: autoruns.Collected(errors=["schtasks could not be run: x"])
         self.panel.snapshot()
@@ -500,6 +769,57 @@ class TestTheTabOnAWindow(AutorunsCase):
         self.assertIn("No snapshot was taken", self.panel.status_var.get())
         self.assertFalse(self.store.exists())
         self.assertEqual(str(self.panel.snapshot_btn.cget("state")), "normal")
+
+
+# ------------------------------------------------------ the window's rule
+
+class TestTheWindowsCheckerRule(unittest.TestCase):
+    """The closure the window hands the tab, called unbound on a stand-in:
+    only a signature that fails makes a change under the Windows folder
+    loud, because the checker cannot verify catalogue-signed files."""
+
+    def setUp(self) -> None:
+        try:
+            from avguard import gui, signing
+        except ImportError:
+            self.skipTest("GUI dependencies are not installed")
+        self.gui, self.signing = gui, signing
+        self.tmp = Path(_tempfile.mkdtemp(prefix="avguard-trust-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp, ignore_errors=True))
+
+    def test_only_a_failing_signature_makes_a_system_root_change_loud(self):
+        from types import SimpleNamespace
+        Trust = self.signing.Trust
+        target = self.tmp / "x.exe"
+        target.write_bytes(b"MZ")
+        answer = {}
+
+        class FakeChecker:
+            available = True
+
+            def check(self, path, size=0, mtime_ns=0):
+                return SimpleNamespace(trust=answer["trust"], is_trusted=answer["trust"] is Trust.TRUSTED)
+        app = SimpleNamespace(scanner=SimpleNamespace(signatures=FakeChecker()))
+        trusted = self.gui.AVGuardApp._startup_trusted(app)
+        for trust, quiet in ((Trust.TRUSTED, True), (Trust.UNSIGNED, True), (Trust.UNTRUSTED, False)):
+            answer["trust"] = trust
+            self.assertEqual(trusted(str(target)), quiet, trust)
+        none = SimpleNamespace(scanner=SimpleNamespace(signatures=SimpleNamespace(available=False)))
+        self.assertIsNone(self.gui.AVGuardApp._startup_trusted(none))
+
+    def test_the_banner_takes_the_worker_s_judgement(self):
+        from types import SimpleNamespace
+        banners: list[str] = []
+        app = SimpleNamespace(_banner=lambda text, style: banners.append(text), _startup_trusted=lambda: None)
+        loud = autoruns.Change("added", Entry("run", "HKCU" + BS + "Run", "Dropper", "C:" + BS + "d.exe"))
+        quiet = autoruns.Change("added", Entry("run", "HKLM" + BS + "Run", "Helper", ROOT + BS + "h.exe"))
+        self.gui.AVGuardApp._startup_report(app, autoruns.SnapshotReport(changes=[quiet, loud], loud=[loud]))
+        self.assertEqual(len(banners), 1)
+        self.assertIn("Dropper", banners[0])
+        self.gui.AVGuardApp._startup_report(app, autoruns.SnapshotReport(changes=[loud], loud=[]))
+        self.assertEqual(len(banners), 1, "what the worker judged quiet is not announced here")
+        self.gui.AVGuardApp._startup_report(app, autoruns.SnapshotReport(changes=[quiet, loud], loud=None))
+        self.assertEqual(len(banners), 2, "nobody judged: the system-root rule decides")
 
 
 # ------------------------------------------------------ the Windows runner
@@ -517,12 +837,20 @@ class TestOnTheWindowsRunner(unittest.TestCase):
             print(f"  note: {note}")
         self.assertGreater(first.counts[autoruns.KIND_SERVICE], 50, "a Windows machine has services")
         self.assertGreater(first.counts[autoruns.KIND_TASK], 0, "and scheduled tasks")
+        self.assertEqual(first.failed, set(), first.errors)
+        self.assertFalse([e for e in first.errors if "unreadable XML" in e],
+                         "a task the parser cannot read is a defect, not a note: " + "; ".join(first.errors))
         report = store.snapshot(first)
         self.assertTrue(report.first)
         second = store.snapshot(autoruns.collect())
         for change in second.changes:
             print(f"  changed between two snapshots: {change.describe()}")
-        self.assertEqual(second.changes, [])
+        if second.changes:
+            # The runner is a live machine: a task an updater registers
+            # between two collections is real and does not repeat; a diff
+            # that flaps repeats on the third collection.
+            third = store.snapshot(autoruns.collect())
+            self.assertEqual(third.changes, [], "a change that repeats is the diff's, not the machine's")
         print(f"  database: {store.db_path.stat().st_size:,} bytes after two snapshots of "
               f"{report.snapshot.entries:,} entries")
         self.assertEqual(store.verify_integrity(), autoruns.INTEGRITY_OK)
