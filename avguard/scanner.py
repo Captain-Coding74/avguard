@@ -221,7 +221,7 @@ def finding_from_dict(raw: object) -> Finding:
                        bool(raw.get("hard", False)), str(raw.get("severity", "")),
                        str(raw.get("pack", "")),
                        tuple(str(n) for n in notes) if isinstance(notes, (list, tuple)) else ())
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:   # Infinity is a JSON token
         return Finding("stored", "malformed", 0, f"malformed stored finding ({exc})")
 
 

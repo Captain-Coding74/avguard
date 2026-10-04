@@ -4,7 +4,10 @@ AVGuard is the host layer and Network Watchdog is the network layer of one
 home setup. The events store already records every detection; posting each
 one to a URL is a small step that lets the two see each other. Off until a
 URL is set, and setting one names exactly what leaves the machine: the file
-path, the verdict, the rule names and the file's SHA-256.
+path, the verdict, the file's SHA-256 and the evidence behind the verdict
+(each finding's source, weight, severity and pack, a rule author's note, the
+counted totals and the quarantine threshold). The paste guard's events are
+recorded with forward=False and never reach this module.
 
 The rule that shapes this module is the GUI pump's: the scan path must not
 be able to see a dead or slow endpoint at all. So `submit()` puts the event

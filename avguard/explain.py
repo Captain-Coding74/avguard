@@ -24,6 +24,7 @@ the console render what it returns.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass
 from typing import Sequence
 
@@ -41,6 +42,7 @@ RECORDED = "recorded"            # a reason sentence from before evidence was ke
 # What happened to the file, which decides what can be done about it.
 QUARANTINED = "quarantined"
 REPORTED = "reported"            # MALICIOUS, nothing moved
+DETECTED = "detected"            # a detection event that does not say whether a move followed
 SUSPICIOUS = "suspicious"        # reported and left alone
 KEPT = "kept"                    # CLEAN by the user's decision
 OTHER = "other"
@@ -57,12 +59,19 @@ _MEANING = {
     Level.SKIPPED.value: "Not examined.",
     Level.ERROR.value: "Could not be examined.",
 }
+CLEAN_BELOW_THE_LINE = "Below the reporting line: what was found did not add up to a report."
+CLEAN_KEPT = "Kept because you chose to: what was found was set aside by your decision."
+NOTE_LEFT_OUT = ("(a note from the rule's author was left out: it states a confidence figure, "
+                 "which this account does not carry)")
+_VERDICT_KINDS = ("detection", "quarantined", "suspicious")
 
 _HAPPENED: dict[str, tuple[str, tuple[tuple[str, str], ...]]] = {
     QUARANTINED: ("Quarantined. Restore puts it back and remembers these exact bytes.",
                   (("Restore", "restore"), ("Never scan this folder", "exclude"),
                    ("Mark as a known sample", "reference"))),
     REPORTED: ("Nothing was moved.", (("Never scan this folder", "exclude"),)),
+    DETECTED: ("Detected. If automatic quarantine was on, the 'quarantined' row for this file says "
+               "it was then moved.", (("Never scan this folder", "exclude"),)),
     SUSPICIOUS: ("Left alone. If this is your own file, 'Never scan this folder' stops the report.",
                  (("Never scan this folder", "exclude"),)),
     KEPT: ("Kept because you chose to; Settings > Files you chose to keep withdraws that.",
@@ -87,8 +96,9 @@ class Tally:
     soft: int                 # before the cap
     soft_capped: int
     cap: int
-    threshold: int            # hard evidence needed to move a file (cfg.quarantine_threshold)
+    threshold: float          # hard evidence needed to move a file, as decide() was given it
     suspicious_at: int
+    count: int = 0            # findings counted; none means CLEAN, as decide() returns early
 
     @property
     def total(self) -> int:
@@ -96,6 +106,8 @@ class Tally:
 
     def level(self) -> Level:
         """The level this arithmetic yields; equal to decide()'s by construction."""
+        if not self.count:
+            return Level.CLEAN
         if self.hard >= self.threshold:
             return Level.MALICIOUS
         if self.total >= self.suspicious_at:
@@ -120,6 +132,7 @@ class Explanation:
     happened: str
     actions: tuple[tuple[str, str], ...]     # (label, kind); the window maps kinds to methods
     evidence_kept: bool = True
+    reasons: tuple[str, ...] = ()            # the verdict's sentences; what a skipped file has
 
     @property
     def consistent(self) -> bool:
@@ -129,11 +142,21 @@ class Explanation:
         return self.evidence_kept and self.tally.level().value == self.level
 
 
-def tally_of(findings: Sequence[Finding], threshold: int) -> Tally:
+def tally_of(findings: Sequence[Finding], threshold) -> Tally:
     hard = sum(f.weight for f in findings if f.hard)
     soft = sum(f.weight for f in findings if not f.hard)
     return Tally(hard=hard, soft=soft, soft_capped=min(soft, HEURISTIC_CAP), cap=HEURISTIC_CAP,
-                 threshold=int(threshold), suspicious_at=SUSPICIOUS_AT)
+                 threshold=threshold, suspicious_at=SUSPICIOUS_AT, count=len(findings))
+
+
+def _author_notes(notes: Sequence[str]) -> tuple[str, ...]:
+    """A rule author's note, unless it states a confidence figure: the one
+    number this account promises never to carry, whoever wrote it."""
+    kept = []
+    for note in notes:
+        figure = "%" in note or (re.search(r"\d", note) and re.search(r"confiden|probab", note, re.I))
+        kept.append(NOTE_LEFT_OUT if figure else note)
+    return tuple(kept)
 
 
 def _source_words(finding: Finding, packs) -> tuple[str, str, tuple[str, ...]]:
@@ -186,29 +209,47 @@ def _source_words(finding: Finding, packs) -> tuple[str, str, tuple[str, ...]]:
 
 def _row(finding: Finding, packs) -> Row:
     kind, words, extra = _source_words(finding, packs)
-    return Row(kind, words, int(finding.weight), finding.describe(), tuple(finding.notes) + extra)
+    return Row(kind, words, int(finding.weight), finding.describe(), _author_notes(finding.notes) + extra)
+
+
+def _meaning(level: str, rows: Sequence[Row], state: str) -> str:
+    if level == Level.CLEAN.value:
+        if state == KEPT:
+            return CLEAN_KEPT
+        if any(row.weight for row in rows):
+            return CLEAN_BELOW_THE_LINE
+        return _MEANING[level]
+    return _MEANING.get(level, "")
 
 
 def explain(path: str, level: str, reasons: Sequence[str], findings: Sequence[Finding] | None,
             cfg: config.Config, *, packs=None, sha256: str = "", state: str = OTHER,
-            evidence_kept: bool = True) -> Explanation:
+            evidence_kept: bool = True, threshold=None) -> Explanation:
     """The account. `findings` None, or evidence_kept False, means the source
     never stored its evidence (a record or an event from before this
-    existed): the rows are then the reason sentences, said to be that."""
-    findings = list(findings or [])
+    existed): the rows are then the reason sentences, said to be that.
+    `threshold` is the one the verdict was decided with when the source
+    recorded it; the configuration's is used when it did not."""
     kept = evidence_kept and findings is not None
+    findings = list(findings or [])
     if kept and findings:
         rows = tuple(_row(f, packs) for f in findings)
     elif kept:
         rows = ()
     else:
         rows = tuple(Row(RECORDED, NOT_KEPT, 0, reason) for reason in reasons)
-    tally = tally_of(findings if kept else [], cfg.quarantine_threshold)
-    meaning = _MEANING.get(level, level)
+    tally = tally_of(findings if kept else [],
+                     cfg.quarantine_threshold if threshold is None else threshold)
     happened, actions = _HAPPENED.get(state, _HAPPENED[OTHER])
-    return Explanation(path=str(path), level=level, meaning=meaning, rows=rows, tally=tally,
-                       sha256=sha256, state=state, happened=happened,
-                       actions=actions + (("Copy this account", "copy"),), evidence_kept=kept)
+    return Explanation(path=str(path), level=level, meaning=_meaning(level, rows, state), rows=rows,
+                       tally=tally, sha256=sha256, state=state, happened=happened,
+                       actions=actions + (("Copy this account", "copy"),), evidence_kept=kept,
+                       reasons=tuple(str(r) for r in reasons))
+
+
+def _recorded_threshold(detail: dict):
+    value = detail.get("threshold")
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
 def state_of(verdict: Verdict, quarantined: bool = False) -> str:
@@ -227,23 +268,41 @@ def from_verdict(verdict: Verdict, cfg: config.Config, packs=None,
                    packs=packs, sha256=verdict.sha256, state=state_of(verdict, quarantined))
 
 
-def from_record(record, evidence: list | None, cfg: config.Config, packs=None) -> Explanation:
+def from_record(record, evidence, cfg: config.Config, packs=None) -> Explanation:
     """A held file: MALICIOUS by definition, its evidence from the store's
-    sidecar when the store kept one."""
-    findings = findings_from_dicts(evidence) if evidence is not None else None
+    sidecar when the store kept one. `evidence` is what evidence_detail()
+    produced (a dict with findings and the threshold), a bare list of
+    findings, or None."""
+    threshold = None
+    if isinstance(evidence, dict):
+        raw = evidence.get("findings")
+        threshold = _recorded_threshold(evidence)
+    elif isinstance(evidence, list):
+        raw = evidence
+    else:
+        raw = None
+    findings = findings_from_dicts(raw) if raw is not None else None
     return explain(record.original_path, Level.MALICIOUS.value, record.reasons, findings, cfg,
                    packs=packs, sha256=record.sha256, state=QUARANTINED,
-                   evidence_kept=evidence is not None)
+                   evidence_kept=raw is not None, threshold=threshold)
+
+
+def is_verdict_event(event) -> bool:
+    """Only these kinds have an account; a restore or a scan summary does not."""
+    return getattr(event, "kind", "") in _VERDICT_KINDS
 
 
 def from_event(event, cfg: config.Config, packs=None) -> Explanation:
     detail = event.detail if isinstance(event.detail, dict) else {}
     raw = detail.get("findings")
-    state = {"quarantined": QUARANTINED, "detection": REPORTED, "suspicious": SUSPICIOUS}.get(
-        event.kind, OTHER)
-    return explain(event.path, event.level or Level.CLEAN.value, event.reasons,
+    # What happened is recorded with the event when the window knew it (a
+    # detection that was then quarantined); the kind is the fallback.
+    state = detail.get("state") if detail.get("state") in _HAPPENED else \
+        {"quarantined": QUARANTINED, "detection": DETECTED, "suspicious": SUSPICIOUS}.get(event.kind, OTHER)
+    return explain(event.path, event.level or "", event.reasons,
                    findings_from_dicts(raw) if raw is not None else None, cfg, packs=packs,
-                   sha256=str(detail.get("sha256", "")), state=state, evidence_kept=raw is not None)
+                   sha256=str(detail.get("sha256", "")), state=state, evidence_kept=raw is not None,
+                   threshold=_recorded_threshold(detail))
 
 
 def evidence_detail(verdict: Verdict, cfg: config.Config) -> dict:
@@ -257,7 +316,9 @@ def evidence_detail(verdict: Verdict, cfg: config.Config) -> dict:
 
 def render_text(account: Explanation) -> str:
     """The console form; also what the Copy button puts on the clipboard."""
-    lines = [f"[{account.level.upper()}] {account.path}", f"  {account.meaning}"]
+    lines = [f"[{account.level.upper()}] {account.path}"]
+    if account.meaning:
+        lines.append(f"  {account.meaning}")
     if account.rows:
         heading = "  Evidence:" if account.evidence_kept else f"  Evidence ({NOT_KEPT}):"
         lines.append(heading)
@@ -269,10 +330,14 @@ def render_text(account: Explanation) -> str:
             lines.append(f"{'':24}{row.text}")
             for note in row.notes:
                 lines.append(f"{'':24}note: {note}")
-    elif account.evidence_kept:
+        if account.evidence_kept:
+            lines.append(f"  Counted: {account.tally.sentence()}.")
+    elif account.reasons:
+        # A skipped, unreadable or empty file: no findings, one sentence why.
+        lines.append("  Reasons:")
+        lines.extend(f"    {reason}" for reason in account.reasons)
+    else:
         lines.append("  Evidence: none recorded.")
-    if account.evidence_kept:
-        lines.append(f"  Counted: {account.tally.sentence()}.")
     if account.happened:
         lines.append(f"  {account.happened}")
     if account.sha256:
@@ -289,4 +354,6 @@ def as_dict(account: Explanation) -> dict:
 
 
 def as_json(account: Explanation) -> str:
-    return json.dumps(as_dict(account), ensure_ascii=False)
+    """One line, ASCII-safe: a console code page that cannot encode a path
+    must not lose the object (json.loads restores every character)."""
+    return json.dumps(as_dict(account))

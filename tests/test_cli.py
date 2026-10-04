@@ -230,6 +230,53 @@ class TestTheAccount(CliCase):
         self.assertTrue(bad["consistent"])
         self.assertIn("Examined", err.getvalue(), "the summary went beside the objects, not among them")
 
+    def test_json_lines_stay_whole_across_the_worker_threads(self):
+        """scan_tree reports from four threads; without one lock and one
+        write per line, 85 of 660 objects were unparsable here."""
+        import json
+        folder = self.tmp / "many"
+        folder.mkdir()
+        from avguard.scanner import SELFTEST_MARKER
+        for index in range(240):
+            (folder / f"c{index:03d}.txt").write_text(f"clean {index}", encoding="utf-8")
+        for index in range(40):
+            (folder / f"t{index:03d}.bin").write_bytes(SELFTEST_MARKER)
+        from avguard.__main__ import main
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = main(["--scan", str(folder), "--json"])
+        self.assertEqual(code, 1)
+        lines = out.getvalue().split("\n")
+        self.assertEqual(lines[-1], "", "ends with one newline")
+        objects = [json.loads(line) for line in lines[:-1]]
+        self.assertEqual(len(objects), 280, "one object per file, every one whole")
+        self.assertEqual(sum(o["level"] == "malicious" for o in objects), 40)
+
+    def test_json_and_explain_with_quarantine_say_what_the_command_did(self):
+        import json
+        target = self.marker_file()
+        (target.parent / "clean.txt").write_text("nothing here", encoding="utf-8")
+        from avguard.__main__ import main
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = main(["--scan", str(target.parent), "--json", "--quarantine"])
+        self.assertEqual(code, 1)
+        self.assertFalse(target.exists(), "moved")
+        lines = out.getvalue().split("\n")
+        self.assertNotIn("", lines[:-1], "no blank line among the objects")
+        objects = [json.loads(line) for line in lines[:-1]]
+        bad = next(o for o in objects if o["level"] == "malicious")
+        self.assertEqual((bad["state"], bad["happened"][:12]), ("quarantined", "Quarantined."))
+        self.assertIn("quarantined:", err.getvalue())
+
+        again = self.marker_file("second.bin")
+        code, output = self.run_cli("--scan", str(again), "--explain", "--quarantine")
+        self.assertEqual(code, 1, output)
+        self.assertIn("Quarantined. Restore puts it back", output)
+        self.assertNotIn("Nothing was moved.", output)
+        self.assertLess(output.index("quarantined:"), output.index("Quarantined. Restore"),
+                        "the account follows the move it describes")
+
     def test_explain_quarantine_reads_the_record_and_its_evidence_without_the_lock(self):
         target = self.marker_file()
         code, output = self.run_cli("--scan", str(target), "--quarantine")

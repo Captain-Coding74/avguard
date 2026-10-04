@@ -10,6 +10,7 @@ import argparse
 import os
 import logging
 import sys
+import threading
 from pathlib import Path
 
 from . import fim, iocs, shellext, tlsh
@@ -19,7 +20,7 @@ from .instance import InstanceLock
 from .protection import SelfProtection
 from . import rulepacks
 from .quarantine import QuarantineError, QuarantineStore, RestoreIncomplete
-from .scanner import Level, Scanner, findings_to_dicts
+from .scanner import Level, Scanner
 
 
 def _console_scan(target: Path, quarantine_threats: bool, verbose: bool,
@@ -35,10 +36,16 @@ def _console_scan(target: Path, quarantine_threats: bool, verbose: bool,
     # Under --json stdout carries one object per file and nothing else, so
     # everything said to a person goes beside it; the exit code is unchanged.
     console = sys.stderr if as_json else sys.stdout
+    # scan_tree reports from its worker threads. One lock and one write per
+    # line, or two objects land on one line and the next line is empty:
+    # measured at 85 of 660 objects unparsable without it.
+    emit_lock = threading.Lock()
 
-    def say(text: str = "") -> None:
-        transcript.append(text)
-        print(text, file=console)
+    def say(text: str = "", keep: bool = True) -> None:
+        with emit_lock:
+            if keep:
+                transcript.append(text)
+            console.write(text + "\n")
 
     cfg = config.Config.load()
     protection = SelfProtection()
@@ -54,27 +61,40 @@ def _console_scan(target: Path, quarantine_threats: bool, verbose: bool,
     threats = []
     from . import explain as explain_module
 
-    def account_of(verdict):
-        return explain_module.from_verdict(verdict, cfg, scanner.packs)
+    def account(verdict, quarantined: bool = False) -> None:
+        """The account of one verdict, in the form asked for."""
+        made = explain_module.from_verdict(verdict, cfg, scanner.packs, quarantined=quarantined)
+        if as_json:
+            # One object per file examined, on stdout and nothing else there,
+            # so the output is JSON lines whatever the folder holds.
+            line = explain_module.as_json(made)
+            with emit_lock:
+                try:
+                    sys.stdout.write(line + "\n")
+                except OSError as exc:              # a closed pipe; never silently
+                    print(f"could not write the object for {verdict.path}: {exc}", file=sys.stderr)
+        else:
+            say(explain_module.render_text(made))
 
     def report(verdict) -> None:
         counts[verdict.level] += 1
         if verdict.level is Level.MALICIOUS:
             threats.append(verdict)
-        if as_json:
-            # One object per file examined, on stdout and nothing else there,
-            # so the output is JSON lines whatever the folder holds.
-            print(explain_module.as_json(account_of(verdict)))
-            return
-        if verdict.level in (Level.MALICIOUS, Level.SUSPICIOUS):
-            if explain_each:
-                say(explain_module.render_text(account_of(verdict)))
-                return
+            if quarantine_threats and (as_json or explain_each):
+                return      # its account says what happened to it: after the quarantine step
+        if as_json or (explain_each and verdict.level in (Level.MALICIOUS, Level.SUSPICIOUS)):
+            account(verdict)
+        elif verdict.level in (Level.MALICIOUS, Level.SUSPICIOUS):
             say(f"[{verdict.level.value.upper()}] {verdict.path}")
             for reason in verdict.reasons:
                 say(f"    {reason}")
         elif verbose:
-            print(f"[{verdict.level.value}] {verdict.path}")
+            say(f"[{verdict.level.value}] {verdict.path}", keep=False)
+
+    def accounts_of_threats(moved: dict) -> None:
+        if as_json or explain_each:
+            for verdict in threats:
+                account(verdict, quarantined=moved.get(verdict.path, False))
 
     scanner.scan_tree(target, on_verdict=report)
     cloud.save_cache()
@@ -101,18 +121,23 @@ def _console_scan(target: Path, quarantine_threats: bool, verbose: bool,
                 "and run this again.",
                 file=sys.stderr,
             )
+            accounts_of_threats({})
             return 2
+        moved: dict = {}
         try:
-            print()
+            say()
             for verdict in threats:
                 try:
                     store.quarantine(verdict.path, verdict.reasons,
-                                     findings=findings_to_dicts(verdict.findings))
-                    print(f"quarantined: {verdict.path}", file=console)
+                                     evidence=explain_module.evidence_detail(verdict, cfg))
+                    moved[verdict.path] = True
+                    say(f"quarantined: {verdict.path}")
                 except QuarantineError as exc:
+                    moved[verdict.path] = False
                     print(f"could not quarantine {verdict.path}: {exc}", file=sys.stderr)
         finally:
             lock.release()
+        accounts_of_threats(moved)
     elif threats:
         say("\nNothing was moved. Pass --quarantine to act on these findings.")
 

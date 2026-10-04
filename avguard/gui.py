@@ -129,6 +129,11 @@ class AVGuardApp(tb.Window):
 
         self._shutting_down = False
         self._scan_thread: threading.Thread | None = None
+        # True from _start_scan to _scan_finished, on the GUI thread. The
+        # thread's is_alive() is the wrong gate: the worker posts its last
+        # verdicts and _scan_finished together and exits before the pump
+        # drains them, so every small scan looked finished to its own verdicts.
+        self._scan_active = False
         self._cancel = threading.Event()
         self._threats_this_scan = 0
 
@@ -576,7 +581,7 @@ class AVGuardApp(tb.Window):
         was reported and not moved, with the account and the way out behind
         it. During a full scan the summary line stays and History carries
         each one, so a folder of unusual files does not churn the banner."""
-        if self._scan_thread is not None and self._scan_thread.is_alive():
+        if self._scan_active:
             return
         self._banner(f"Unusual file reported, not moved: {verdict.path.name}", "inverse-warning")
         self._offer_account(explain.from_verdict(verdict, self.cfg, self.scanner.packs))
@@ -586,32 +591,38 @@ class AVGuardApp(tb.Window):
         """Runs on the GUI thread."""
         self._threats_this_scan += 1
         # The evidence rides inside `detail` (the event's seven fields are
-        # schema 1 and stay so), so History can account for the verdict later.
+        # schema 1 and stay so), so History can account for the verdict later;
+        # `state` says what happened, so the detection row of a file that was
+        # then quarantined does not read "nothing was moved".
         detail = explain.evidence_detail(verdict, self.cfg)
+        record = None
+        failure = ""
+        if self.cfg.auto_quarantine:
+            try:
+                record = self.quarantine.quarantine(verdict.path, verdict.reasons, evidence=detail)
+            except QuarantineError as exc:
+                log.error("could not quarantine %s: %s", verdict.path, exc)
+                failure = str(exc)
+        state = explain.QUARANTINED if record is not None else explain.REPORTED
         self.events.record(Event(
             kind="detection", path=str(verdict.path), level=verdict.level.value,
-            score=verdict.score, reasons=list(verdict.reasons), detail=detail))
+            score=verdict.score, reasons=list(verdict.reasons), detail={**detail, "state": state}))
 
-        if not self.cfg.auto_quarantine:
-            self._banner(f"Threat found in {verdict.path.name} (not quarantined - "
-                         f"automatic quarantine is off)", "inverse-danger")
+        if record is None:
+            if failure:
+                self._banner(f"Could not quarantine {verdict.path.name}: {failure}", "inverse-danger")
+            else:
+                self._banner(f"Threat found in {verdict.path.name} (not quarantined - "
+                             f"automatic quarantine is off)", "inverse-danger")
             # The account and the way out, for a reported threat as much as
             # for a quarantined one; before this only a quarantine offered them.
             self._offer_account(explain.from_verdict(verdict, self.cfg, self.scanner.packs))
             self._offer_exclusion(verdict.path.parent)
             return
 
-        try:
-            record = self.quarantine.quarantine(verdict.path, verdict.reasons,
-                                                findings=detail["findings"])
-        except QuarantineError as exc:
-            log.error("could not quarantine %s: %s", verdict.path, exc)
-            self._banner(f"Could not quarantine {verdict.path.name}: {exc}", "inverse-danger")
-            return
-
         self.events.record(Event(
             kind="quarantined", path=str(verdict.path), level=verdict.level.value,
-            score=verdict.score, reasons=list(verdict.reasons), detail=detail))
+            score=verdict.score, reasons=list(verdict.reasons), detail={**detail, "state": state}))
         self.cache.invalidate(verdict.path)
         self._refresh_quarantine()
         self._banner(f"Quarantined {verdict.path.name} - {'; '.join(verdict.reasons)}",
@@ -652,6 +663,7 @@ class AVGuardApp(tb.Window):
             return
         self._cancel.clear()
         self._threats_this_scan = 0
+        self._scan_active = True
         self._set_scanning(True)
         self.status_var.set(f"Scanning {target}")
         self.progress.config(value=0, maximum=100)
@@ -693,6 +705,7 @@ class AVGuardApp(tb.Window):
             self.post(self._scan_finished, 0, True)
 
     def _scan_finished(self, scanned: int, cancelled: bool) -> None:
+        self._scan_active = False
         self.events.record(Event(
             kind="scan_finished",
             detail={"files": scanned, "threats": self._threats_this_scan,

@@ -141,9 +141,11 @@ class QuarantineStore:
         never completed: drop our copy and leave the user's file alone. If it
         is gone, the move did complete and only the flag was never cleared.
         """
+        changed = False
         for entry_id, record in list(self._records.items()):
             if not record.pending:
                 continue
+            changed = True
             try:
                 original_still_there = Path(record.original_path).exists()
             except OSError:
@@ -157,6 +159,8 @@ class QuarantineStore:
             else:
                 log.info("completing an interrupted quarantine of %s", record.original_name)
                 record.pending = False
+        if not changed:
+            return          # a settled index is read, not rewritten: --list-quarantine holds no lock
         try:
             self._save()
         except QuarantineError as exc:
@@ -241,26 +245,38 @@ class QuarantineStore:
             return {}
         return raw if isinstance(raw, dict) else {}
 
-    def _keep_evidence(self, entry_id: str, findings: list[dict] | None) -> None:
+    def _keep_evidence(self, entry_id: str, evidence) -> None:
         """Best effort and never raises: the account of a verdict is worth
         keeping, the file it belongs to is worth more, and by the time this
         runs the file is safely in the store."""
-        if findings is None:
+        if evidence is None:
             return
         try:
-            evidence = self._read_evidence()
-            evidence[entry_id] = list(findings)
+            kept = self._read_evidence()
+            kept[entry_id] = evidence
             # Rows for entries that no longer exist go with them.
-            evidence = {k: v for k, v in evidence.items() if k in self._records}
-            config.atomic_write_text(self.evidence_path, json.dumps(evidence))
+            kept = {k: v for k, v in kept.items() if k in self._records}
+            config.atomic_write_text(self.evidence_path, json.dumps(kept))
         except (OSError, TypeError, ValueError) as exc:
             log.warning("could not keep the evidence for %s: %s", entry_id, exc)
 
-    def evidence(self, entry_id: str) -> list | None:
-        """The stored findings behind a held file, or None when none were
-        kept (a record from before evidence was kept, or a failed write)."""
+    def _forget_evidence(self, entry_id: str) -> None:
+        """A restored or deleted file takes its evidence row with it."""
+        kept = self._read_evidence()
+        if entry_id not in kept:
+            return
+        del kept[entry_id]
+        try:
+            config.atomic_write_text(self.evidence_path, json.dumps(kept))
+        except OSError as exc:
+            log.warning("could not drop the evidence for %s: %s", entry_id, exc)
+
+    def evidence(self, entry_id: str):
+        """What was kept behind a held file (the dict evidence_detail()
+        produced, or a bare list of findings), or None when nothing was: a
+        record from before evidence was kept, or a failed write."""
         found = self._read_evidence().get(entry_id)
-        return found if isinstance(found, list) else None
+        return found if isinstance(found, (dict, list)) else None
 
     def get(self, entry_id: str) -> QuarantineRecord | None:
         with self._lock:
@@ -273,14 +289,15 @@ class QuarantineStore:
     # ---------------------------------------------------------- quarantine
 
     def quarantine(self, path: Path | str, reasons: list[str] | None = None,
-                   findings: list[dict] | None = None) -> QuarantineRecord:
+                   evidence: dict | None = None) -> QuarantineRecord:
         """Move `path` into the store, masked, and record how to undo it.
 
-        `findings` is the evidence behind the verdict in its stored form
-        (scanner.findings_to_dicts); it is kept in a sidecar beside the index,
-        never on the record, because an older AVGuard reading an index row
-        with a field it does not know drops that row (see _reload_and_merge)
-        and would then save the index without it.
+        `evidence` is what explain.evidence_detail() produced for the verdict
+        (its findings, the threshold it was decided with, its digest); it is
+        kept in a sidecar beside the index, never on the record, because an
+        older AVGuard reading an index row with a field it does not know
+        drops that row (see _reload_and_merge) and would then save the index
+        without it.
         """
         source = Path(path).resolve()
 
@@ -354,7 +371,7 @@ class QuarantineStore:
                             source.name, exc)
 
         log.warning("quarantined %s (%s)", source, "; ".join(record.reasons) or "no reason given")
-        self._keep_evidence(entry_id, findings)
+        self._keep_evidence(entry_id, evidence)
         return record
 
     # ------------------------------------------------------------- restore
@@ -433,6 +450,7 @@ class QuarantineStore:
             del self._records[entry_id]
             self._deleted.add(entry_id)
             self._save()
+            self._forget_evidence(entry_id)
 
         # Remember the decision, or the next scan takes it straight back.
         try:
@@ -460,6 +478,7 @@ class QuarantineStore:
             del self._records[entry_id]
             self._deleted.add(entry_id)
             self._save()
+            self._forget_evidence(entry_id)
         log.info("deleted quarantined file %s", record.original_name)
         return record.original_name
 

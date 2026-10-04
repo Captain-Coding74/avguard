@@ -186,8 +186,10 @@ class Config:
 
     # Where scan events are POSTed as JSON (Network Watchdog's server, for
     # instance). Empty means off. Setting it is a consent action: the file
-    # path, the verdict, the rule names and the file's SHA-256 leave the
-    # machine for every event.
+    # path, the verdict, the file's SHA-256 and the evidence behind the
+    # verdict (findings with their weights, severities, packs and notes, the
+    # totals, the threshold) leave the machine for every event; paste-guard
+    # events never do.
     event_forward_url: str = ""
 
     @classmethod

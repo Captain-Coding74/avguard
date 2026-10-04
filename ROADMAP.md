@@ -894,6 +894,81 @@ desktop: the one-time cache drop on a real Downloads folder, the dialog at
 the main window's minimum size with a long path, and whether the "Why?"
 button is found.
 
+**The account, second reading, 2026-10-04.** The same four-lens
+adversarial read the paste guard had (the scanner and stores, the account
+module, the window, privacy and the tests), with every finding reproduced
+here before anything changed. What was wrong, in order of weight.
+
+The console. `--json` reported from the scanner's four worker threads with
+`print()`, two writes per line, so objects merged and lines went missing:
+85 of 660 objects unparsable on a 660-file folder here. One lock and one
+write per line now, for `--explain` too. With `--quarantine`, `--explain`
+and `--json` printed "Nothing was moved." for a file the same command then
+moved; the account of a MALICIOUS file now waits for the quarantine step
+and says what happened, "Quarantined." on success and "Nothing was moved."
+when the lock was refused or the store raised. A blank line still reached
+stdout under `--json --quarantine`. `as_json` wrote raw characters, so a
+Windows console code page that cannot encode a path would have lost that
+object; it is ASCII-safe now and `json.loads` restores every character.
+
+The window and History. Every History row opened an account, so a scan
+summary or a restore read "[CLEAN] Nothing found."; only detection,
+suspicious and quarantined rows open one now, a double-click opens the row
+under the pointer rather than whatever was selected before, and an event
+with no level has no meaning invented for it. The detection row of a file
+that was then quarantined read "Nothing was moved."; the window records
+what happened in the event (`detail.state`), and an older detection event
+with no state reads "Detected", a sentence that claims nothing about a
+move. `_report_suspicious` gated on the worker thread being alive, which
+every small scan had already outlived when its own verdicts were pumped,
+so the banner it was meant to suppress during a scan was shown and then
+torn down by "Scan complete"; the gate is a flag the window owns between
+`_start_scan` and `_scan_finished`. A detection whose quarantine failed got
+neither "Why?" nor "Never scan". The dialog, shrunk to the minimum it
+allowed, lost its button row and clipped its note: the buttons and the note
+are packed first from the bottom so the text absorbs the shrink, Close is
+packed before the actions so it keeps its place, and the minimum width is
+the one at which the five buttons fit, 660, checked on a mapped root under
+Xvfb at 780x500 and 660x360.
+
+The account and the stores. A History account recomputed the tally with
+today's threshold, so after a change to `quarantine_threshold` the level
+line and the counted line contradicted each other; the threshold the
+verdict was decided with travels with the evidence (events already carried
+it; the quarantine sidecar now holds the whole `evidence_detail`, not a
+bare list) and is the one shown. A CLEAN verdict with findings under the
+reporting line, or kept by the user's decision, said "Nothing found."; it
+says which it was. A skipped or unreadable file's one sentence of reason
+was dropped from `--json`; the account carries the reasons. `Tally.level()`
+disagreed with `decide()` at a threshold of 0 or 100.5 and with no
+findings; it carries the finding count and the threshold as given, and a
+test runs every fixture at four thresholds. `findings=None` was rendered
+as evidence kept. A rule author's note is relayed verbatim, so a pack rule
+could put "95% confidence" in the account; such a note is replaced by one
+line saying it was left out and why. A shipped rule's note carried a
+hex-escaped apostrophe ("somebody E2 80 99 s writing"). `finding_from_dict`
+raised `OverflowError` on a weight of Infinity, a JSON token, in the
+verdict path. Restore and delete left the evidence row in the sidecar;
+they take it with them. The store's constructor rewrote a settled index on
+every start, so `--list-quarantine` and `--explain-quarantine` were not the
+read-only commands their comments claimed; `_reconcile` saves only when it
+changed something. Three forwarding sentences (the Settings label, the
+README, the module and config comments) still said "the rule names and the
+SHA-256" when the evidence had started to leave; all four now say what
+does. Three assertions that could not fail (a schema compared with the
+constant that wrote it, a digest compared with its own copy, a time bound
+eighty times the measurement) are now ones that can.
+
+Tests 624 -> 640, among them: 280 objects whole across the worker threads;
+`--json --quarantine` with no blank line and state "quarantined"; the
+threshold from the evidence; "detected" against "quarantined" from
+`detail.state`; nothing opened for a summary row or a click off the rows;
+an automatic quarantine driven through the window with the sidecar read
+back and the "Why?" account carrying the entry id; a settled index's mtime
+unchanged by a second constructor; a rule note reaching the finding from a
+scan; a confidence note left out; ASCII-safe JSON; every fixture against
+four thresholds. Green on 3.13 (GUI hidden) and 3.12 with a display.
+
 ## Deliberately not doing
 
 The paste guard (above) is the one input that is not a file; it watches a user-mode clipboard buffer through documented calls, with no driver, no hook and no process telemetry, so it does not reopen the first decision here. The EDR-shaped extensions of it are refused by name: no keyboard hook to see Win+R, no automation of the Run dialog, no watching what the user then runs.

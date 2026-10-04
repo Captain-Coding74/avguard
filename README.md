@@ -532,7 +532,9 @@ Off by default. With a URL set in Settings, every recorded event — a
 detection, a quarantine, a restore, an integrity change — is POSTed to it as
 JSON, for a Network Watchdog server on your own network. Setting the URL
 asks first, and says what leaves the machine: the file path, the verdict,
-the rule names and the file's SHA-256. The paste guard's events are the
+the file's SHA-256 and the evidence behind the verdict (each finding's
+source, weight, severity and pack, a rule author's note, the counted totals
+and your quarantine threshold). The paste guard's events are the
 exception: they are written to History and never forwarded, so its "sends
 nothing" holds whatever address is set here. A dead or slow endpoint never
 slows a scan: events go onto a bounded queue and a background thread posts

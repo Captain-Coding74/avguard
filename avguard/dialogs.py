@@ -14,10 +14,11 @@ from tkinter import filedialog
 
 import tkinter as tk
 import ttkbootstrap as tb
-from ttkbootstrap.constants import BOTH, END, LEFT, RIGHT, VERTICAL, X, Y
+from ttkbootstrap.constants import BOTH, BOTTOM, END, LEFT, RIGHT, VERTICAL, X, Y
 from ttkbootstrap.dialogs import Messagebox
 
-from . import allowlist as allowlist_module, config, iocs as iocs_module, rulepacks, scheduling, shellext
+from . import allowlist as allowlist_module, config, explain as explain_module, iocs as iocs_module, \
+    rulepacks, scheduling, shellext
 
 log = logging.getLogger("avguard.dialogs")
 
@@ -178,9 +179,12 @@ class SettingsDialog(tb.Toplevel):
         tb.Entry(forward, textvariable=self.forward_var).pack(fill=X)
         tb.Label(forward, bootstyle="secondary", wraplength=520, justify="left",
                  text=("Empty means off. With a URL set, every scan event is POSTed to "
-                       "it as JSON: the file path, the verdict, the rule names and the "
-                       "file's SHA-256. Meant for a Network Watchdog server on your "
-                       "own network. A dead or slow endpoint never slows a scan.")
+                       "it as JSON: the file path, the verdict, the file's SHA-256 and the "
+                       "evidence behind the verdict (each finding's source, weight, severity "
+                       "and pack, a rule author's note, the counted totals and your "
+                       "quarantine threshold). Paste-guard warnings never leave. Meant for "
+                       "a Network Watchdog server on your own network. A dead or slow "
+                       "endpoint never slows a scan.")
                  ).pack(anchor="w", pady=(6, 0))
 
         # --- rule packs ------------------------------------------------------
@@ -455,9 +459,10 @@ class SettingsDialog(tb.Toplevel):
         return Messagebox.yesno(
             f"Send scan events to {url}?" + CHR_NL + CHR_NL
             + "Every event carries the file's path, the verdict, the rule names and "
-              "the SHA-256 hash of the file, and the evidence behind the verdict (rule "
-              "names, weights and the pack they came from). The paste guard's warnings stay "
-              "on this machine and are never sent. Nothing is sent while the address is empty.",
+              "the SHA-256 hash of the file, and the evidence behind the verdict: each "
+              "finding's source, weight, severity and pack, a rule author's note, the counted "
+              "totals and your quarantine threshold. The paste guard's warnings stay on this "
+              "machine and are never sent. Nothing is sent while the address is empty.",
             "Forward events?", parent=self) == "Yes"
 
     def _apply_scheduling(self) -> list[str]:
@@ -556,7 +561,8 @@ class HistoryDialog(tb.Toplevel):
             iid = self.tree.insert("", END, values=(
                 event.when, event.kind, event.level or "-",
                 event.path or "; ".join(event.reasons)[:120]))
-            self._events[iid] = event
+            if explain_module.is_verdict_event(event):
+                self._events[iid] = event           # only a verdict has an account
         if on_open is not None:
             self.tree.bind("<Double-1>", self._open_selected)
 
@@ -565,15 +571,21 @@ class HistoryDialog(tb.Toplevel):
         tb.Label(actions, bootstyle="secondary", wraplength=560, justify="left",
                  text=("This history and the scan cache both record file paths "
                        "from this machine. Clearing removes them."
-                       + (" Double-click an event for its account." if on_open else ""))
+                       + (" Double-click a detection for its account." if on_open else ""))
                  ).pack(side=LEFT, fill=X, expand=True)
         tb.Button(actions, text="Clear history", bootstyle="danger-outline",
                   command=self._clear).pack(side=RIGHT)
 
-    def _open_selected(self, _event=None) -> None:
-        selection = self.tree.selection()
-        if selection and selection[0] in self._events and self._on_open is not None:
-            self._on_open(self._events[selection[0]])
+    def _open_selected(self, event=None) -> None:
+        """The row under the pointer, not whatever was selected before: a
+        double-click on a heading or on empty space opens nothing."""
+        if event is not None:
+            iid = self.tree.identify_row(event.y)
+        else:
+            selection = self.tree.selection()
+            iid = selection[0] if selection else ""
+        if iid in self._events and self._on_open is not None:
+            self._on_open(self._events[iid])
 
     def _clear(self) -> None:
         if Messagebox.yesno("Delete the recorded history from this machine?",
@@ -594,22 +606,32 @@ class ExplanationDialog(tb.Toplevel):
 
     def __init__(self, parent, account, actions: dict | None = None) -> None:
         super().__init__(title="Why?", transient=parent)
-        from . import explain as explain_module
         self.geometry("780x500")
-        self.minsize(560, 360)
+        # The narrowest window at which the five buttons still fit in one row.
+        self.minsize(660, 360)
         self._text = explain_module.render_text(account)
         name = account.path.replace("\\", "/").rsplit("/", 1)[-1] or account.path
+        # Wrapped for the narrowest window this dialog allows, not the one it opens at.
+        wrap = 660 - 2 * 14
 
         body = tb.Frame(self, padding=14)
         body.pack(fill=BOTH, expand=True)
         tb.Label(body, text=f"{account.level.upper()}: {name}",
                  font=("Segoe UI", 14, "bold")).pack(anchor="w")
-        tb.Label(body, bootstyle="secondary", wraplength=720, justify="left",
+        tb.Label(body, bootstyle="secondary", wraplength=wrap, justify="left",
                  text=account.meaning).pack(anchor="w", pady=(2, 8))
 
+        # The buttons and the note are packed first, from the bottom, so a
+        # window shrunk to its minimum takes the room from the text, never
+        # from the buttons: the Integrity tab's lesson.
+        row = tb.Frame(body)
+        row.pack(side=BOTTOM, fill=X)
+        tb.Label(body, bootstyle="secondary", wraplength=wrap, justify="left",
+                 text="Copying puts this account, with the file's path and its SHA-256, on your "
+                      "clipboard; nothing is sent anywhere.").pack(side=BOTTOM, anchor="w", pady=(8, 4))
         frame = tb.Frame(body)
         frame.pack(fill=BOTH, expand=True)
-        box = tk.Text(frame, wrap="word", height=14, font=("Consolas", 10), relief="flat")
+        box = tk.Text(frame, wrap="word", height=8, font=("Consolas", 10), relief="flat")
         scroll = tb.Scrollbar(frame, orient=VERTICAL, command=box.yview)
         box.configure(yscrollcommand=scroll.set)
         box.insert("1.0", self._text)
@@ -617,11 +639,9 @@ class ExplanationDialog(tb.Toplevel):
         scroll.pack(side=RIGHT, fill=Y)
         box.pack(fill=BOTH, expand=True)
 
-        tb.Label(body, bootstyle="secondary", wraplength=720, justify="left",
-                 text="Copying puts this account, with the file's path and its SHA-256, on your "
-                      "clipboard; nothing is sent anywhere.").pack(anchor="w", pady=(8, 4))
-        row = tb.Frame(body)
-        row.pack(fill=X)
+        # Close is packed first so it keeps its place at the right whatever
+        # the width; the actions fill in from the left.
+        tb.Button(row, text="Close", bootstyle="secondary", command=self.destroy).pack(side=RIGHT)
         for label, kind in account.actions:
             if kind == "copy":
                 tb.Button(row, text=label, bootstyle="secondary-outline",
@@ -630,7 +650,6 @@ class ExplanationDialog(tb.Toplevel):
                 tb.Button(row, text=label, bootstyle="info-outline",
                           command=lambda fn=actions[kind]: (self.destroy(), fn())
                           ).pack(side=LEFT, padx=(0, 6))
-        tb.Button(row, text="Close", bootstyle="secondary", command=self.destroy).pack(side=RIGHT)
 
     def _copy(self) -> None:
         """A user click on the GUI thread: Tk's own clipboard write."""

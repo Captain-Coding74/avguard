@@ -31,6 +31,7 @@ if _os.environ["AVGUARD_DATA"] == _test_data:
     _atexit.register(lambda: _shutil.rmtree(_test_data, ignore_errors=True))
 
 from avguard import config, explain
+from avguard.allowlist import Allowlist
 from avguard.events import Event, EventStore
 from avguard.protection import SelfProtection
 from avguard.quarantine import QuarantineStore
@@ -82,8 +83,16 @@ class ScannerCase(unittest.TestCase):
         self.bad = self.tmp / "drop" / "threat.bin"
         self.bad.parent.mkdir()
         self.bad.write_bytes(SELFTEST_MARKER)
+        # Everything this scanner remembers lives under tmp: a restore in one
+        # test must not make the next test's scan CLEAN by exception.
+        self.allowlist = Allowlist(self.tmp / "allow.sqlite")
         self.scanner = Scanner(CFG, SelfProtection(), cache=ScanCache(self.tmp / "cache.json",
-                                                                       generation="test"))
+                                                                       generation="test"),
+                               allowlist=self.allowlist)
+
+    def store(self) -> QuarantineStore:
+        return QuarantineStore(self.tmp / "q", self.tmp / "q" / "index.json", protection=SelfProtection(),
+                               allowlist=self.allowlist)
 
 
 # ------------------------------------------------------------- the replay
@@ -111,10 +120,21 @@ class TestAReplayKnowsAsMuchAsTheFirstScan(ScannerCase):
         self.assertEqual(len(cache), 0)
         self.assertTrue(any("starting fresh" in r.getMessage() for r in logged.records))
 
+    def test_a_rule_note_reaches_the_finding_from_the_scanner(self):
+        import shutil
+        noted = Path("tests/rules/must_match/Ransomware_Note_And_Extensions__note.txt")
+        target = self.tmp / "drop" / noted.name
+        shutil.copy(noted, target)
+        verdict = self.scanner.scan(target)
+        rule = next(f for f in verdict.findings if f.source == "yara")
+        self.assertEqual((rule.severity, rule.pack), ("medium", ""))
+        self.assertTrue(any("somebody's writing" in n for n in rule.notes), rule.notes)
+
     def test_stored_findings_round_trip_and_a_malformed_one_is_a_line_not_a_crash(self):
         for name, findings in FIXTURES.items():
             with self.subTest(fixture=name):
                 self.assertEqual(findings_from_dicts(findings_to_dicts(findings)), findings)
+        self.assertEqual(finding_from_dict({"weight": float("inf")}).source, "stored", "Infinity is a JSON token")
         for junk in ({"weight": "heavy"}, "junk", None, {"notes": "not-a-list", "weight": 5}):
             with self.subTest(junk=junk):
                 self.assertIsInstance(finding_from_dict(junk), Finding)
@@ -133,7 +153,7 @@ class TestAReplayKnowsAsMuchAsTheFirstScan(ScannerCase):
         without = len(json.dumps({k: v for k, v in entry.items() if k != "findings"}))
         print(f"\n  cache entry with one finding: {with_findings} bytes ({with_findings - without} for the "
               f"finding); a clean entry adds {len(json.dumps({'findings': []})) - 2} bytes")
-        self.assertEqual(raw["schema"], ScanCache.SCHEMA)
+        self.assertEqual(raw["schema"], 4, "the schema the README and ROADMAP promise")
 
 
 # -------------------------------------------------------- facts, opinions
@@ -279,6 +299,70 @@ class TestFactsAndOpinions(unittest.TestCase):
         self.assertEqual((old.state, old.evidence_kept, old.rows[0].text),
                          (explain.QUARANTINED, False, "old reason"))
 
+    def test_tally_level_matches_decide_at_odd_thresholds(self):
+        for threshold in (0, -5, 100.5, 150):
+            for name, findings in FIXTURES.items():
+                with self.subTest(threshold=threshold, fixture=name):
+                    self.assertEqual(explain.tally_of(findings, threshold).level(),
+                                     decide(findings, threshold))
+
+    def test_findings_none_means_evidence_not_kept(self):
+        account = explain.explain("x", "malicious", ["r1"], None, CFG)
+        self.assertFalse(account.evidence_kept)
+        self.assertEqual([r.kind for r in account.rows], [explain.RECORDED])
+        self.assertNotIn("Counted:", explain.render_text(account))
+
+    def test_a_clean_verdict_with_findings_says_so_and_a_kept_one_says_kept(self):
+        below = account_for(ENTROPY, state=explain.OTHER)
+        self.assertEqual((below.level, below.meaning), ("clean", explain.CLEAN_BELOW_THE_LINE))
+        kept = account_for(ALLOW, state=explain.KEPT)
+        self.assertEqual(kept.meaning, explain.CLEAN_KEPT)
+        self.assertEqual(account_for([], state=explain.OTHER).meaning, "Nothing found.")
+
+    def test_a_skipped_or_errored_file_keeps_its_reason(self):
+        account = explain.explain("C:/big.iso", "skipped", ["larger than the size cap (3000 MB)"], [], CFG)
+        text = explain.render_text(account)
+        self.assertIn("Reasons:", text)
+        self.assertIn("larger than the size cap", text)
+        self.assertNotIn("Counted:", text)
+        self.assertEqual(json.loads(explain.as_json(account))["reasons"], ["larger than the size cap (3000 MB)"])
+
+    def test_a_detection_event_says_what_happened_or_nothing_about_a_move(self):
+        detail = {"findings": findings_to_dicts(SIGNATURE), "threshold": 100, "sha256": "a" * 64}
+        old = explain.from_event(Event(kind="detection", path="C:/x", level="malicious", score=100,
+                                       reasons=["r"], detail=detail), CFG)
+        self.assertEqual(old.state, explain.DETECTED)
+        self.assertNotIn("Nothing was moved", old.happened)
+        moved = explain.from_event(Event(kind="detection", path="C:/x", level="malicious", score=100,
+                                         reasons=["r"], detail={**detail, "state": "quarantined"}), CFG)
+        self.assertEqual(moved.state, explain.QUARANTINED)
+        reported = explain.from_event(Event(kind="detection", path="C:/x", level="malicious", score=100,
+                                            reasons=["r"], detail={**detail, "state": "reported"}), CFG)
+        self.assertIn("Nothing was moved", reported.happened)
+
+    def test_an_event_without_a_verdict_is_not_called_clean(self):
+        summary = Event(kind="scan_finished", detail={"files": 120, "threats": 3})
+        self.assertFalse(explain.is_verdict_event(summary))
+        account = explain.from_event(summary, CFG)
+        self.assertEqual((account.level, account.meaning), ("", ""))
+        self.assertNotIn("CLEAN", explain.render_text(account))
+        for kind in ("detection", "quarantined", "suspicious"):
+            self.assertTrue(explain.is_verdict_event(Event(kind=kind, path="x", level="malicious")))
+
+    def test_a_note_that_states_a_confidence_figure_is_left_out(self):
+        loud = [Finding("yara", "R", 50, "d (rule R, medium)", severity="medium", pack="p",
+                        notes=("95% confidence this is malware", "see https://example.test"))]
+        text = explain.render_text(account_for(loud))
+        self.assertNotIn("95%", text)
+        self.assertIn(explain.NOTE_LEFT_OUT, text)
+        self.assertIn("note: see https://example.test", text)
+
+    def test_as_json_is_ascii_safe(self):
+        account = explain.explain("C:/drop/clean-\u4e2d.txt", "clean", [], [], CFG)
+        line = explain.as_json(account)
+        self.assertTrue(line.isascii(), "a console code page that cannot encode a path must not lose the object")
+        self.assertEqual(json.loads(line)["path"], "C:/drop/clean-\u4e2d.txt")
+
     def test_as_dict_is_json_and_as_json_round_trips(self):
         account = account_for(CYGWIN)
         data = json.loads(explain.as_json(account))
@@ -299,7 +383,7 @@ class TestFactsAndOpinions(unittest.TestCase):
         text = explain.render_text(account)
         print(f"\n  explain()+render_text(): {per:.0f} us; worst account {len(text)} chars, "
               f"{len(text.splitlines())} lines")
-        self.assertLess(per, 2000)
+        self.assertLess(per, 500, "25 us measured; a bound that something plausible can cross")
 
 
 # -------------------------------------------------------- never changes
@@ -324,26 +408,68 @@ class TestExplainNeverChangesTheVerdict(ScannerCase):
 # ---------------------------------------------------- the evidence travels
 
 class TestTheEvidenceTravels(ScannerCase):
+    def evidence(self, threshold=100):
+        return {"findings": findings_to_dicts(SIGNATURE), "hard": 100, "soft_capped": 0,
+                "threshold": threshold, "sha256": "ab" * 32}
+
     def test_the_quarantine_store_keeps_evidence_beside_the_index_not_on_the_record(self):
-        store = QuarantineStore(self.tmp / "q", self.tmp / "q" / "index.json", protection=SelfProtection())
-        record = store.quarantine(self.bad, ["r"], findings=findings_to_dicts(SIGNATURE))
+        store = self.store()
+        record = store.quarantine(self.bad, ["r"], evidence=self.evidence())
         index = json.loads((self.tmp / "q" / "index.json").read_text(encoding="utf-8"))
-        self.assertNotIn("findings", index[record.entry_id],
-                         "an older AVGuard drops a record with a field it does not know")
-        self.assertEqual(store.evidence(record.entry_id), findings_to_dicts(SIGNATURE))
+        self.assertEqual(set(index[record.entry_id]),
+                         {"entry_id", "original_path", "original_name", "quarantined_at", "size",
+                          "sha256", "nonce", "reasons", "pending"},
+                         "no new field: an older AVGuard drops a record with one it does not know")
+        self.assertEqual(store.evidence(record.entry_id), self.evidence())
         self.assertEqual(store.evidence_path.name, "index_evidence.json")
         self.assertIsNone(store.evidence("never-held"))
         account = explain.from_record(record, store.evidence(record.entry_id), CFG)
         self.assertTrue(account.evidence_kept)
+        self.assertEqual(account.rows[0].kind, explain.FACT)
+
+    def test_restore_and_delete_take_the_evidence_row_with_them(self):
+        store = self.store()
+        other = self.tmp / "drop" / "other.bin"
+        other.write_bytes(SELFTEST_MARKER)
+        first = store.quarantine(self.bad, ["r"], evidence=self.evidence())
+        second = store.quarantine(other, ["r"], evidence=self.evidence())
+        self.assertEqual(set(json.loads(store.evidence_path.read_text(encoding="utf-8"))),
+                         {first.entry_id, second.entry_id})
+        store.restore(first.entry_id)
+        store.delete(second.entry_id)
+        self.assertEqual(json.loads(store.evidence_path.read_text(encoding="utf-8")), {})
+        self.assertIsNone(store.evidence(first.entry_id))
+
+    def test_a_settled_index_is_read_not_rewritten(self):
+        """--list-quarantine and --explain-quarantine hold no lock, so their
+        constructor must not write; it used to save on every start."""
+        store = self.store()
+        store.quarantine(self.bad, ["r"], evidence=self.evidence())
+        index = self.tmp / "q" / "index.json"
+        before = index.stat().st_mtime_ns
+        time.sleep(0.01)
+        QuarantineStore(self.tmp / "q", index, protection=SelfProtection())
+        self.assertEqual(index.stat().st_mtime_ns, before)
+
+    def test_the_threshold_recorded_with_the_evidence_is_the_one_shown(self):
+        strict = config.Config(cloud_enabled=False, quarantine_threshold=150)
+        record = SimpleNamespace(original_path="C:/x", reasons=["r"], sha256="ab" * 32)
+        account = explain.from_record(record, self.evidence(threshold=150), CFG)
+        self.assertIn("150 in facts alone moves a file", account.tally.sentence())
+        event = Event(kind="quarantined", path="C:/x", level="malicious", score=100, reasons=["r"],
+                      detail=self.evidence(threshold=100))
+        account = explain.from_event(event, strict)
+        self.assertEqual(account.tally.threshold, 100, "the threshold it was decided with, not today's")
+        self.assertTrue(account.consistent)
 
     def test_a_record_held_without_evidence_reads_as_not_kept(self):
-        store = QuarantineStore(self.tmp / "q", self.tmp / "q" / "index.json", protection=SelfProtection())
+        store = self.store()
         record = store.quarantine(self.bad, ["r"])
         self.assertIsNone(store.evidence(record.entry_id))
         self.assertFalse(explain.from_record(record, store.evidence(record.entry_id), CFG).evidence_kept)
 
     def test_a_failed_evidence_write_keeps_the_file_and_says_so(self):
-        store = QuarantineStore(self.tmp / "q", self.tmp / "q" / "index.json", protection=SelfProtection())
+        store = self.store()
         real = config.atomic_write_text
 
         def flaky(path, text):
@@ -352,16 +478,16 @@ class TestTheEvidenceTravels(ScannerCase):
             return real(path, text)
         with mock.patch.object(config, "atomic_write_text", flaky), \
                 self.assertLogs("avguard.quarantine", level="WARNING") as logged:
-            record = store.quarantine(self.bad, ["r"], findings=findings_to_dicts(SIGNATURE))
+            record = store.quarantine(self.bad, ["r"], evidence=self.evidence())
         self.assertFalse(self.bad.exists(), "the file was taken")
         self.assertIsNotNone(store.get(record.entry_id))
         self.assertTrue(any("could not keep the evidence" in r.getMessage() for r in logged.records))
 
     def test_evidence_rows_for_gone_entries_are_pruned_on_the_next_keep(self):
-        store = QuarantineStore(self.tmp / "q", self.tmp / "q" / "index.json", protection=SelfProtection())
+        store = self.store()
         store.evidence_path.parent.mkdir(parents=True, exist_ok=True)
         store.evidence_path.write_text(json.dumps({"stale": [{"source": "x"}]}), encoding="utf-8")
-        record = store.quarantine(self.bad, ["r"], findings=[])
+        record = store.quarantine(self.bad, ["r"], evidence=self.evidence())
         kept = json.loads(store.evidence_path.read_text(encoding="utf-8"))
         self.assertEqual(set(kept), {record.entry_id})
 
@@ -370,7 +496,10 @@ class TestTheEvidenceTravels(ScannerCase):
         detail = explain.evidence_detail(verdict, CFG)
         self.assertEqual(set(detail), {"findings", "hard", "soft_capped", "threshold", "sha256"})
         self.assertEqual((detail["hard"], detail["soft_capped"], detail["threshold"]), (100, 0, 100))
-        self.assertEqual(detail["sha256"], verdict.sha256)
+        replayed = self.scanner.scan(self.bad)
+        self.assertIsNone(replayed.facts)
+        self.assertEqual(len(explain.evidence_detail(replayed, CFG)["sha256"]), 64,
+                         "a replay carries the digest; it used to carry nothing")
         events = EventStore(path=self.tmp / "events.jsonl")
         events.record(Event(kind="detection", path=str(self.bad), level="malicious", score=100,
                             reasons=verdict.reasons, detail=detail))
@@ -411,7 +540,9 @@ class TestTheWindow(unittest.TestCase):
                  if isinstance(c, tk.Text)]
         self.assertIn("an exact byte signature", texts[0].get("1.0", "end"))
         self.assertEqual(str(texts[0].cget("state")), "disabled", "read-only")
-        buttons = {b.cget("text"): b for b in body.winfo_children()[-1].winfo_children()}
+        row = [w for w in body.winfo_children()
+               if w.winfo_children() and all(c.winfo_class() == "TButton" for c in w.winfo_children())][0]
+        buttons = {b.cget("text"): b for b in row.winfo_children()}
         self.assertEqual(set(buttons), {"Restore", "Never scan this folder", "Copy this account", "Close"},
                          "only the actions the caller can take, plus Copy and Close")
         dialog._copy()
@@ -432,7 +563,7 @@ class TestTheWindow(unittest.TestCase):
         dialog.destroy()
         self.assertEqual(len(opened), 1)
         account = explain.from_event(opened[0], CFG)
-        self.assertEqual((account.state, account.rows[0].kind), (explain.REPORTED, explain.FACT))
+        self.assertEqual((account.state, account.rows[0].kind), (explain.DETECTED, explain.FACT))
 
     def test_a_reported_threat_offers_why_and_never_scan_and_records_the_evidence(self):
         import tkinter as tk
@@ -458,8 +589,68 @@ class TestTheWindow(unittest.TestCase):
         self.assertEqual([w.cget("text") for w in banner.winfo_children()], ["Why?", "Never scan drop"])
         self.assertTrue(bad.exists(), "reported, not moved")
         event = events.read(kinds={"detection"})[0]
-        self.assertEqual(set(event.detail), {"findings", "hard", "soft_capped", "threshold", "sha256"})
+        self.assertEqual(set(event.detail), {"findings", "hard", "soft_capped", "threshold", "sha256", "state"})
+        self.assertEqual(event.detail["state"], explain.REPORTED)
         holder.destroy()
+
+    def test_an_automatic_quarantine_records_what_happened_and_offers_the_account_with_restore(self):
+        import tkinter as tk
+        import ttkbootstrap as tb
+        bad = self.tmp / "drop" / "threat.bin"
+        bad.parent.mkdir()
+        bad.write_bytes(SELFTEST_MARKER)
+        cfg = config.Config(cloud_enabled=False, auto_quarantine=True)
+        scanner = Scanner(cfg, SelfProtection(), cache=ScanCache(self.tmp / "c.json", generation="t"))
+        verdict = scanner.scan(bad)
+        events = EventStore(path=self.tmp / "events.jsonl")
+        store = QuarantineStore(self.tmp / "q", self.tmp / "q" / "index.json", protection=SelfProtection(),
+                                allowlist=Allowlist(self.tmp / "allow.sqlite"))
+        holder = tb.Frame(self.root)
+        panes = tb.Frame(holder)
+        panes.pack()
+        var = tk.StringVar()
+        banner = tb.Label(holder, textvariable=var)
+        shown: list = []
+        fake = SimpleNamespace(cfg=cfg, events=events, scanner=scanner, _threats_this_scan=0, banner=banner,
+                               banner_var=var, _panes=panes, tray=None, quarantine=store,
+                               cache=scanner.cache, _refresh_quarantine=lambda: None,
+                               _show_account=lambda a, e=None: shown.append((a, e)))
+        for name in ("_banner", "_offer_account", "_offer_exclusion"):
+            setattr(fake, name, getattr(self.gui.AVGuardApp, name).__get__(fake))
+        self.gui.AVGuardApp._handle_threat(fake, verdict)
+        self.assertFalse(bad.exists(), "moved")
+        kinds = [(e.kind, e.detail["state"]) for e in events.read()]
+        self.assertEqual(sorted(kinds), [("detection", "quarantined"), ("quarantined", "quarantined")],
+                         "the detection row says the file was then moved")
+        record = store.records()[0]
+        self.assertEqual(store.evidence(record.entry_id)["findings"], findings_to_dicts(verdict.findings))
+        why = [w for w in banner.winfo_children() if w.cget("text") == "Why?"][0]
+        why.invoke()
+        account, entry_id = shown[0]
+        self.assertEqual((account.state, entry_id), (explain.QUARANTINED, record.entry_id))
+        # "Why was this taken?" on the Quarantine tab reads the same evidence.
+        fake._selected_id = lambda: record.entry_id
+        self.gui.AVGuardApp._explain_selected(fake)
+        self.assertEqual(shown[1][0].rows[0].kind, explain.FACT)
+        self.assertTrue(shown[1][0].evidence_kept)
+        holder.destroy()
+
+    def test_history_opens_nothing_for_a_row_without_a_verdict_or_a_click_off_the_rows(self):
+        events = EventStore(path=self.tmp / "events.jsonl")
+        events.record(Event(kind="scan_finished", detail={"files": 3, "threats": 0}))
+        events.record(Event(kind="detection", path="C:/x/a.exe", level="malicious", score=100,
+                            reasons=["r"], detail={"findings": findings_to_dicts(SIGNATURE)}))
+        opened: list = []
+        dialog = self.dialogs.HistoryDialog(self.root, events, lambda: None, on_open=opened.append)
+        rows = dialog.tree.get_children()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(dialog._events), 1, "only the verdict row has an account")
+        summary = next(iid for iid in rows if dialog.tree.item(iid, "values")[1] == "scan_finished")
+        dialog.tree.selection_set(summary)
+        dialog._open_selected()
+        dialog._open_selected(SimpleNamespace(y=-5))          # a heading or empty space
+        self.assertEqual(opened, [])
+        dialog.destroy()
 
 
 if __name__ == "__main__":
