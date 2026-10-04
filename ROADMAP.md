@@ -699,7 +699,7 @@ Settings states the trade.
 Measured here on Linux (the classifier is pure and runs anywhere):
 `classify()` 32 us on a lure, 13 us on an ordinary command, 0.8 ms over
 16 KB of non-matching text. Over the fixture corpora, 22 of 22 ClickFix and
-FileFix shapes reach warning and 0 of 29 legitimate one-liners do, with 3
+FileFix shapes reach warning and 0 of 31 legitimate lines do, with 3
 of those (the bun, uv and pnpm install lines) landing at notice and counted.
 The two first-draft mistakes the project's own history predicted are
 fixtures that must not warn: a hidden window alone (the install.bat shape
@@ -710,7 +710,20 @@ desktop: the cost of the live tick over a session, what `GetClipboardOwner`
 resolves to when a browser's JavaScript writes the clipboard, and which
 password managers set which private-format marker. Until those run the
 first-run default stays pre-ticked on the strength of the corpus, and the
-ROADMAP says "not yet on the owner's desktop". Tests 516 -> 547.
+ROADMAP says "not yet on the owner's desktop". Tests 516 -> 551.
+
+Three things a second read found before the first commit had finished its
+CI run, each now a test. The Windows clipboard reader used `ctypes.wintypes`
+without importing that submodule: on Linux the reader never binds, so every
+test stayed green while the real window would have failed to open on
+Windows; a Windows-only test now constructs the reader, polls it and reads
+it on the runner's desktop. A launcher word in a sentence earned a notice
+("open cmd and start https://..." names a launcher, a URL and the word
+start); a launcher now counts only in command position, at the start of
+the text, after a path or a quote, or after a hand-off token such as `/c`
+or `start`, and two prose fixtures must stay silent. And a banner's button
+outlived its message, so "Don't warn about this text again" would have sat
+beside "Scan complete"; a banner now clears the previous one's button.
 
 ## Deliberately not doing
 

@@ -366,7 +366,13 @@ class AVGuardApp(tb.Window):
         self.log_text.config(state=DISABLED)
 
     def _banner(self, text: str, style: str = "inverse-warning") -> None:
-        """Show a one-line notice above the panes, replacing any previous one."""
+        """Show a one-line notice above the panes, replacing any previous one.
+
+        Any button the previous banner carried goes with it: "Don't warn
+        about this text again" must not sit beside "Scan complete".
+        """
+        for child in self.banner.winfo_children():
+            child.destroy()
         self.banner_var.set(text)
         self.banner.configure(bootstyle=style)
         self.banner.pack(fill=X, pady=(0, 8), before=self._panes)

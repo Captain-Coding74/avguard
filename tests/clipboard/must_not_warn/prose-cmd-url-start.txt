@@ -1,0 +1,1 @@
+Open cmd and start https://example.com/setup to begin; it will download the installer and show the licence.

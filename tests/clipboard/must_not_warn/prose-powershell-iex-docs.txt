@@ -1,0 +1,1 @@
+In PowerShell, iex runs a string as code; see https://example.com/docs/about_iex before you use it in a script.

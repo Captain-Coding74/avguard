@@ -96,6 +96,36 @@ _PADDED_COMMENT = re.compile(r"\S[ \t]{12,}#")
 _CHARCODE = re.compile(r"\[char\]")
 _OBFUSCATION = re.compile(r"-bxor\b|\[array\]::reverse|\[string\]::join|-join\s*\(?\s*\[char\]|\.replace\([^)]*\)\.replace\(")
 
+# Tokens after which the next word is a command: "cmd /c powershell", "start
+# powershell", "conhost --headless powershell", "a && b".
+# (No encoded-command flag here: a base64 blob follows it, never a launcher,
+# and the literal is one a shipped rule hunts for in AVGuard's own source.)
+_COMMAND_LEADERS = {"/c", "/k", "/r", "/min", "--headless", "&&", "||", "|", ";", "start", "call",
+                    "-command", "-c", "-file"}
+
+
+def _launcher_in_command_position(low: str) -> str:
+    """The first launcher that sits where a command sits, else empty.
+
+    A Run-box string begins with its program, or reaches it through a path, a
+    quote or a hand-off token. A launcher word in the middle of a sentence
+    ("open cmd and run powershell to check") is prose, and prose with a URL
+    and the word "start" in it used to earn a notice.
+    """
+    for found in _LAUNCHER.finditer(low):
+        before = low[:found.start()]
+        if not before.strip():
+            return found.group(1)
+        previous = before[-1]
+        if previous in "\"'\\/@&|;(=":
+            return found.group(1)
+        if previous == " ":
+            token = before.rstrip().rsplit(" ", 1)[-1]
+            if token in _COMMAND_LEADERS or token.endswith(("&&", "||", "|", ";")):
+                return found.group(1)
+    return ""
+
+
 _LAUNCHER_WORDS = {
     "powershell": "PowerShell", "pwsh": "PowerShell", "mshta": "mshta", "cmd": "the command prompt",
     "wscript": "Windows Script Host", "cscript": "Windows Script Host", "rundll32": "rundll32",
@@ -169,13 +199,11 @@ def classify(text: str) -> Match | None:
     if not low:
         return None
 
-    launcher = ""
-    found = _LAUNCHER.search(low)
-    protocol = _PROTOCOL.search(low)
-    if found and (not protocol or found.start() < protocol.start()):
-        launcher = found.group(1)
-    elif protocol:
-        launcher = protocol.group(1) + ":"
+    launcher = _launcher_in_command_position(low)
+    if not launcher:
+        protocol = _PROTOCOL.search(low)
+        if protocol:
+            launcher = protocol.group(1) + ":"     # a URI pasted into Run is its own launcher
     if not launcher:
         return None
 
@@ -290,12 +318,16 @@ class WindowsClipboard:
     def __init__(self) -> None:
         self._user32 = None
         self._kernel32 = None
+        self._wt = None
         self._exclusion_formats: tuple[int, ...] = ()
         if self.available:
             self._bind()
 
     def _bind(self) -> None:
-        wt = ctypes.wintypes  # type: ignore[attr-defined]
+        # `import ctypes` does not import the wintypes submodule; done here so
+        # the module imports everywhere and binds only where it can run.
+        import ctypes.wintypes as wt
+        self._wt = wt
         user32 = ctypes.WinDLL("user32", use_last_error=True)
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         user32.GetClipboardSequenceNumber.restype = wt.DWORD
@@ -369,7 +401,7 @@ class WindowsClipboard:
             hwnd = user32.GetClipboardOwner()
             if not hwnd:
                 return None
-            pid = ctypes.wintypes.DWORD(0)  # type: ignore[attr-defined]
+            pid = self._wt.DWORD(0)
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
             if not pid.value:
                 return None
@@ -378,7 +410,7 @@ class WindowsClipboard:
                 return None
             try:
                 buffer = ctypes.create_unicode_buffer(32768)
-                size = ctypes.wintypes.DWORD(len(buffer))  # type: ignore[attr-defined]
+                size = self._wt.DWORD(len(buffer))
                 if not kernel32.QueryFullProcessImageNameW(process, 0, buffer, ctypes.byref(size)):
                     return None
                 return os.path.basename(buffer.value).lower() or None

