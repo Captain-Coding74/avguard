@@ -41,7 +41,14 @@ Still owed, on the owner's desktop: the live tick over a day, what
 `GetClipboardOwner` resolves to for a browser's write, which password
 managers set which private-format marker.
 
-## 2. "Explain why" — build next, reduced
+## 2. "Explain why" — DONE, reduced as planned
+
+Built the same day; the record is in ROADMAP.md under "Explain why". The one
+departure from the shape below: a quarantined file's evidence lives in a
+sidecar beside the index, not on the record, because an older AVGuard drops
+an index row with a field it does not know. The confidence number stayed
+refused. What was planned:
+
 
 **The honesty bug it starts from, measured in this checkout.** A file that
 scans MALICIOUS with one hard finding (the self-test marker: `signature`,

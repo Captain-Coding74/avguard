@@ -455,8 +455,9 @@ class SettingsDialog(tb.Toplevel):
         return Messagebox.yesno(
             f"Send scan events to {url}?" + CHR_NL + CHR_NL
             + "Every event carries the file's path, the verdict, the rule names and "
-              "the SHA-256 hash of the file. The paste guard's warnings stay on this "
-              "machine and are never sent. Nothing is sent while the address is empty.",
+              "the SHA-256 hash of the file, and the evidence behind the verdict (rule "
+              "names, weights and the pack they came from). The paste guard's warnings stay "
+              "on this machine and are never sent. Nothing is sent while the address is empty.",
             "Forward events?", parent=self) == "Yes"
 
     def _apply_scheduling(self) -> list[str]:
@@ -516,12 +517,16 @@ def glob_for(folder: str | Path) -> str:
 
 
 class HistoryDialog(tb.Toplevel):
-    """What the scanner has done, beyond what the log widget still holds."""
+    """What the scanner has done, beyond what the log widget still holds.
+    A double-click on a row opens the account of that event, which is also
+    where the reasons of an event that has a path can be read."""
 
-    def __init__(self, parent, store, on_cleared) -> None:
+    def __init__(self, parent, store, on_cleared, on_open=None) -> None:
         super().__init__(title="History", transient=parent)
         self.store = store
         self._on_cleared = on_cleared
+        self._on_open = on_open
+        self._events: dict[str, object] = {}
         self.geometry("900x520")
 
         body = tb.Frame(self, padding=14)
@@ -548,18 +553,27 @@ class HistoryDialog(tb.Toplevel):
         self.tree.pack(fill=BOTH, expand=True)
 
         for event in store.read(limit=1000):
-            self.tree.insert("", END, values=(
+            iid = self.tree.insert("", END, values=(
                 event.when, event.kind, event.level or "-",
                 event.path or "; ".join(event.reasons)[:120]))
+            self._events[iid] = event
+        if on_open is not None:
+            self.tree.bind("<Double-1>", self._open_selected)
 
         actions = tb.Frame(body, padding=(0, 12, 0, 0))
         actions.pack(fill=X)
         tb.Label(actions, bootstyle="secondary", wraplength=560, justify="left",
                  text=("This history and the scan cache both record file paths "
-                       "from this machine. Clearing removes them.")
+                       "from this machine. Clearing removes them."
+                       + (" Double-click an event for its account." if on_open else ""))
                  ).pack(side=LEFT, fill=X, expand=True)
         tb.Button(actions, text="Clear history", bootstyle="danger-outline",
                   command=self._clear).pack(side=RIGHT)
+
+    def _open_selected(self, _event=None) -> None:
+        selection = self.tree.selection()
+        if selection and selection[0] in self._events and self._on_open is not None:
+            self._on_open(self._events[selection[0]])
 
     def _clear(self) -> None:
         if Messagebox.yesno("Delete the recorded history from this machine?",
@@ -568,7 +582,60 @@ class HistoryDialog(tb.Toplevel):
         self.store.clear()
         for item in self.tree.get_children():
             self.tree.delete(item)
+        self._events.clear()
         self._on_cleared()
+
+
+class ExplanationDialog(tb.Toplevel):
+    """Why a file was judged as it was: the account, read-only, a Copy button
+    and the actions that apply to what happened to the file. Nothing here
+    changes a verdict or a weight; explain.py renders what the scanner kept.
+    """
+
+    def __init__(self, parent, account, actions: dict | None = None) -> None:
+        super().__init__(title="Why?", transient=parent)
+        from . import explain as explain_module
+        self.geometry("780x500")
+        self.minsize(560, 360)
+        self._text = explain_module.render_text(account)
+        name = account.path.replace("\\", "/").rsplit("/", 1)[-1] or account.path
+
+        body = tb.Frame(self, padding=14)
+        body.pack(fill=BOTH, expand=True)
+        tb.Label(body, text=f"{account.level.upper()}: {name}",
+                 font=("Segoe UI", 14, "bold")).pack(anchor="w")
+        tb.Label(body, bootstyle="secondary", wraplength=720, justify="left",
+                 text=account.meaning).pack(anchor="w", pady=(2, 8))
+
+        frame = tb.Frame(body)
+        frame.pack(fill=BOTH, expand=True)
+        box = tk.Text(frame, wrap="word", height=14, font=("Consolas", 10), relief="flat")
+        scroll = tb.Scrollbar(frame, orient=VERTICAL, command=box.yview)
+        box.configure(yscrollcommand=scroll.set)
+        box.insert("1.0", self._text)
+        box.configure(state="disabled")
+        scroll.pack(side=RIGHT, fill=Y)
+        box.pack(fill=BOTH, expand=True)
+
+        tb.Label(body, bootstyle="secondary", wraplength=720, justify="left",
+                 text="Copying puts this account, with the file's path and its SHA-256, on your "
+                      "clipboard; nothing is sent anywhere.").pack(anchor="w", pady=(8, 4))
+        row = tb.Frame(body)
+        row.pack(fill=X)
+        for label, kind in account.actions:
+            if kind == "copy":
+                tb.Button(row, text=label, bootstyle="secondary-outline",
+                          command=self._copy).pack(side=LEFT, padx=(0, 6))
+            elif actions and kind in actions:
+                tb.Button(row, text=label, bootstyle="info-outline",
+                          command=lambda fn=actions[kind]: (self.destroy(), fn())
+                          ).pack(side=LEFT, padx=(0, 6))
+        tb.Button(row, text="Close", bootstyle="secondary", command=self.destroy).pack(side=RIGHT)
+
+    def _copy(self) -> None:
+        """A user click on the GUI thread: Tk's own clipboard write."""
+        self.clipboard_clear()
+        self.clipboard_append(self._text)
 
 
 class HealthDialog(tb.Toplevel):

@@ -135,6 +135,33 @@ malware — that needs a maintained signature corpus, which is a different
 project. Turning on VirusTotal lookups is what gives it real detection, and
 that is your decision to make.
 
+## Explaining a detection
+
+Every verdict can be opened into an account of its evidence: the "Why?"
+button beside a detection banner, "Why was this taken?" on the Quarantine
+tab, a double-click on a History row, and `--scan PATH --explain` or
+`--json` in a terminal (`--explain-quarantine ID` for a held file). Each
+finding is named a fact or an opinion, with where it came from (a byte
+signature, a hash blocklist and its source, a rule with its severity and
+pack, the executable's structure, resemblance to a known sample) and what
+it weighed, and the arithmetic that decided is shown as the scanner used
+it: facts count toward moving a file, opinions are capped at 75 and never
+do. A rule's own note, when its author wrote one, is there too. Copying the
+account puts it, with the file's path and SHA-256, on your clipboard;
+nothing is sent anywhere.
+
+The limit, stated plainly: an account describes what the scanner saw and
+how it counted it. It is not a probability that the file is malware; the
+program has no such number and will not invent one. The only percentage an
+account can contain is a rule pack's measured admission rate, with the size
+of the corpus it was measured on.
+
+This also fixed a lie. A verdict replayed from the scan cache used to come
+back with no findings and a score of 0, and that 0 is what History and
+event forwarding received for a MALICIOUS file. The cache now keeps the
+findings (its schema moved from 3 to 4, so every cached verdict is forgotten
+once on upgrade), and a replay knows exactly what the first scan knew.
+
 ## The paste guard
 
 One thing AVGuard watches that is not a file: the clipboard. The ClickFix scam (and its FileFix cousin) is a fake CAPTCHA or "fix this error" page that copies a command for you and tells you to press Win+R, paste, and Enter. No file is downloaded until you have already run it, so a file scanner never sees it coming. When the guard is on, AVGuard looks at text you copy, on this PC, for the shape of such a command, a launcher like PowerShell or mshta together with an encoded blob, a remote script, a hidden window or one of the tell-tale "I am not a robot" comment tails, and warns you in the seconds before you paste.

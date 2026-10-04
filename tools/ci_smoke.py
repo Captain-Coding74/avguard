@@ -87,6 +87,23 @@ def _run(work: Path) -> int:
     check("--scan alone moves nothing", bad.exists(),
           "the file was moved without --quarantine")
 
+    # --- the account of a verdict, from the console --------------------------
+    code, output = run("--scan", str(bad), "--explain")
+    check("--scan --explain names the evidence as a fact", code == 1
+          and "fact" in output and "an exact byte signature (AVGuard-Selftest-Marker)" in output
+          and "Counted: facts 100" in output, f"exit {code}: {output[-400:]}")
+    code, output = run("--scan", str(bad), "--json")
+    import json as _json
+    objects = []
+    for line in output.splitlines():
+        try:
+            objects.append(_json.loads(line))
+        except ValueError:
+            pass
+    check("--scan --json yields an object with the findings", code == 1 and len(objects) == 1
+          and objects[0]["level"] == "malicious" and objects[0]["rows"][0]["kind"] == "fact",
+          f"exit {code}: {output[-400:]}")
+
     # --- a clean file is examined, not merely skipped -----------------------
     good = work / "clean.txt"
     good.write_text("nothing to see here", encoding="utf-8")
@@ -113,6 +130,11 @@ def _run(work: Path) -> int:
           f"not listed: {listing[-400:]}")
 
     entry_id = listing.strip().split()[0] if listing.strip() else ""
+    if entry_id:
+        code, output = run("--explain-quarantine", entry_id)
+        check("--explain-quarantine accounts for a held file from its kept evidence", code == 0
+              and "an exact byte signature" in output and "Quarantined. Restore puts it back" in output,
+              f"exit {code}: {output[-400:]}")
     code, output = run("--export-all", str(work / "rescued"))
     check("--export-all exits 0", code == 0,
           f"the documented exit door failed with {code}: {output[-400:]}")

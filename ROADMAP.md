@@ -819,6 +819,81 @@ not measured on the owner's desktop: the live tick over a session, what
 `GetClipboardOwner` resolves to for a browser's write, which password
 managers set which marker.
 
+**Explain why, 2026-10-04.** Every verdict can now be opened into an
+account of its evidence: `avguard/explain.py`, tkinter-free, turns the
+findings back into the model that decided them. Each finding is a fact or
+an opinion (hard or soft, the vocabulary `Finding`'s own docstring already
+used), with where it came from in words (an exact byte signature, a hash
+blocklist and its source, a rule with its declared severity and pack, the
+executable's structure, resemblance to a known sample with the two bands
+named) and what it weighed; the tally is `decide()`'s arithmetic, facts
+against the configured threshold and opinions capped at 75, not
+`Verdict.score`, which is the uncapped sum and would read 150 for a file
+with a signature and an odd structure; the level has one sentence of
+meaning; what can be done depends on what happened (quarantined, reported,
+left alone, kept). Surfaces: a "Why?" button beside every detection banner,
+including a reported-only threat and, under real-time protection, a
+SUSPICIOUS file, both of which now also get "Never scan" (before this only
+an automatic quarantine offered a way out); "Why was this taken?" on the
+Quarantine tab; a double-click on a History row, which is also where the
+reasons of an event with a path can finally be read; `--scan --explain`,
+`--scan --json` (one object per file, the log and the summary on stderr)
+and `--explain-quarantine ID`, read-only and without the instance lock.
+Refused, with a test: a confidence number. The only percentage an account
+can carry is a pack's measured admission rate, with its corpus size, said
+to be the pack's and not the rule's.
+
+It started from a lie, measured here: the first scan of the self-test
+marker was MALICIOUS with one hard finding of 100; the second, served from
+the cache in 0.15 ms, was MALICIOUS with `findings=[]`, `score=0` and no
+digest, and that 0 is what `_handle_threat` wrote to History and what
+event forwarding sent. The cache now keeps the findings (`ScanCache.SCHEMA`
+3 -> 4, so every cached verdict is forgotten once on upgrade; the schema is
+part of `detection_generation()`, so no process can replay a schema-3
+entry, and `DETECTION_VERSION` stays 15 because the same bytes still yield
+the same level and reasons), a replay rebuilds the Verdict with its
+findings and `sha256`, and `Finding` gained `severity`, `pack` and `notes`
+(a rule's `note` and `reference` meta, which reached nobody before) with
+defaults, so no constructor and no reason sentence changed; a test holds
+the sentences byte-identical.
+
+The evidence travels. Detection, suspicious and quarantined events carry
+`detail.findings`, `hard`, `soft_capped`, `threshold` and `sha256`, inside
+`detail` so the seven schema-1 fields stay what they are (a test pins the
+set); the forwarding consent sentence and the README now name the evidence
+as something that leaves the machine, and the paste guard's events stay
+local as before. A quarantined file's evidence lives in a sidecar
+(`quarantine/index_evidence.json`), not on the record: the design put it
+on `QuarantineRecord`, and `_reload_and_merge` drops any index row with a
+field it does not know and would then save the index without it, so an
+older AVGuard started after a newer one would have lost the user's held
+files from view. The sidecar write is best effort and never raises; a
+record without one reads as "recorded before evidence was kept", as does
+an event without detail, and nothing is invented for either.
+
+Measured here (Linux; the module is pure and the numbers are the same
+shape on Windows): a cache hit 66 us before and 69 us after per `scan()`
+over 1,000; `EventStore.record()` 23 us without and 33 us with the
+evidence in detail, 311 bytes more per detection line; a cache entry 427
+bytes with one finding (212 of them the finding) and 14 bytes more for a
+clean entry; `explain()` plus `render_text()` 9 us on the self-test
+verdict and 25 us on the worst fixture (four opinions, a resemblance and a
+noted rule: 1,742 characters, 23 lines); the account dialog 18 ms to build
+on a warm root under Xvfb, 712x412 requested. Tests 593 -> 624: the replay
+keeps its findings; a schema-3 cache is dropped with the log line; the
+tally reproduces `decide()` for every fixture shape including the capped
+pile and the signature-plus-structure file; the threshold comes from the
+config; a pack rule names its pack, trust and rate with corpus size; no
+line of any rendering carries a percentage without "clean files" or a
+number beside "confidence" or "probability"; the sidecar and its failure;
+the event detail through the store; the dialog, History and the
+reported-threat banner on the shared root; the three console verbs,
+`--explain-quarantine` with another instance holding the lock. Read, not
+measured: the wording of the ten fixture accounts. Not yet on the owner's
+desktop: the one-time cache drop on a real Downloads folder, the dialog at
+the main window's minimum size with a long path, and whether the "Why?"
+button is found.
+
 ## Deliberately not doing
 
 The paste guard (above) is the one input that is not a file; it watches a user-mode clipboard buffer through documented calls, with no driver, no hook and no process telemetry, so it does not reopen the first decision here. The EDR-shaped extensions of it are refused by name: no keyboard hook to see Win+R, no automation of the Run dialog, no watching what the user then runs.

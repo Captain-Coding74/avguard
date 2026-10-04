@@ -26,7 +26,7 @@ from ttkbootstrap.constants import (
 )
 from ttkbootstrap.dialogs import Messagebox, Querybox
 
-from . import clipguard, config, dialogs, fimpanel, logsetup, scheduling
+from . import clipguard, config, dialogs, explain, fimpanel, logsetup, scheduling
 from .events import Event, EventStore
 from .cloud import VirusTotalClient
 from . import iocs as iocs_module
@@ -252,6 +252,8 @@ class AVGuardApp(tb.Window):
                   command=self._export_all).pack(fill=X, pady=(0, 4))
         tb.Button(quarantine, text="Mark as a known sample...", bootstyle="info-outline",
                   command=self._mark_known_sample).pack(fill=X, pady=(0, 4))
+        tb.Button(quarantine, text="Why was this taken?", bootstyle="info-outline",
+                  command=self._explain_selected).pack(fill=X, pady=(0, 4))
 
         # The file-integrity baseline, beside the quarantine because both are
         # things the user comes back to look at. Its work runs on a thread of
@@ -560,26 +562,48 @@ class AVGuardApp(tb.Window):
             log.warning("suspicious %s - %s", verdict.path, "; ".join(verdict.reasons))
             self.events.record(Event(
                 kind="suspicious", path=str(verdict.path), level=verdict.level.value,
-                score=verdict.score, reasons=list(verdict.reasons)))
+                score=verdict.score, reasons=list(verdict.reasons),
+                detail=explain.evidence_detail(verdict, self.cfg)))
+            self.post(self._report_suspicious, verdict)
         elif verdict.level is Level.ERROR:
             log.error("%s - %s", verdict.path, "; ".join(verdict.reasons))
         else:
             log.debug("%s - %s", verdict.path, verdict.level.value)
 
+    def _report_suspicious(self, verdict: Verdict) -> None:
+        """On the GUI thread. Under real-time protection a SUSPICIOUS file used
+        to reach only the Activity line and History; one banner now says it
+        was reported and not moved, with the account and the way out behind
+        it. During a full scan the summary line stays and History carries
+        each one, so a folder of unusual files does not churn the banner."""
+        if self._scan_thread is not None and self._scan_thread.is_alive():
+            return
+        self._banner(f"Unusual file reported, not moved: {verdict.path.name}", "inverse-warning")
+        self._offer_account(explain.from_verdict(verdict, self.cfg, self.scanner.packs))
+        self._offer_exclusion(verdict.path.parent)
+
     def _handle_threat(self, verdict: Verdict) -> None:
         """Runs on the GUI thread."""
         self._threats_this_scan += 1
+        # The evidence rides inside `detail` (the event's seven fields are
+        # schema 1 and stay so), so History can account for the verdict later.
+        detail = explain.evidence_detail(verdict, self.cfg)
         self.events.record(Event(
             kind="detection", path=str(verdict.path), level=verdict.level.value,
-            score=verdict.score, reasons=list(verdict.reasons)))
+            score=verdict.score, reasons=list(verdict.reasons), detail=detail))
 
         if not self.cfg.auto_quarantine:
             self._banner(f"Threat found in {verdict.path.name} (not quarantined - "
                          f"automatic quarantine is off)", "inverse-danger")
+            # The account and the way out, for a reported threat as much as
+            # for a quarantined one; before this only a quarantine offered them.
+            self._offer_account(explain.from_verdict(verdict, self.cfg, self.scanner.packs))
+            self._offer_exclusion(verdict.path.parent)
             return
 
         try:
-            self.quarantine.quarantine(verdict.path, verdict.reasons)
+            record = self.quarantine.quarantine(verdict.path, verdict.reasons,
+                                                findings=detail["findings"])
         except QuarantineError as exc:
             log.error("could not quarantine %s: %s", verdict.path, exc)
             self._banner(f"Could not quarantine {verdict.path.name}: {exc}", "inverse-danger")
@@ -587,11 +611,13 @@ class AVGuardApp(tb.Window):
 
         self.events.record(Event(
             kind="quarantined", path=str(verdict.path), level=verdict.level.value,
-            score=verdict.score, reasons=list(verdict.reasons)))
+            score=verdict.score, reasons=list(verdict.reasons), detail=detail))
         self.cache.invalidate(verdict.path)
         self._refresh_quarantine()
         self._banner(f"Quarantined {verdict.path.name} - {'; '.join(verdict.reasons)}",
                      "inverse-danger")
+        self._offer_account(explain.from_verdict(verdict, self.cfg, self.scanner.packs,
+                                                 quarantined=True), entry_id=record.entry_id)
         self._offer_exclusion(verdict.path.parent)
 
         # A tray notification instead of a modal dialog. During a scan a modal
@@ -783,9 +809,15 @@ class AVGuardApp(tb.Window):
 
     def _restore_selected(self) -> None:
         entry_id = self._selected_id()
-        if entry_id is None:
-            return
+        if entry_id is not None:
+            self._restore_entry(entry_id)
+
+    def _restore_entry(self, entry_id: str) -> None:
         record = self.quarantine.get(entry_id)
+        if record is None:
+            Messagebox.show_info("That entry is already gone.", "AVGuard", parent=self)
+            self._refresh_quarantine()
+            return
         confirm = Messagebox.yesno(
             f"Put '{record.original_name}' back at:\n{record.original_path}\n\n"
             f"It was quarantined for: {'; '.join(record.reasons) or 'no reason given'}\n\n"
@@ -861,8 +893,10 @@ class AVGuardApp(tb.Window):
         next variant of it a soft finding. Nothing is moved on resemblance.
         """
         entry_id = self._selected_id()
-        if entry_id is None:
-            return
+        if entry_id is not None:
+            self._mark_known_entry(entry_id)
+
+    def _mark_known_entry(self, entry_id: str) -> None:
         record = self.quarantine.get(entry_id)
         if record is None:
             Messagebox.show_info("That entry is already gone.", "AVGuard", parent=self)
@@ -1055,7 +1089,40 @@ class AVGuardApp(tb.Window):
         self._banner("Settings saved.", "inverse-success")
 
     def _show_history(self) -> None:
-        dialogs.HistoryDialog(self, self.events, self._history_cleared)
+        dialogs.HistoryDialog(self, self.events, self._history_cleared, on_open=self._explain_event)
+
+    # ------------------------------------------------------------ accounts
+
+    def _offer_account(self, account: explain.Explanation, entry_id: str | None = None) -> None:
+        """The "Why?" button beside a detection banner. Packed after the
+        banner, which cleared the previous one's buttons."""
+        tb.Button(self.banner, text="Why?", bootstyle="light-outline",
+                  command=lambda a=account, e=entry_id: self._show_account(a, e)
+                  ).pack(side=RIGHT, padx=6)
+
+    def _show_account(self, account: explain.Explanation, entry_id: str | None = None) -> None:
+        """The dialog, with only the actions the window can take from here."""
+        actions = {"exclude": lambda: self._exclude_folder(Path(account.path).parent)}
+        if entry_id is not None:
+            actions["restore"] = lambda: self._restore_entry(entry_id)
+            actions["reference"] = lambda: self._mark_known_entry(entry_id)
+        dialogs.ExplanationDialog(self, account, actions)
+
+    def _explain_selected(self) -> None:
+        entry_id = self._selected_id()
+        if entry_id is None:
+            return
+        record = self.quarantine.get(entry_id)
+        if record is None:
+            Messagebox.show_info("That entry is already gone.", "AVGuard", parent=self)
+            self._refresh_quarantine()
+            return
+        account = explain.from_record(record, self.quarantine.evidence(entry_id), self.cfg,
+                                      self.scanner.packs)
+        self._show_account(account, entry_id)
+
+    def _explain_event(self, event: Event) -> None:
+        self._show_account(explain.from_event(event, self.cfg, self.scanner.packs))
 
     def _history_cleared(self) -> None:
         log.info("history cleared at the user's request")

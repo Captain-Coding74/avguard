@@ -19,21 +19,26 @@ from .instance import InstanceLock
 from .protection import SelfProtection
 from . import rulepacks
 from .quarantine import QuarantineError, QuarantineStore, RestoreIncomplete
-from .scanner import Level, Scanner
+from .scanner import Level, Scanner, findings_to_dicts
 
 
 def _console_scan(target: Path, quarantine_threats: bool, verbose: bool,
-                  pause: bool = False) -> int:
+                  pause: bool = False, explain_each: bool = False, as_json: bool = False) -> int:
     logsetup.configure(level=logging.DEBUG if verbose else logging.INFO)
     if sys.stdout is not None:
-        logging.getLogger("avguard").addHandler(logging.StreamHandler(sys.stdout))
+        # Under --json stdout carries nothing but the objects; the log goes beside it.
+        logging.getLogger("avguard").addHandler(
+            logging.StreamHandler(sys.stderr if as_json else sys.stdout))
     # Everything printed is also kept, for --pause under the windowed build,
     # where there is no console to have printed it to.
     transcript: list[str] = []
+    # Under --json stdout carries one object per file and nothing else, so
+    # everything said to a person goes beside it; the exit code is unchanged.
+    console = sys.stderr if as_json else sys.stdout
 
     def say(text: str = "") -> None:
         transcript.append(text)
-        print(text)
+        print(text, file=console)
 
     cfg = config.Config.load()
     protection = SelfProtection()
@@ -47,15 +52,27 @@ def _console_scan(target: Path, quarantine_threats: bool, verbose: bool,
 
     counts = {level: 0 for level in Level}
     threats = []
+    from . import explain as explain_module
+
+    def account_of(verdict):
+        return explain_module.from_verdict(verdict, cfg, scanner.packs)
 
     def report(verdict) -> None:
         counts[verdict.level] += 1
+        if verdict.level is Level.MALICIOUS:
+            threats.append(verdict)
+        if as_json:
+            # One object per file examined, on stdout and nothing else there,
+            # so the output is JSON lines whatever the folder holds.
+            print(explain_module.as_json(account_of(verdict)))
+            return
         if verdict.level in (Level.MALICIOUS, Level.SUSPICIOUS):
+            if explain_each:
+                say(explain_module.render_text(account_of(verdict)))
+                return
             say(f"[{verdict.level.value.upper()}] {verdict.path}")
             for reason in verdict.reasons:
                 say(f"    {reason}")
-            if verdict.level is Level.MALICIOUS:
-                threats.append(verdict)
         elif verbose:
             print(f"[{verdict.level.value}] {verdict.path}")
 
@@ -89,8 +106,9 @@ def _console_scan(target: Path, quarantine_threats: bool, verbose: bool,
             print()
             for verdict in threats:
                 try:
-                    store.quarantine(verdict.path, verdict.reasons)
-                    print(f"quarantined: {verdict.path}")
+                    store.quarantine(verdict.path, verdict.reasons,
+                                     findings=findings_to_dicts(verdict.findings))
+                    print(f"quarantined: {verdict.path}", file=console)
                 except QuarantineError as exc:
                     print(f"could not quarantine {verdict.path}: {exc}", file=sys.stderr)
         finally:
@@ -569,6 +587,14 @@ def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="avguard", description="A small file scanner.")
     parser.add_argument("--scan", metavar="PATH", type=Path,
                         help="scan a file or folder in the console and exit")
+    parser.add_argument("--explain", action="store_true",
+                        help="with --scan: an account of each flagged file, each finding named "
+                             "a fact or an opinion with its weight, and the arithmetic that decided")
+    parser.add_argument("--json", action="store_true",
+                        help="with --scan: one JSON object per file examined, with its findings "
+                             "and the arithmetic, instead of the printed report")
+    parser.add_argument("--explain-quarantine", metavar="ID",
+                        help="the account of a quarantined file, from the evidence the store kept")
     parser.add_argument("--quarantine", action="store_true",
                         help="with --scan, move anything detected into quarantine")
     parser.add_argument("--pause", action="store_true",
@@ -653,6 +679,19 @@ def _main(argv: list[str] | None = None) -> int:
                      "(commands are options, e.g. --scan PATH)")
 
     config.ensure_directories()
+
+    if args.explain_quarantine:
+        # Read-only, so no instance lock: records() re-reads the index.
+        from . import explain as explain_module
+        store = QuarantineStore(protection=SelfProtection())
+        record = next((r for r in store.records() if r.entry_id == args.explain_quarantine), None)
+        if record is None:
+            print(f"no quarantined file with id {args.explain_quarantine}", file=sys.stderr)
+            return 1
+        account = explain_module.from_record(record, store.evidence(record.entry_id),
+                                             config.Config.load(), packs=rulepacks.PackStore())
+        print(explain_module.render_text(account))
+        return 0
 
     if args.list_quarantine:
         store = QuarantineStore(protection=SelfProtection())
@@ -751,7 +790,8 @@ def _main(argv: list[str] | None = None) -> int:
         if not args.scan.exists():
             print(f"no such path: {args.scan}", file=sys.stderr)
             return 2
-        return _console_scan(args.scan, args.quarantine, args.verbose, pause=args.pause)
+        return _console_scan(args.scan, args.quarantine, args.verbose, pause=args.pause,
+                             explain_each=args.explain, as_json=args.json)
 
     from .gui import main as gui_main
     return gui_main()

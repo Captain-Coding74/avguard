@@ -189,9 +189,50 @@ class Finding:
     weight: int
     detail: str = ""
     hard: bool = False
+    # What the account of a verdict needs that the sentence does not carry:
+    # the severity a rule declared, the pack it came from, and its author's
+    # note or reference. Defaults, so every existing constructor still holds.
+    severity: str = ""
+    pack: str = ""
+    notes: tuple[str, ...] = ()
 
     def describe(self) -> str:
         return self.detail or f"{self.source} {self.name}"
+
+
+def finding_to_dict(finding: Finding) -> dict:
+    """The stored form: what the cache, the quarantine evidence and an event
+    keep so a verdict can be accounted for later with what decided it."""
+    return {"source": finding.source, "name": finding.name, "weight": int(finding.weight),
+            "detail": finding.detail, "hard": bool(finding.hard), "severity": finding.severity,
+            "pack": finding.pack, "notes": list(finding.notes)}
+
+
+def finding_from_dict(raw: object) -> Finding:
+    """The stored form back. Defensive: a malformed entry becomes a weightless
+    finding that says so, never an exception, because this runs in the
+    verdict path (a cache hit) and in dialogs."""
+    if not isinstance(raw, dict):
+        return Finding("stored", "malformed", 0, f"malformed stored finding: {raw!r}"[:200])
+    try:
+        notes = raw.get("notes") or ()
+        return Finding(str(raw.get("source", "stored")), str(raw.get("name", "")),
+                       int(raw.get("weight", 0)), str(raw.get("detail", "")),
+                       bool(raw.get("hard", False)), str(raw.get("severity", "")),
+                       str(raw.get("pack", "")),
+                       tuple(str(n) for n in notes) if isinstance(notes, (list, tuple)) else ())
+    except (TypeError, ValueError) as exc:
+        return Finding("stored", "malformed", 0, f"malformed stored finding ({exc})")
+
+
+def findings_to_dicts(findings) -> list[dict]:
+    return [finding_to_dict(f) for f in (findings or [])]
+
+
+def findings_from_dicts(raw: object) -> list[Finding]:
+    if not isinstance(raw, list):
+        return []
+    return [finding_from_dict(item) for item in raw]
 
 
 @dataclass(frozen=True)
@@ -240,6 +281,9 @@ class Verdict:
     reasons: list[str] = field(default_factory=list)
     facts: FileFacts | None = None
     findings: list[Finding] = field(default_factory=list)
+    # The digest of the bytes judged, kept on a replay too; `facts` is only
+    # present when the file was read this time.
+    sha256: str = ""
 
     @property
     def score(self) -> int:
@@ -335,7 +379,10 @@ class ScanCache:
 
     # Bumped whenever a stored verdict would mean something different. Entries
     # written under an older schema are dropped rather than replayed.
-    SCHEMA = 3
+    # 4: entries carry the findings, so a replayed verdict knows as much as
+    # the first one did (before this a cached MALICIOUS came back with no
+    # findings and a score of 0, and that 0 went into History).
+    SCHEMA = 4
 
     def __init__(self, path: Path = config.SCAN_CACHE_PATH, max_entries: int = 20_000,
                  generation: str = "", ttl_days: int = 30):
@@ -444,7 +491,8 @@ class ScanCache:
             return self._entries.get(self._key(path, size, mtime_ns))
 
     def put(self, path: Path, size: int, mtime_ns: int, level: Level,
-            reasons: list[str], sha256: str, allowed: bool = False) -> None:
+            reasons: list[str], sha256: str, allowed: bool = False,
+            findings: Sequence[Finding] | None = None) -> None:
         with self._lock:
             self._entries[self._key(path, size, mtime_ns)] = {
                 "level": level.value,
@@ -453,6 +501,7 @@ class ScanCache:
                 # CLEAN only because the user said so. Recorded so the entry
                 # can be dropped the moment that decision is withdrawn.
                 "allowed": allowed,
+                "findings": findings_to_dicts(findings),
                 "at": time.time(),
             }
 
@@ -1263,10 +1312,15 @@ class Scanner:
         attribution = f", from the {origin} pack" if origin else ""
         location = f" inside {inside}" if inside else ""
 
+        # The author's note and reference, if the rule carries them, reach the
+        # account of the verdict; nothing else reads them.
+        notes = tuple(str(meta[key]).strip() for key in ("note", "reference")
+                      if str(meta.get(key, "")).strip())
         return Finding(
             "yara", match.rule, weight,
             f"{detail} (rule {match.rule}, {severity or 'unrated'}{attribution}){location}",
-            hard=weight >= MALICIOUS_AT and not imported)
+            hard=weight >= MALICIOUS_AT and not imported,
+            severity=severity or "unrated", pack=origin, notes=notes)
 
     def _match_large_file(self, facts: FileFacts, rules):
         """YARA-match a file too big to have been buffered during the read.
@@ -1420,7 +1474,11 @@ class Scanner:
         if use_cache:
             cached = cache.get(path, size, mtime_ns)
             if cached and self._cache_still_applies(cached):
-                return Verdict(path, Level(cached["level"]), list(cached["reasons"]))
+                # The replay carries what decided it: the same findings, score
+                # and digest the first scan had.
+                return Verdict(path, Level(cached["level"]), list(cached["reasons"]),
+                               findings=findings_from_dicts(cached.get("findings")),
+                               sha256=str(cached.get("sha256", "")))
 
         try:
             facts = self._read_facts(path, size, mtime_ns,
@@ -1440,10 +1498,11 @@ class Scanner:
                       + (f" (it was flagged for {'; '.join(allowed.was_flagged_for)})"
                          if allowed.was_flagged_for else ""))
             verdict = Verdict(path, Level.CLEAN, [reason], facts,
-                              [Finding("allowlist", "user-decision", 0, reason)])
+                              [Finding("allowlist", "user-decision", 0, reason)],
+                              sha256=facts.sha256)
             if use_cache:
                 cache.put(path, size, mtime_ns, Level.CLEAN, [reason], facts.sha256,
-                          allowed=True)
+                          allowed=True, findings=verdict.findings)
             return verdict
 
         findings: list[Finding] = []
@@ -1525,9 +1584,9 @@ class Scanner:
                 level = decide(findings, self.cfg.quarantine_threshold)
 
         reasons = [f.describe() for f in findings]
-        verdict = Verdict(path, level, reasons, facts, findings)
+        verdict = Verdict(path, level, reasons, facts, findings, sha256=facts.sha256)
         if use_cache:
-            cache.put(path, size, mtime_ns, level, reasons, facts.sha256)
+            cache.put(path, size, mtime_ns, level, reasons, facts.sha256, findings=findings)
         return verdict
 
     # ------------------------------------------------------------ walking

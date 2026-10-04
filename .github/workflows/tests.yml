@@ -78,7 +78,7 @@ jobs:
           import importlib
           modules = ["config", "protection", "scanner", "quarantine", "cloud",
                      "watcher", "logsetup", "instance", "archives", "peinfo",
-                     "events", "signing", "scheduling", "tlsh", "iocs", "clipguard"]
+                     "events", "signing", "scheduling", "tlsh", "iocs", "clipguard", "explain"]
           for name in modules:
               importlib.import_module(f"avguard.{name}")
               print(f"  ok  avguard.{name}")

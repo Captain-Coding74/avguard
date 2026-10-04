@@ -228,6 +228,40 @@ class QuarantineStore:
             self._reload_and_merge()
             return sorted(self._records.values(), key=lambda r: r.quarantined_at, reverse=True)
 
+    # ------------------------------------------------------------ evidence
+
+    @property
+    def evidence_path(self) -> Path:
+        return self.index_path.with_name(self.index_path.stem + "_evidence.json")
+
+    def _read_evidence(self) -> dict:
+        try:
+            raw = json.loads(self.evidence_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return raw if isinstance(raw, dict) else {}
+
+    def _keep_evidence(self, entry_id: str, findings: list[dict] | None) -> None:
+        """Best effort and never raises: the account of a verdict is worth
+        keeping, the file it belongs to is worth more, and by the time this
+        runs the file is safely in the store."""
+        if findings is None:
+            return
+        try:
+            evidence = self._read_evidence()
+            evidence[entry_id] = list(findings)
+            # Rows for entries that no longer exist go with them.
+            evidence = {k: v for k, v in evidence.items() if k in self._records}
+            config.atomic_write_text(self.evidence_path, json.dumps(evidence))
+        except (OSError, TypeError, ValueError) as exc:
+            log.warning("could not keep the evidence for %s: %s", entry_id, exc)
+
+    def evidence(self, entry_id: str) -> list | None:
+        """The stored findings behind a held file, or None when none were
+        kept (a record from before evidence was kept, or a failed write)."""
+        found = self._read_evidence().get(entry_id)
+        return found if isinstance(found, list) else None
+
     def get(self, entry_id: str) -> QuarantineRecord | None:
         with self._lock:
             return self._records.get(entry_id)
@@ -238,8 +272,16 @@ class QuarantineStore:
 
     # ---------------------------------------------------------- quarantine
 
-    def quarantine(self, path: Path | str, reasons: list[str] | None = None) -> QuarantineRecord:
-        """Move `path` into the store, masked, and record how to undo it."""
+    def quarantine(self, path: Path | str, reasons: list[str] | None = None,
+                   findings: list[dict] | None = None) -> QuarantineRecord:
+        """Move `path` into the store, masked, and record how to undo it.
+
+        `findings` is the evidence behind the verdict in its stored form
+        (scanner.findings_to_dicts); it is kept in a sidecar beside the index,
+        never on the record, because an older AVGuard reading an index row
+        with a field it does not know drops that row (see _reload_and_merge)
+        and would then save the index without it.
+        """
         source = Path(path).resolve()
 
         if self.protection is not None and self.protection.is_protected(source):
@@ -312,6 +354,7 @@ class QuarantineStore:
                             source.name, exc)
 
         log.warning("quarantined %s (%s)", source, "; ".join(record.reasons) or "no reason given")
+        self._keep_evidence(entry_id, findings)
         return record
 
     # ------------------------------------------------------------- restore

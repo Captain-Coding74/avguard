@@ -616,6 +616,7 @@ class TestTheQuarantineTabButton(TlshCase):
             _banner=lambda text, style="": banners.append((text, style)),
             _refresh_quarantine=lambda: None)
 
+        fake._mark_known_entry = gui.AVGuardApp._mark_known_entry.__get__(fake)   # the button hands over to it
         with mock.patch.object(gui.Querybox, "get_string", return_value="   ") as ask:
             gui.AVGuardApp._mark_known_sample(fake)
         self.assertEqual(ask.call_args.kwargs["initialvalue"], "Fam-Test-File")

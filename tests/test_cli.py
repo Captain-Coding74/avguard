@@ -198,6 +198,60 @@ class TestQuarantineCommands(CliCase):
         self.assertIn("could not restore", output.lower())
 
 
+class TestTheAccount(CliCase):
+    """--explain, --json and --explain-quarantine: the account of a verdict
+    from the console, with the exit codes unchanged."""
+
+    def test_explain_prints_the_account_and_keeps_the_exit_code(self):
+        target = self.marker_file()
+        code, output = self.run_cli("--scan", str(target), "--explain")
+        self.assertEqual(code, 1, output)
+        self.assertIn("an exact byte signature (AVGuard-Selftest-Marker)", output)
+        self.assertIn("Counted: facts 100 + opinions 0 = 100", output)
+        self.assertIn("Nothing was moved. Pass --quarantine", output)
+        self.assertNotIn("%", output)
+        self.assertTrue(target.exists())
+
+    def test_json_is_one_object_per_file_with_the_findings(self):
+        import json
+        target = self.marker_file()
+        (target.parent / "clean.txt").write_text("nothing here", encoding="utf-8")
+        from avguard.__main__ import main
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = main(["--scan", str(target.parent), "--json"])
+        self.assertEqual(code, 1)
+        objects = [json.loads(line) for line in out.getvalue().splitlines()]
+        self.assertEqual(sorted(o["level"] for o in objects), ["clean", "malicious"])
+        bad = next(o for o in objects if o["level"] == "malicious")
+        self.assertEqual(bad["rows"][0]["kind"], "fact")
+        self.assertEqual((bad["tally"]["hard"], bad["tally"]["threshold"]), (100, 100))
+        self.assertEqual(len(bad["sha256"]), 64)
+        self.assertTrue(bad["consistent"])
+        self.assertIn("Examined", err.getvalue(), "the summary went beside the objects, not among them")
+
+    def test_explain_quarantine_reads_the_record_and_its_evidence_without_the_lock(self):
+        target = self.marker_file()
+        code, output = self.run_cli("--scan", str(target), "--quarantine")
+        self.assertEqual(code, 1, output)
+        code, listing = self.run_cli("--list-quarantine")
+        entry_id = listing.strip().split()[0]
+        from avguard.instance import InstanceLock
+        other = InstanceLock()
+        self.assertTrue(other.acquire(), "the test holds the lock as another AVGuard would")
+        try:
+            code, output = self.run_cli("--explain-quarantine", entry_id)
+        finally:
+            other.release()
+        self.assertEqual(code, 0, output)
+        self.assertIn("an exact byte signature (AVGuard-Selftest-Marker)", output)
+        self.assertIn("Quarantined. Restore puts it back", output)
+        self.assertIn("SHA-256:", output)
+        code, output = self.run_cli("--explain-quarantine", "no-such-id")
+        self.assertEqual(code, 1)
+        self.assertIn("no quarantined file", output)
+
+
 class TestRuleCommands(CliCase):
 
     def test_reload_rules_exits_zero_and_names_the_files(self):
