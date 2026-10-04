@@ -1122,12 +1122,18 @@ Numbers that moved were re-measured: the fixture's database is 118,784
 bytes after thirty snapshots (was 114,688; the ServiceDll in `extra`),
 20,480 after one; tests 668 -> 695, both suites green. "A dozen times a
 month" is gone from the README, the docstrings and this file until the
-fortnight counts it. The runner's figures above (898 entries, 687
-services) will move with the skipped instances and the implied drivers;
-the next run's printout is the record, and that test now asserts no
-collector failed and no task was unreadable instead of printing it. Not
-changed: whether the quiet rule is enough is still the owner's fourteen
-days.
+fortnight counts it. On the Windows runner (run #58; the test now asserts
+that no collector failed and no task was unreadable, instead of printing
+it): 901 entries in one snapshot, of them 689 services and drivers in
+67 ms (a net two more than run #56, after the implied driver keys were
+added and the per-logon instances dropped), 209 scheduled tasks in 297 ms
+(the Performance Monitor task now among them), 2 Run values and 1 Startup
+file in 1 ms each; no collector note; two snapshots seconds apart differed
+in nothing; the database was 917,504 bytes after the two, and the
+fixture's 122,880 after thirty there against 118,784 here, the file
+systems allocating pages differently. 695 tests, 17 skipped, in 208 s on
+the runner. Not changed: whether the quiet rule is enough is still the
+owner's fourteen days.
 
 ## Deliberately not doing
 
