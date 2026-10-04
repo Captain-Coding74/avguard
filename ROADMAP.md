@@ -1135,6 +1135,34 @@ systems allocating pages differently. 695 tests, 17 skipped, in 208 s on
 the runner. Not changed: whether the quiet rule is enough is still the
 owner's fourteen days.
 
+**The baseline store, the same three gaps, 2026-10-04.** The startup
+snapshot's review named three defects in `fim.py` as "the same shape,
+outside this change"; they are inside it now. A key that cannot be
+unprotected raised out of `baseline()` and `accept()` after the rows were
+written, so the documented way out of key-unreadable, baselining again,
+was itself broken: `baseline()` now replaces a key it cannot read and
+says so (`BaselineReport.key_replaced`, one line from `--fim-baseline`),
+because a baseline is "record what is here now" and the key belongs with
+the old one; `accept()` keeps the rows and returns "not signed; baseline
+again to replace it" instead of a traceback. The window and the daily
+check shared the database and the signature with nothing between them, so
+a check landing in the milliseconds between a baseline's commit and its
+signature would have recorded a false tamper event: `FileLock`, the OS
+lock the snapshot store took, now lives in `fim.py` and both stores use
+it; a writer holds it for its write and signature, a check for its
+signature check and row read only (the hashing holds nothing), and the
+one that cannot get it within five seconds says "in use" and does
+nothing. `--fim-*` configured no log, so a check failing under pythonw
+left no trace; it configures one, as the window does. Four tests: the key
+replaced once and only when it had to be, the acceptance kept and said
+unsigned, the lock refusing a second writer and a check and letting the
+next one through, the console verbs configuring the log. Tests 695 ->
+699, both suites green. The snapshot store keeps its unattended rule
+(recorded unsigned, reported) and `--autoruns-status` now names the
+folder to move away to start again. Not measured: the race itself, which
+the reviewer replayed by hand on the snapshot store and which the lock
+makes impossible rather than rare.
+
 ## Deliberately not doing
 
 The paste guard (above) is the one input that is not a file; it watches a user-mode clipboard buffer through documented calls, with no driver, no hook and no process telemetry, so it does not reopen the first decision here. The EDR-shaped extensions of it are refused by name: no keyboard hook to see Win+R, no automation of the Run dialog, no watching what the user then runs.

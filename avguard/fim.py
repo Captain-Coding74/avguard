@@ -57,6 +57,10 @@ FIM_DIR = config.DATA_DIR / "fim"
 BASELINE_NAME = "baseline.sqlite"
 KEY_NAME = "baseline.key"
 SIGNATURE_NAME = "baseline.hmac"
+LOCK_NAME = "baseline.lock"
+LOCK_WAIT = 5.0                 # seconds a writer or a check waits for the other
+IN_USE = ("the baseline is in use by another AVGuard (the daily check, or a second window); "
+          "try again in a moment")
 KEY_DESCRIPTION = "AVGuard file-integrity baseline key"
 CRYPTPROTECT_UI_FORBIDDEN = 0x01
 
@@ -184,6 +188,7 @@ class BaselineReport:
     errors: list[str] = field(default_factory=list)
     seconds: float = 0.0
     cancelled: bool = False      # stopped early; nothing was written
+    key_replaced: bool = False   # the signing key could not be read and a new one signs this baseline
 
 
 @dataclass
@@ -252,6 +257,55 @@ def _key(path: str | Path) -> str:
 
 # ------------------------------------------------------------------ store
 
+
+class FileLock:
+    """One writer at a time across processes: the window and the daily task
+    share a database and its signature file, and a signature written over
+    another writer's database reads as tampering. An OS lock on a file, so
+    a process that dies releases it; the integrity stores in this module
+    and in autoruns.py both take one."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._handle = None
+
+    def acquire(self, timeout: float = LOCK_WAIT) -> bool:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + timeout
+        handle = open(self.path, "a+b")
+        while True:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self._handle = handle
+                return True
+            except OSError:
+                if time.monotonic() >= deadline:
+                    handle.close()
+                    return False
+                time.sleep(0.1)
+
+    def release(self) -> None:
+        handle, self._handle = self._handle, None
+        if handle is None:
+            return
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        handle.close()
+
 class FimStore:
     """The baseline on disk, and the checks against it."""
 
@@ -282,6 +336,10 @@ class FimStore:
     @property
     def signature_path(self) -> Path:
         return self.directory / SIGNATURE_NAME
+
+    @property
+    def lock_path(self) -> Path:
+        return self.directory / LOCK_NAME
 
     def exists(self) -> bool:
         return self.db_path.is_file()
@@ -394,20 +452,32 @@ class FimStore:
         if not report.roots:
             return report
 
-        with closing(self._connect()) as conn:
-            with conn:
-                # Rows under a root being re-baselined go first, so a file that
-                # vanished since the last baseline is not carried forward.
-                existing = [row[0] for row in conn.execute("SELECT path FROM files")]
-                stale = [p for p in existing
-                         if any(path_within(p, root) for root in report.roots)]
-                conn.executemany("DELETE FROM files WHERE path = ?", ((p,) for p in stale))
-                conn.executemany(
-                    "INSERT OR REPLACE INTO files(path, sha256, size, mtime_ns, baselined_at) "
-                    "VALUES (?, ?, ?, ?, ?)", rows)
-                conn.executemany("INSERT OR REPLACE INTO roots(path, added_at) VALUES (?, ?)",
-                                 ((r, now) for r in report.roots))
-        self._sign()
+        lock = FileLock(self.lock_path)
+        if not lock.acquire(LOCK_WAIT):
+            report.errors.append(IN_USE)
+            report.roots = []
+            report.seconds = time.monotonic() - started
+            return report
+        try:
+            with closing(self._connect()) as conn:
+                with conn:
+                    # Rows under a root being re-baselined go first, so a file that
+                    # vanished since the last baseline is not carried forward.
+                    existing = [row[0] for row in conn.execute("SELECT path FROM files")]
+                    stale = [p for p in existing
+                             if any(path_within(p, root) for root in report.roots)]
+                    conn.executemany("DELETE FROM files WHERE path = ?", ((p,) for p in stale))
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO files(path, sha256, size, mtime_ns, baselined_at) "
+                        "VALUES (?, ?, ?, ?, ?)", rows)
+                    conn.executemany("INSERT OR REPLACE INTO roots(path, added_at) VALUES (?, ?)",
+                                     ((r, now) for r in report.roots))
+            # A baseline is "record what is here now": a key that cannot be
+            # read (another user's, or damaged) goes with the old baseline,
+            # and the documented way out of key-unreadable is this call.
+            report.key_replaced = self._sign(replace_unreadable_key=True)
+        finally:
+            lock.release()
         report.files = len(rows)
         report.seconds = time.monotonic() - started
         log.info("baselined %d file(s) under %d root(s) in %.1fs",
@@ -434,9 +504,17 @@ class FimStore:
         if not self.exists():
             report.integrity = INTEGRITY_NO_BASELINE
             return report
-        report.integrity = self.verify_integrity()
-
+        # The lock covers the signature check and the row read only: the
+        # milliseconds in which a baseline being written by the window and a
+        # check run by the daily task could see each other's half-state. The
+        # hashing that follows holds nothing.
+        lock = FileLock(self.lock_path)
+        if not lock.acquire(LOCK_WAIT):
+            report.errors.append(IN_USE)
+            report.seconds = time.monotonic() - started
+            return report
         try:
+            report.integrity = self.verify_integrity()
             with closing(self._connect()) as conn:
                 rows = conn.execute("SELECT path, sha256, size, mtime_ns FROM files").fetchall()
                 roots = [row[0] for row in conn.execute("SELECT path FROM roots")]
@@ -455,6 +533,8 @@ class FimStore:
                     events.record(integrity)
             log.error("integrity check: the baseline cannot be read (%s)", exc)
             return report
+        finally:
+            lock.release()
 
         known: dict[str, tuple[str, str, int, int]] = {}
         for stored_path, sha, size, mtime_ns in rows:
@@ -557,23 +637,36 @@ class FimStore:
         baseline; a new one is added; a changed one is re-hashed.
         """
         done: list[str] = []
-        with closing(self._connect()) as conn:
-            with conn:
-                for path in paths:
-                    path = Path(os.path.abspath(str(path)))
-                    if path.is_file():
-                        sha, size, mtime_ns = hash_file(path)
-                        conn.execute(
-                            "INSERT OR REPLACE INTO files(path, sha256, size, mtime_ns, "
-                            "baselined_at) VALUES (?, ?, ?, ?, ?)",
-                            (str(path), bytes.fromhex(sha), size, mtime_ns, time.time()))
-                        done.append(f"accepted {path} ({sha[:12]})")
-                    else:
-                        removed = conn.execute("DELETE FROM files WHERE path = ?",
-                                               (str(path),)).rowcount
-                        done.append(f"dropped {path} from the baseline"
-                                    if removed else f"{path}: not in the baseline")
-        self._sign()
+        lock = FileLock(self.lock_path)
+        if not lock.acquire(LOCK_WAIT):
+            return [IN_USE]
+        try:
+            with closing(self._connect()) as conn:
+                with conn:
+                    for path in paths:
+                        path = Path(os.path.abspath(str(path)))
+                        if path.is_file():
+                            sha, size, mtime_ns = hash_file(path)
+                            conn.execute(
+                                "INSERT OR REPLACE INTO files(path, sha256, size, mtime_ns, "
+                                "baselined_at) VALUES (?, ?, ?, ?, ?)",
+                                (str(path), bytes.fromhex(sha), size, mtime_ns, time.time()))
+                            done.append(f"accepted {path} ({sha[:12]})")
+                        else:
+                            removed = conn.execute("DELETE FROM files WHERE path = ?",
+                                                   (str(path),)).rowcount
+                            done.append(f"dropped {path} from the baseline"
+                                        if removed else f"{path}: not in the baseline")
+            try:
+                self._sign()
+            except (OSError, ValueError) as exc:
+                # The rows are in; the signature is not. Said, not raised:
+                # raising here lost the notes and left the user guessing.
+                log.error("accept: the baseline was changed but not signed (%s)", exc)
+                done.append("not signed: the baseline's signing key cannot be read; "
+                            "baseline again to replace it")
+        finally:
+            lock.release()
         return done
 
     # ------------------------------------------------------------ integrity
@@ -589,9 +682,22 @@ class FimStore:
     def _signature(self, key: bytes) -> str:
         return hmac.new(key, self.db_path.read_bytes(), hashlib.sha256).hexdigest()
 
-    def _sign(self) -> None:
-        key = self._load_or_create_key()
+    def _sign(self, replace_unreadable_key: bool = False) -> bool:
+        """Sign the database. With `replace_unreadable_key`, a key that cannot
+        be read is replaced by a fresh one and True is returned; otherwise
+        the error is the caller's."""
+        replaced = False
+        try:
+            key = self._load_or_create_key()
+        except (OSError, ValueError):
+            if not replace_unreadable_key:
+                raise
+            log.warning("the baseline's signing key could not be read; a new one replaces it")
+            self.key_path.unlink(missing_ok=True)
+            key = self._load_or_create_key()
+            replaced = True
         config.atomic_write_text(self.signature_path, self._signature(key))
+        return replaced
 
     def verify_integrity(self) -> str:
         if not self.exists():

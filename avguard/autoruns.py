@@ -680,54 +680,6 @@ def _unique(entries: Iterable[Entry]) -> list[Entry]:
     return list(seen.values())
 
 
-class _Lock:
-    """One snapshot at a time across processes: the window and the daily
-    task share the database and the signature file, and a signature
-    written over another writer's database reads as tampering. An OS lock
-    on a file, so a process that dies releases it."""
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self._handle = None
-
-    def acquire(self, timeout: float = LOCK_WAIT) -> bool:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        deadline = time.monotonic() + timeout
-        handle = open(self.path, "a+b")
-        while True:
-            try:
-                if sys.platform == "win32":
-                    import msvcrt
-                    handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                self._handle = handle
-                return True
-            except OSError:
-                if time.monotonic() >= deadline:
-                    handle.close()
-                    return False
-                time.sleep(0.1)
-
-    def release(self) -> None:
-        handle, self._handle = self._handle, None
-        if handle is None:
-            return
-        try:
-            if sys.platform == "win32":
-                import msvcrt
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except OSError:
-            pass
-        handle.close()
-
-
 class AutorunsStore:
     """The snapshots on disk, signed like the file-integrity baseline."""
 
@@ -852,7 +804,7 @@ class AutorunsStore:
         if not collected.entries:
             report.errors.append("nothing was collected; the snapshot was not recorded")
             return report
-        lock = _Lock(self.directory / LOCK_NAME)
+        lock = fim.FileLock(self.directory / LOCK_NAME)
         if not lock.acquire(LOCK_WAIT):
             report.errors.append("another snapshot is being taken; this one was not recorded")
             return report

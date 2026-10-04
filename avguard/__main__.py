@@ -325,6 +325,9 @@ def _fim_command(args) -> int:
     """Integrity monitoring from a terminal. Reports; never moves a file."""
     from datetime import datetime
     from .events import EventStore
+    # The daily check runs this under pythonw, which has no stderr: what went
+    # wrong has to reach the log file, as the window's check does.
+    logsetup.configure(level=logging.DEBUG if args.verbose else logging.INFO)
     cfg = config.Config.load()
     store = fim.FimStore(excluded_globs=cfg.excluded_globs)
 
@@ -341,6 +344,8 @@ def _fim_command(args) -> int:
               f"{len(report.roots)} root(s) in {report.seconds:.1f}s:")
         for root in report.roots:
             print(f"    {root}")
+        if report.key_replaced:
+            print("The signing key could not be read and was replaced; this baseline is signed with a new one.")
         print("The baseline is signed. Check it with:  python -m avguard --fim-check")
         return 0
 
@@ -572,6 +577,8 @@ def _autoruns_command(args) -> int:
         return 0
     ok, text = autoruns.summarize(store)
     print(("OK   " if ok else "BAD  ") + text)
+    if not ok:
+        print(f"To start again, move this folder away and take a new snapshot:  {store.directory}")
     if latest is None:
         return 0 if ok else 3          # a file with no snapshot in it: its signature says what it is
     when = datetime.fromtimestamp(latest.taken_at).strftime("%Y-%m-%d %H:%M")

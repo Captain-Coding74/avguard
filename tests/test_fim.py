@@ -183,6 +183,48 @@ class TestTheBaselineIsATarget(FimCase):
         self.store.key_path.write_bytes(b"not a protected key")
         self.assertEqual(self.store.check().integrity, fim.INTEGRITY_KEY_UNREADABLE)
 
+    def test_a_baseline_over_an_unreadable_key_replaces_it_and_says_so(self):
+        self.baseline()
+        self.store.key_path.write_bytes(b"not a protected key")
+        self.assertEqual(self.store.verify_integrity(), fim.INTEGRITY_KEY_UNREADABLE)
+        report = self.store.baseline([self.tree])
+        self.assertTrue(report.key_replaced, "a baseline is 'record what is here now'; the key goes with it")
+        self.assertEqual(report.files, 7)
+        self.assertEqual(self.store.verify_integrity(), fim.INTEGRITY_OK)
+        self.assertNotEqual(self.store.key_path.read_bytes(), b"not a protected key")
+        self.assertFalse(self.store.baseline([self.tree]).key_replaced, "and only when it had to be")
+
+    def test_accepting_with_an_unreadable_key_keeps_the_rows_and_says_not_signed(self):
+        self.baseline()
+        self.store.key_path.write_bytes(b"not a protected key")
+        (self.tree / "f1.txt").write_bytes(b"changed")
+        notes = self.store.accept([self.tree / "f1.txt"])
+        self.assertTrue(any("accepted" in n for n in notes), notes)
+        self.assertTrue(any("not signed" in n for n in notes), notes)
+        report = self.store.check()
+        self.assertEqual(report.integrity, fim.INTEGRITY_KEY_UNREADABLE)
+        self.assertEqual(report.changes, [], "the acceptance itself was recorded")
+
+    def test_one_writer_at_a_time_and_a_check_waits_for_it(self):
+        self.baseline()
+        signature = self.store.signature_path.read_text(encoding="utf-8")
+        other = fim.FileLock(self.store.lock_path)
+        self.assertTrue(other.acquire(0.1))
+        self.addCleanup(other.release)
+        self.addCleanup(setattr, fim, "LOCK_WAIT", fim.LOCK_WAIT)
+        fim.LOCK_WAIT = 0.3
+        (self.tree / "f2.txt").write_bytes(b"changed")
+        report = self.store.baseline([self.tree])
+        self.assertEqual(report.roots, [])
+        self.assertTrue(any("in use" in e for e in report.errors), report.errors)
+        self.assertEqual(self.store.signature_path.read_text(encoding="utf-8"), signature, "nothing was written")
+        self.assertTrue(any("in use" in n for n in self.store.accept([self.tree / "f2.txt"])))
+        check = self.store.check()
+        self.assertEqual((check.examined, check.changes), (0, []))
+        self.assertTrue(any("in use" in e for e in check.errors), check.errors)
+        other.release()
+        self.assertEqual([c.kind for c in self.store.check().changes], ["modified"])
+
     def test_every_legitimate_write_re_signs(self):
         self.baseline()
         first = self.store.signature_path.read_text(encoding="utf-8")
@@ -287,6 +329,14 @@ class TestBaselineUpkeep(FimCase):
 # ------------------------------------------------------------------- CLI
 
 class TestTheCommandLine(FimCase):
+    def test_the_console_verbs_configure_the_log_for_the_daily_task(self):
+        """Under pythonw there is no stderr; a check that fails there must
+        reach avguard.log, which only configure() arranges."""
+        import avguard.__main__ as cli
+        with mock.patch.object(cli.logsetup, "configure") as configure:
+            self._cli("--fim-status")
+        configure.assert_called_once()
+
     def _cli(self, *args: str) -> tuple[int, str]:
         import avguard.__main__ as cli
         out, err = io.StringIO(), io.StringIO()

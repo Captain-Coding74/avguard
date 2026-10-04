@@ -25,7 +25,7 @@ if _os.environ["AVGUARD_DATA"] == _test_data:
     import shutil as _shutil
     _atexit.register(lambda: _shutil.rmtree(_test_data, ignore_errors=True))
 
-from avguard import autoruns
+from avguard import autoruns, fim
 from avguard.autoruns import Entry, diff
 from avguard.events import EventStore
 
@@ -617,7 +617,7 @@ class TestTheStore(AutorunsCase):
 
     def test_one_snapshot_at_a_time(self):
         self.store.snapshot(self.collect())
-        other = autoruns._Lock(self.store.directory / autoruns.LOCK_NAME)
+        other = fim.FileLock(self.store.directory / autoruns.LOCK_NAME)
         self.assertTrue(other.acquire(0.1))
         self.addCleanup(other.release)
         self.addCleanup(setattr, autoruns, "LOCK_WAIT", autoruns.LOCK_WAIT)
