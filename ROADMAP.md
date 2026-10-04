@@ -1015,14 +1015,20 @@ nothing at all was collected, because an empty snapshot would report every
 entry as gone the next day; a collector that fails is noted and the others
 still run.
 
-Measured here (Linux, the fakes): a snapshot database of 20,480 bytes
-after one snapshot of 8 entries and 114,688 bytes after thirty, the
-collectors and the diff in well under a millisecond on the fixture, so the
-real cost is the registry walk and `schtasks`, which only the Windows
-runner can time; its per-collector table (counts and milliseconds), its
-database size after two snapshots of a real machine's entries, and whether
-two snapshots seconds apart agree are printed by the runner's test and
-belong in the next paragraph of this entry. Tests 640 -> 667: the
+Measured on the Windows runner (run #56, printed by the runner's own
+test): 898 entries in one snapshot, of them 687 services and drivers in
+54 ms, 208 scheduled tasks in 323 ms (`schtasks` is the whole cost), 2 Run
+values in 28 ms and 1 Startup file in 1 ms; two snapshots seconds apart
+differed in nothing; the database was 843,776 bytes after the two. The
+same run found the first defect: one task, Server Manager Performance
+Monitor, came back "unreadable XML (unclosed CDATA section)", because the
+splitter cut each task at the first `</Task>` and that task's CDATA holds
+a data-collector definition with a `<Task></Task>` of its own; the blocks
+are now cut at the comments `schtasks` writes before each task, and a
+fixture with that CDATA is in the tests. Here on Linux, against the fakes:
+a database of 20,480 bytes after one snapshot of 8 entries and 114,688
+after thirty; the collectors and the diff in well under a millisecond on
+the fixture. Tests 640 -> 668: the
 collectors against the fake in both registry views with the disabled flag,
 services and drivers with the start and type words, the Startup folders
 with the hash and the skipped desktop.ini, the tasks from the fixture with

@@ -238,6 +238,28 @@ class TestTheCollectors(AutorunsCase):
         changed = autoruns.parse_tasks(text.replace("upd.exe</Command>", "upd2.exe</Command>"))
         self.assertEqual([(c.kind, c.entry.name) for c in diff(before, changed)], [("modified", "Updater")])
 
+    def test_a_task_whose_cdata_holds_a_task_element_is_still_read(self):
+        """The Windows runner's Performance Monitor task: its ComHandler Data is
+        a data-collector definition in CDATA with <Task></Task> inside, and a
+        splitter that cut at the first </Task> reported it unreadable."""
+        text = FIXTURE.read_text(encoding="utf-8")
+        pla = ('<!-- ' + BS + 'Microsoft' + BS + 'Windows' + BS + 'PLA' + BS + 'Server Manager Performance Monitor -->\n'
+               '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+               '<Settings><Enabled>true</Enabled></Settings>'
+               '<Actions><ComHandler><ClassId>{abc}</ClassId><Data><![CDATA[<DataCollectorSet>'
+               '<Task></Task><TaskArguments>-x</TaskArguments></DataCollectorSet>]]></Data></ComHandler></Actions>'
+               '</Task>\n')
+        errors: list[str] = []
+        entries = autoruns.parse_tasks(text.replace("</Tasks>", pla + "</Tasks>"), errors)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(entries), 3)
+        pla_entry = next(e for e in entries if e.name == "Server Manager Performance Monitor")
+        self.assertTrue(pla_entry.value.startswith("COM {abc}"))
+        self.assertIn("<Task></Task>", pla_entry.value, "the data is kept as the action's text")
+        broken = autoruns.parse_tasks(text.replace("</Settings>", "</Setting>", 1), errors)
+        self.assertEqual(len(broken), 1)
+        self.assertTrue(any("unreadable XML" in e for e in errors))
+
     def test_console_output_is_decoded_whatever_its_encoding(self):
         text = FIXTURE.read_text(encoding="utf-8")
         for encoding in ("utf-16", "utf-8-sig", "utf-8", "cp1252"):

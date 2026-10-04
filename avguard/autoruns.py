@@ -80,7 +80,12 @@ SERVICE_TYPE = {1: "kernel driver", 2: "file system driver", 16: "own process", 
                 80: "user service", 96: "user service", 272: "own process, interactive",
                 288: "shared process, interactive"}
 TASK_NS = "{http://schemas.microsoft.com/windows/2004/02/mit/task}"
-_TASK_BLOCKS = re.compile(r"<!--\s*(\\[^>]*?)\s*-->\s*(<Task\b.*?</Task>)", re.S)
+# schtasks writes a comment naming each task before its XML. The blocks are
+# cut at those comments, not at "</Task>": a Performance Monitor task's
+# CDATA holds a data-collector definition with its own <Task></Task>
+# inside, and cutting at the first "</Task>" left the Windows runner with an
+# "unclosed CDATA section" for it.
+_TASK_NAMES = re.compile(r"<!--\s*(\\[^>]*?)\s*-->")
 
 _NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
@@ -435,10 +440,17 @@ def parse_tasks(xml_text: str, errors: list[str] | None = None) -> list[Entry]:
     the triggers and the run level. Not counted: author, date, description."""
     errors = errors if errors is not None else []
     entries: list[Entry] = []
-    for found in _TASK_BLOCKS.finditer(xml_text):
-        full_name, block = found.group(1).strip(), found.group(2)
+    pieces = _TASK_NAMES.split(xml_text)
+    # pieces: [before the first comment, name, block, name, block, ...]
+    for full_name, block in zip(pieces[1::2], pieces[2::2]):
+        full_name = full_name.strip()
+        block = block.split("</Tasks>", 1)[0].strip()
+        start = block.find("<Task")
+        if start < 0:
+            errors.append(f"task {full_name}: no XML followed its name")
+            continue
         try:
-            task = ET.fromstring(block)
+            task = ET.fromstring(block[start:])
         except ET.ParseError as exc:
             errors.append(f"task {full_name}: unreadable XML ({exc})")
             continue
