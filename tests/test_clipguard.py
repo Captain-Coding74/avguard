@@ -743,7 +743,9 @@ class TestTheRealClipboard(unittest.TestCase):
         kernel32.GlobalLock.restype = wt.LPVOID
         kernel32.GlobalUnlock.argtypes = [wt.HGLOBAL]
         kernel32.GlobalUnlock.restype = wt.BOOL
-        text = "avguard clipboard self-test \u2713 " + WARN_LINE
+        # The command first: a prefix would put the launcher outside command
+        # position, which is the rule, and the guard would rightly say nothing.
+        text = WARN_LINE + " avguard clipboard self-test \u2713"
         data = text.encode("utf-16-le") + b"\0\0"
         source = clipguard.WindowsClipboard()
         before = source.sequence()
