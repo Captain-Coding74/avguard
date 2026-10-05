@@ -1203,10 +1203,12 @@ miss; over a 167-file corpus (this repository's own files, a quarter of
 them renamed .exe so the gated path runs, 1.5 MB, the cache off, best of
 three) the whole provenance pass costs 47 us per file (929 against 882);
 hashing and remembering the 50 members of a marked 10 MB archive adds
-29 ms to a 156 ms scan. Not measured here: the real stream, which the
-Windows runner's run of the same tests exercises (the timing test prints
-its numbers there too), and the owner's real Downloads zips. Tests 699 ->
-719, both suites green.
+29 ms to a 156 ms scan. On the Windows runner (run #61), where the
+stream is real: `read_zone` 58 us per marked file and 16 us per unmarked
+one, 1,000 of each, warm; a store lookup 4 us per miss; the quarantine
+round trip there reads the zone back off the restored and the exported
+file. Not measured: the owner's real Downloads zips. Tests 699 -> 719,
+both suites green here and 719 in 191 s on the runner.
 
 ## Deliberately not doing
 
