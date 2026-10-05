@@ -118,6 +118,51 @@ class TestTheMark(ProvenanceCase):
             self.assertFalse(Path(provenance.stream_path(target)).exists(), "no stray file off Windows")
             self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), ["restored.exe"])
 
+    def test_a_cut_stream_does_not_read_a_username_as_the_host(self):
+        """A referrer long enough to push HostUrl past the read limit left
+        the cut line parsed as a whole one, and urlsplit read the username
+        of "https://alice.smith:pw@..." as the host."""
+        limit = provenance.MAX_STREAM_BYTES
+        head = "[ZoneTransfer]\r\nZoneId=3\r\n"
+        referrer_start = "ReferrerUrl=https://r.example.test/"
+        referrer = referrer_start + "a" * (limit - 30 - len(head) - len(referrer_start) - 2) + "\r\n"
+        hosturl = "HostUrl=https://alice.smith:pw-hunter2@downloads.example.test/x\r\n"
+        self.assertEqual(len(head) + len(referrer), limit - 30, "the cut lands inside the password")
+        path = self.write("cut.exe", exe_bytes("cut"))
+        with open(provenance.stream_path(path), "w", newline="") as handle:
+            handle.write(head + referrer + hosturl)
+        zone = read_zone(path)
+        self.assertEqual(zone, Zone(3, "", "r.example.test"))
+        self.assertNotIn("alice", repr(zone))
+
+    def test_hosts_are_hosts(self):
+        from avguard.provenance import host_of
+        self.assertEqual(host_of("https://user:p@ss@Host.Example/x?y"), "host.example")
+        self.assertEqual(host_of("https://[2001:db8::1]/"), "2001:db8::1")
+        self.assertEqual(host_of("https://b\u00fccher.example/"), "b\u00fccher.example")
+        for bad in ("https://ho\x00st.example/", "https://ho\x1bst.example/", "https://ho st.example/",
+                    "https://ex%61mple.test/", "https://" + "a" * 300 + ".test/", "about:internet",
+                    "file:///C:/x.zip", "data:text/plain,hi", "not a url", ""):
+            with self.subTest(url=bad):
+                self.assertEqual(host_of(bad), "")
+
+    def test_the_first_block_and_the_first_zone_id_count(self):
+        self.assertEqual(parse_zone("[ZoneTransfer]\r\nZoneId=3\r\nHostUrl=https://a.test/x\u2028ZoneId=0\r\n"),
+                         Zone(3, "a.test"), "a Unicode separator inside a URL is not a line break")
+        self.assertEqual(parse_zone("[ZoneTransfer]\r\nZoneId=3\r\nZoneId=0\r\n").zone_id, 3)
+        self.assertEqual(parse_zone("[ZoneTransfer]\r\nZoneId=3\r\n[ZoneTransfer]\r\nZoneId=0\r\n").zone_id, 3)
+        self.assertEqual(parse_zone("[ZoneTransfer]\r\nZoneId=3\r\n[Other]\r\nHostUrl=https://b.test/\r\n").host, "")
+        self.assertIsNone(parse_zone("[ZoneTransfer]\r\nZoneId=99\r\n"), "not a zone Windows has")
+        self.assertIsNone(parse_zone("[ZoneTransfer]\r\nZoneId=-1\r\n"))
+
+    @unittest.skipIf(WINDOWS, "a stream cannot be a FIFO")
+    def test_a_fifo_beside_the_file_does_not_block(self):
+        path = self.write("fifo.exe", exe_bytes("fifo"))
+        _os.mkfifo(provenance.stream_path(path))
+        started = time.monotonic()
+        self.assertIsNone(read_zone(path))
+        self.assertLess(time.monotonic() - started, 2.0)
+
     def test_timings_are_printed(self):
         folder = self.tmp / "many"
         folder.mkdir()
@@ -250,18 +295,76 @@ class TestTheScannerSaysWhereAFileCameFrom(ProvenanceCase):
         self.assertIs(said.level, Level.CLEAN)
         found = self.provenance_of(said)
         self.assertEqual([(f.name, f.weight, f.hard) for f in found], [("extracted", 0, False)])
-        self.assertIn("extracted from app.zip (downloaded from " + HOST + ")", found[0].detail)
-        self.assertIn("carries no download mark", found[0].detail)
+        self.assertIn("has the bytes of tool.exe from app.zip (downloaded from " + HOST + ")", found[0].detail)
+        self.assertIn("carries no download mark, so SmartScreen will not ask", found[0].detail)
         self.assertEqual(decide(said.findings, self.cfg.quarantine_threshold), Level.CLEAN)
         self.assertIsNotNone(provenance.extracted_finding(said.findings))
         replay = self.scanner.scan(extracted)
         self.assertEqual(len(self.provenance_of(replay)), 1, "and on the replay")
 
         document = self.write("Extracted" + _os.sep + "macro.docm", b"PK\x03\x04 a document")
-        self.assertEqual([f.name for f in self.provenance_of(self.scanner.scan(document))], ["extracted"],
+        said_of_document = self.provenance_of(self.scanner.scan(document))
+        self.assertEqual([f.name for f in said_of_document], ["extracted"],
                          "a document Protected View would have gated counts too")
+        self.assertIn("Office will not open it in Protected View", said_of_document[0].detail)
+        self.assertNotIn("SmartScreen", said_of_document[0].detail, "a document is opened, not run")
         text = self.write("Extracted" + _os.sep + "readme.txt", b"read me")
         self.assertEqual(self.provenance_of(self.scanner.scan(text)), [], "nothing gates a text file")
+
+    def test_the_note_follows_the_store_not_the_cache(self):
+        """Walk order is arbitrary: the program may be scanned before its
+        archive. The note is computed live on every scan, replay included,
+        and never stored in the cache."""
+        tool = exe_bytes("order")
+        extracted = self.write("Extracted" + _os.sep + "tool.exe", tool)
+        self.assertEqual(self.provenance_of(self.scanner.scan(extracted)), [], "the archive is not known yet")
+        self.archive("app.zip", {"tool.exe": tool})
+        self.scanner.scan(self.tmp / "Downloads" / "app.zip")
+        replay = self.scanner.scan(extracted)
+        self.assertIsNone(replay.facts, "a cache replay")
+        self.assertEqual([f.name for f in self.provenance_of(replay)], ["extracted"], "and it knows now")
+        stat = extracted.stat()
+        cached = self.cache.get(extracted, stat.st_size, stat.st_mtime_ns)
+        self.assertEqual([f for f in cached["findings"] if f.get("source") == "provenance"], [],
+                         "the cache keeps the conclusion only")
+        with self.store._conn() as conn:
+            conn.execute("DELETE FROM members")
+        self.assertEqual(self.provenance_of(self.scanner.scan(extracted)), [], "forgotten in the store, gone from the replay")
+
+    def test_a_cached_archive_marked_later_is_read_again(self):
+        tool = exe_bytes("later")
+        archive = self.archive("later.zip", {"tool.exe": tool}, marked=False)
+        self.scanner.scan(archive)
+        self.assertEqual(self.store.count(), 0)
+        mark(archive)
+        replay = self.scanner.scan(archive)
+        self.assertIsNotNone(replay.facts, "read afresh: the mark is new and nothing of it is remembered")
+        self.assertEqual(self.store.count(), 1)
+        self.assertIsNone(self.scanner.scan(archive).facts, "known now; the next one replays")
+
+    def test_installed_copies_are_not_said_to_be_extracted(self):
+        """The bytes match; whether they were extracted or installed is not
+        known, so nothing under Program Files or the Windows folder is said."""
+        program_files = self.tmp / "Program Files"
+        self.addCleanup(_os.environ.pop, "ProgramFiles", None)
+        _os.environ["ProgramFiles"] = str(program_files)
+        tool = exe_bytes("vcruntime")
+        self.archive("tool.zip", {"vcruntime140.dll": tool, "tool.exe": tool})
+        self.scanner.scan(self.tmp / "Downloads" / "tool.zip")
+        installed = self.write("Program Files" + _os.sep + "Vendor" + _os.sep + "tool.exe", tool)
+        self.assertEqual(self.provenance_of(self.scanner.scan(installed)), [])
+        desktop = self.write("Desktop" + _os.sep + "tool.exe", tool)
+        self.assertEqual([f.name for f in self.provenance_of(self.scanner.scan(desktop))], ["extracted"])
+        self.assertTrue(provenance.is_installed("C:" + "\\" + "Windows" + "\\" + "System32" + "\\" + "x.exe"))
+
+    def test_an_extracted_copy_marked_from_this_computer_is_still_said(self):
+        tool = exe_bytes("zone0")
+        self.archive("zone0.zip", {"tool.exe": tool})
+        self.scanner.scan(self.tmp / "Downloads" / "zone0.zip")
+        extracted = self.write("Extracted" + _os.sep + "tool.exe", tool)
+        mark(extracted, zone_id=0, host_url=None)
+        self.assertEqual([f.name for f in self.provenance_of(self.scanner.scan(extracted))], ["extracted"],
+                         "a zone SmartScreen does not ask about is no mark in its sense")
 
     def test_an_extracted_file_that_kept_its_mark_is_not_said_twice(self):
         tool = exe_bytes("kept")
@@ -309,14 +412,40 @@ class TestTheStore(ProvenanceCase):
         self.store.remember([(f"{i:064x}", f"m{i}.exe") for i in range(5)], "C:/x/big.zip", HOST)
         self.assertEqual(self.store.count(), 3, "the newest rows are the ones kept")
 
-    def test_a_broken_database_never_reaches_a_scan(self):
+    def test_a_broken_database_never_reaches_a_scan_and_is_opened_once(self):
+        import sqlite3
+        from unittest import mock
         path = self.tmp / "broken.sqlite"
         path.write_bytes(b"not a database" * 50)
         store = ProvenanceStore(path)
         self.addCleanup(store.close)
+        with mock.patch.object(sqlite3, "connect", wraps=sqlite3.connect) as connect:
+            for _ in range(5):
+                self.assertIsNone(store.lookup("ab" * 32))
+            self.assertEqual(store.remember([("ab" * 32, "a.exe")], "x.zip", HOST), 0)
+            self.assertEqual(store.count(), 0)
+            store.mark_told("ab" * 32)
+        self.assertEqual(connect.call_count, 1, "given up on, not opened again for every file")
+
+    def test_a_store_whose_folder_cannot_be_made_never_raises(self):
+        blocker = self.tmp / "notadir"
+        blocker.write_bytes(b"a file where a folder should be")
+        store = ProvenanceStore(blocker / "provenance.sqlite")
         self.assertIsNone(store.lookup("ab" * 32))
         self.assertEqual(store.remember([("ab" * 32, "a.exe")], "x.zip", HOST), 0)
         self.assertEqual(store.count(), 0)
+        store.mark_told("ab" * 32)
+        self.assertTrue(store.touch_container("x.zip"), "unknown is not 'none remembered'")
+
+    def test_a_row_older_than_ninety_days_is_forgotten_on_read(self):
+        self.store.remember([("ab" * 32, "old.exe")], "C:/x/old.zip", HOST)
+        with self.store._conn() as conn:
+            conn.execute("UPDATE members SET seen = ?", (time.time() - 100 * 86400,))
+        self.assertIsNone(self.store.lookup("ab" * 32), "ninety days means ninety days, whoever asks")
+        self.assertEqual(self.store.count(), 1, "the sweep itself happens on the next write")
+        self.assertTrue(self.store.touch_container("C:/x/old.zip"), "an archive seen again is current again")
+        self.assertIsNotNone(self.store.lookup("ab" * 32))
+        self.assertFalse(self.store.touch_container("C:/x/unknown.zip"))
 
 
 # ------------------------------------------------------------ the quarantine
@@ -358,6 +487,16 @@ class TestTheQuarantineKeepsTheMark(ProvenanceCase):
         self.assertTrue(self.marked_after(restored), "a restored download is still a download")
         self.assertIsNone(self.quarantine.evidence(record.entry_id))
 
+    def test_a_bare_list_of_findings_as_evidence_does_not_raise_after_the_move(self):
+        target = self.write("Downloads" + _os.sep + "bad2.exe", SELFTEST_MARKER)
+        mark(target, 3)
+        record = self.quarantine.quarantine(target, ["test"], evidence=[{"source": "signature", "name": "x",
+                                                                          "weight": 100, "hard": True}])
+        kept = self.quarantine.evidence(record.entry_id)
+        self.assertEqual(kept["zone"], 3)
+        self.assertEqual(kept["findings"][0]["source"], "signature")
+        self.assertFalse(target.exists())
+
     def test_a_file_without_a_mark_is_restored_without_one(self):
         target = self.write("local.exe", SELFTEST_MARKER)
         record = self.quarantine.quarantine(target, ["test"])
@@ -366,6 +505,39 @@ class TestTheQuarantineKeepsTheMark(ProvenanceCase):
         self.assertFalse(self.marked_after(restored))
         if WINDOWS:
             self.assertIsNone(read_zone(restored))
+
+
+# -------------------------------------------------------------- the account
+
+class TestTheHistoryRowHasAnAccount(ProvenanceCase):
+    def test_a_provenance_event_opens_into_the_row_that_says_where_the_bytes_came_from(self):
+        from avguard import explain
+        from avguard.events import Event
+        from avguard.scanner import findings_to_dicts
+        self.store.remember([("ab" * 32, "app.zip!tool.exe")], "C:/Users/me/Downloads/app.zip", HOST)
+        finding = Finding("provenance", "extracted", 0, self.store.lookup("ab" * 32).describe())
+        event = Event(kind="provenance", path="C:/Users/me/Desktop/tool.exe", level="clean",
+                      reasons=[finding.describe()],
+                      detail={"sha256": "ab" * 32, "container": "C:/Users/me/Downloads/app.zip", "host": HOST,
+                              "findings": findings_to_dicts([finding])})
+        self.assertTrue(explain.is_verdict_event(event), "double-click opens it")
+        account = explain.from_event(event, config.Config(cloud_enabled=False))
+        self.assertEqual([(r.kind, r.weight) for r in account.rows], [("fact", 0)])
+        self.assertIn("the download mark on the archive whose member has these bytes", account.rows[0].words)
+        self.assertIn("has the bytes of tool.exe from app.zip", account.rows[0].text)
+        self.assertTrue(account.consistent)
+        self.assertNotIn("rule's author", explain.render_text(account))
+
+    def test_a_percent_in_a_name_is_not_a_confidence_figure(self):
+        from avguard import explain
+        finding = Finding("provenance", "extracted", 0, "has the bytes of 100%.exe from Sale 50% off.zip",
+                          notes=("the archive: C:/Users/me/Downloads/Sale 50% off.zip",))
+        account = explain.explain("x.exe", "clean", [finding.describe()], [finding],
+                                  config.Config(cloud_enabled=False))
+        self.assertIn("the archive: C:/Users/me/Downloads/Sale 50% off.zip", account.rows[0].notes)
+        yara = Finding("yara", "r", 50, "d", notes=("95% confident",))
+        account = explain.explain("x.exe", "suspicious", [yara.describe()], [yara], config.Config(cloud_enabled=False))
+        self.assertNotIn("95% confident", account.rows[0].notes, "a rule author's figure is still left out")
 
 
 # ---------------------------------------------------------------- the window
@@ -380,12 +552,18 @@ class TestTheWindowSaysItOnce(ProvenanceCase):
         except ImportError:
             self.skipTest("GUI dependencies are not installed")
         self.gui = gui
-        self.events = EventStore(path=self.tmp / "events.jsonl")
+        self.forwarded: list = []
+
+        class AnyForwarder:                  # records whatever method the store would call
+            def __getattr__(inner, name):
+                return lambda *args, **kwargs: self.forwarded.append((name, args))
+        self.events = EventStore(path=self.tmp / "events.jsonl", forwarder=AnyForwarder())
         self.banners: list[str] = []
         self.posted: list = []
         self.app = SimpleNamespace(
             events=self.events, scanner=SimpleNamespace(provenance=self.store),
             _provenance_banners=set(), _banner=lambda text, style="": self.banners.append(text),
+            _scan_active=False, _banner_is_loud=lambda: False,
             post=lambda fn, *args: self.posted.append((fn, args)), _report_extracted="extracted-handler")
 
     def verdict(self, name: str, seed: str, container: str) -> Verdict:
@@ -403,11 +581,13 @@ class TestTheWindowSaysItOnce(ProvenanceCase):
         report(self.app, first)
         self.assertEqual(len(self.events.read(kinds={"provenance"})), 1, "told once")
         self.assertEqual(len(self.banners), 1)
-        self.assertIn("extracted from app.zip", self.banners[0])
+        self.assertIn("has the bytes of tool.exe from app.zip", self.banners[0])
         self.assertIn(HOST, self.banners[0])
         event = self.events.read(kinds={"provenance"})[0]
         self.assertEqual((event.level, event.detail["host"], event.detail["container"]),
-                         ("extracted", HOST, "C:/Users/me/Downloads/app.zip"))
+                         ("clean", HOST, "C:/Users/me/Downloads/app.zip"))
+        self.assertEqual(event.detail["findings"][0]["name"], "extracted", "History can open an account for it")
+        self.assertEqual(self.forwarded, [], "a clean file's row stays on this machine")
         second = self.verdict("helper.exe", "two", "C:/Users/me/Downloads/app.zip")
         report(self.app, second)
         self.assertEqual(len(self.events.read(kinds={"provenance"})), 2, "a row for each file")
@@ -419,6 +599,23 @@ class TestTheWindowSaysItOnce(ProvenanceCase):
         report(fresh, first)
         self.assertEqual(len(self.events.read(kinds={"provenance"})), 3, "the store remembers it was told")
         self.assertEqual(len(self.banners), 3, "a new session gets its banner again")
+
+    def test_the_banner_waits_for_a_quiet_moment(self):
+        report = self.gui.AVGuardApp._report_extracted
+        verdict = self.verdict("tool.exe", "quiet", "C:/Users/me/Downloads/app.zip")
+        self.app._scan_active = True
+        report(self.app, verdict)
+        self.assertEqual(len(self.events.read(kinds={"provenance"})), 1, "History has it whatever the moment")
+        self.assertEqual(self.banners, [], "the scan summary would replace it unseen")
+        self.assertEqual(self.app._provenance_banners, set(), "not consumed")
+        self.app._scan_active = False
+        self.app._banner_is_loud = lambda: True
+        report(self.app, verdict)
+        self.assertEqual(self.banners, [], "a threat's banner, with its buttons, is not replaced")
+        self.app._banner_is_loud = lambda: False
+        report(self.app, verdict)
+        self.assertEqual(len(self.banners), 1)
+        self.assertEqual(len(self.events.read(kinds={"provenance"})), 1, "still one row")
 
     def test_a_clean_extracted_verdict_is_posted_and_a_plain_clean_one_is_not(self):
         on_verdict = self.gui.AVGuardApp._on_verdict

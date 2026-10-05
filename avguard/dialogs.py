@@ -184,9 +184,10 @@ class SettingsDialog(tb.Toplevel):
                        "and pack, a rule author's note, the counted totals and your "
                        "quarantine threshold); a startup change carries where it is and what "
                        "it is called, its command line with its arguments, old and new, and "
-                       "the account a scheduled task runs as; a downloaded file's evidence "
-                       "names the host it came from and the archive it was extracted from. "
-                       "Paste-guard warnings never leave. Meant for "
+                       "the account a scheduled task runs as; a flagged download's evidence "
+                       "names the host it came from, or the archive whose member has its bytes "
+                       "and that member's name. Paste-guard warnings and the note on a clean "
+                       "file from a download never leave. Meant for "
                        "a Network Watchdog server on your own network. A dead or slow "
                        "endpoint never slows a scan.")
                  ).pack(anchor="w", pady=(6, 0))
@@ -466,10 +467,11 @@ class SettingsDialog(tb.Toplevel):
               "the SHA-256 hash of the file, and the evidence behind the verdict: each "
               "finding's source, weight, severity and pack, a rule author's note, the counted "
               "totals and your quarantine threshold. " + CHR_NL + CHR_NL
-            + "A startup change carries where it is and what it is called, its command line with its arguments, old and new, and the account a scheduled task runs as. For a downloaded file, the host it came from "
-              "and the archive it was extracted from go with the evidence." + CHR_NL + CHR_NL
-            + "The paste guard's warnings stay on this machine and are never sent. Nothing is "
-              "sent while the address is empty.",
+            + "A startup change carries where it is and what it is called, its command line with its arguments, old and new, and the account a scheduled task runs as. For a flagged download, the host it came from, "
+              "or the archive whose member has its bytes and that member's name, go with the "
+              "evidence." + CHR_NL + CHR_NL
+            + "The paste guard's warnings and the note on a clean file from a download stay on "
+              "this machine and are never sent. Nothing is sent while the address is empty.",
             "Forward events?", parent=self) == "Yes"
 
     def _apply_scheduling(self) -> list[str]:

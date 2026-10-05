@@ -8,9 +8,10 @@ path, the verdict, the file's SHA-256 and the evidence behind the verdict
 (each finding's source, weight, severity and pack, a rule author's note, the
 counted totals and the quarantine threshold); a startup change carries where
 it is and what it is called, its command line with its arguments, old and
-new, and the account a scheduled task runs as; a downloaded file's evidence
-names the host it came from and the archive it was extracted from. The paste
-guard's events are recorded with forward=False and never reach this module.
+new, and the account a scheduled task runs as; a flagged download's evidence
+names the host it came from, or the archive whose member has its bytes and
+that member's name. The paste guard's events, and the note on a clean file
+from a download, are recorded with forward=False and never reach this module.
 
 The rule that shapes this module is the GUI pump's: the scan path must not
 be able to see a dead or slow endpoint at all. So `submit()` puts the event

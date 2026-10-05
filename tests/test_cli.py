@@ -164,11 +164,11 @@ class TestScanning(CliCase):
         code, output = self.run_cli("--scan", str(extracted))
         self.assertEqual(code, 0, output)
         self.assertIn("[note]", output)
-        self.assertIn("extracted from app.zip (downloaded from dl.example.test)", output)
+        self.assertIn("has the bytes of tool.exe from app.zip (downloaded from dl.example.test)", output)
         self.assertNotIn("?t=1", output, "the URL appears nowhere")
         code, output = self.run_cli("--scan", str(extracted), "--json")
         self.assertEqual(code, 0, output)
-        self.assertIn('"text": "extracted from app.zip (downloaded from dl.example.test)', output,
+        self.assertIn('"text": "has the bytes of tool.exe from app.zip (downloaded from dl.example.test)', output,
                       "the account object carries the row")
 
     def test_a_missing_path_is_an_error_not_a_crash(self):

@@ -376,8 +376,14 @@ class QuarantineStore:
 
         log.warning("quarantined %s (%s)", source, "; ".join(record.reasons) or "no reason given")
         if zone is not None and zone.marked:
-            evidence = dict(evidence or {})
-            evidence["zone"] = zone.zone_id
+            # Never raises: the file is in the store by now. A bare list of
+            # findings, a form evidence() documents, is wrapped first.
+            try:
+                evidence = ({"findings": list(evidence)} if isinstance(evidence, list)
+                            else dict(evidence or {}))
+                evidence["zone"] = zone.zone_id
+            except (TypeError, ValueError) as exc:
+                log.warning("could not keep the download mark for %s: %s", entry_id, exc)
         self._keep_evidence(entry_id, evidence)
         return record
 

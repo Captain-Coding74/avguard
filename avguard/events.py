@@ -39,8 +39,9 @@ BACKUP_COUNT = 2
 #   forwarder on the wire.
 @dataclass
 class Event:
-    kind: str                     # scan_started | scan_finished | detection |
-                                  # quarantined | restored | deleted | health
+    kind: str                     # scan_started | scan_finished | detection | suspicious |
+                                  # quarantined | restored | deleted | health | fim | autoruns |
+                                  # clipboard | provenance
     at: str = ""
     path: str = ""
     level: str = ""

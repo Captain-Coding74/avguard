@@ -148,7 +148,9 @@ is nothing else to put back), and the "downloaded from" row is added only
 to a verdict that is already SUSPICIOUS or MALICIOUS, so a clean download's
 verdict stays empty and the mark is read for flagged files and for the
 kinds a lost mark matters for (programs, scripts, Office documents), not
-for every file. What was planned:
+for every file. The sentence below that "every 7-Zip extraction loses it"
+was stale when written: 7-Zip 22.00 can propagate the mark, off by default,
+and Explorer's own extraction keeps it. What was planned:
 
 
 **What is right in the proposal.** The mark is an NTFS named stream a

@@ -37,7 +37,7 @@ from . import shellext
 from .instance import InstanceLock
 from .protection import SelfProtection
 from .quarantine import QuarantineError, QuarantineStore, RestoreIncomplete
-from .scanner import Level, ScanCache, Scanner, Verdict
+from .scanner import Level, ScanCache, Scanner, Verdict, findings_to_dicts
 from .watcher import RealtimeMonitor
 
 log = logging.getLogger("avguard.gui")
@@ -140,6 +140,7 @@ class AVGuardApp(tb.Window):
         # Archives whose extracted, unmarked programs have had their banner
         # this session: one per archive, not one per file.
         self._provenance_banners: set[str] = set()
+        self._banner_style = ""
 
         self._build_widgets()
         self._build_tray()
@@ -396,7 +397,16 @@ class AVGuardApp(tb.Window):
             child.destroy()
         self.banner_var.set(text)
         self.banner.configure(bootstyle=style)
+        self._banner_style = style
         self.banner.pack(fill=X, pady=(0, 8), before=self._panes)
+
+    def _banner_is_loud(self) -> bool:
+        """A threat or a warning is showing, with its buttons: a notice must
+        not replace it."""
+        try:
+            return self._banner_style in ("inverse-danger", "inverse-warning") and bool(self.banner.winfo_ismapped())
+        except Exception:
+            return False
 
     # ----------------------------------------------------------- first run
 
@@ -602,27 +612,31 @@ class AVGuardApp(tb.Window):
         self._offer_exclusion(verdict.path.parent)
 
     def _report_extracted(self, verdict: Verdict) -> None:
-        """On the GUI thread. A clean program or document whose bytes came
-        out of a downloaded archive and carries no download mark: SmartScreen
-        will not ask about it, so AVGuard says where it came from, once. One
-        History row per file, ever (the store remembers it was told); one
-        banner per archive per session; no tray notice; nothing moved."""
+        """On the GUI thread. A clean program or document whose bytes equal a
+        member of a downloaded archive and that carries no download mark:
+        SmartScreen will not ask about it, so AVGuard says so, once. One
+        History row per file, ever (the store remembers it was told), kept
+        on this machine like the paste guard's; one banner per archive per
+        session, at a quiet moment; no tray notice; nothing moved."""
         finding = provenance.extracted_finding(verdict.findings)
         origin = self.scanner.provenance.lookup(verdict.sha256)
         if finding is None or origin is None:
             return
         if not origin.told:
             self.events.record(Event(
-                kind="provenance", path=str(verdict.path), level="extracted",
+                kind="provenance", path=str(verdict.path), level=verdict.level.value,
                 reasons=[finding.describe()],
-                detail={"sha256": verdict.sha256, "container": origin.container, "host": origin.host}))
+                detail={"sha256": verdict.sha256, "container": origin.container, "host": origin.host,
+                        "findings": findings_to_dicts([finding])}), forward=False)
             self.scanner.provenance.mark_told(verdict.sha256)
-        if origin.container not in self._provenance_banners:
-            self._provenance_banners.add(origin.container)
-            where = f" ({origin.host})" if origin.host else ""
-            self._banner(f"From a download: {verdict.path.name} was extracted from "
-                         f"{origin.container_name}{where} and carries no download mark, so SmartScreen "
-                         "will not ask before it runs. Nothing was changed.", "inverse-info")
+        # The banner waits for a quiet moment: during a scan the summary
+        # would replace it unseen, and a threat's banner, with its buttons,
+        # is not replaced by a notice. History has the row either way.
+        if self._scan_active or self._banner_is_loud() or origin.container in self._provenance_banners:
+            return
+        self._provenance_banners.add(origin.container)
+        self._banner(f"From a download: {verdict.path.name} {finding.describe()}. Nothing was changed.",
+                     "inverse-info")
 
     def _handle_threat(self, verdict: Verdict) -> None:
         """Runs on the GUI thread."""

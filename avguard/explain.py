@@ -63,7 +63,7 @@ CLEAN_BELOW_THE_LINE = "Below the reporting line: what was found did not add up 
 CLEAN_KEPT = "Kept because you chose to: what was found was set aside by your decision."
 NOTE_LEFT_OUT = ("(a note from the rule's author was left out: it states a confidence figure, "
                  "which this account does not carry)")
-_VERDICT_KINDS = ("detection", "quarantined", "suspicious")
+_VERDICT_KINDS = ("detection", "quarantined", "suspicious", "provenance")
 
 _HAPPENED: dict[str, tuple[str, tuple[tuple[str, str], ...]]] = {
     QUARANTINED: ("Quarantined. Restore puts it back and remembers these exact bytes.",
@@ -205,7 +205,7 @@ def _source_words(finding: Finding, packs) -> tuple[str, str, tuple[str, ...]]:
         return RECORDED, "a stored finding that could not be read", ()
     if source == "provenance":
         words = ("the download mark on the file (where it came from)" if finding.name == "downloaded"
-                 else "the download mark on the archive this was extracted from")
+                 else "the download mark on the archive whose member has these bytes")
         return FACT, words, ("where a file came from weighs nothing; it never moves a file",)
     name = f" ({finding.name})" if finding.name else ""
     return (FACT if finding.hard else OPINION), f"{source}{name}", ()
@@ -213,7 +213,10 @@ def _source_words(finding: Finding, packs) -> tuple[str, str, tuple[str, ...]]:
 
 def _row(finding: Finding, packs) -> Row:
     kind, words, extra = _source_words(finding, packs)
-    return Row(kind, words, int(finding.weight), finding.describe(), _author_notes(finding.notes) + extra)
+    # The confidence filter is for a rule author's prose; a note the scanner
+    # itself wrote (a path, a name) is kept as it is.
+    notes = _author_notes(finding.notes) if finding.source == "yara" else tuple(finding.notes)
+    return Row(kind, words, int(finding.weight), finding.describe(), notes + extra)
 
 
 def _meaning(level: str, rows: Sequence[Row], state: str) -> str:

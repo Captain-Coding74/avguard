@@ -1431,27 +1431,38 @@ class Scanner:
             log.debug("%s: %d member(s) of a downloaded archive remembered", facts.path.name, kept)
         return findings
 
-    def _provenance_findings(self, facts: FileFacts, level: Level) -> list[Finding]:
-        """Where the file came from, at weight 0: said of a flagged file that
-        carries the download mark, and of an unmarked program or document
-        whose bytes came out of a downloaded archive. A fact about the file,
-        never evidence against it; decide() is the same with or without."""
+    def _provenance_findings(self, path: Path, sha256: str, level: Level) -> list[Finding]:
+        """Where the file came from, at weight 0, computed live on every scan,
+        a cache replay included: said of a flagged file that carries the
+        download mark, and of an unmarked program or document, outside the
+        Windows and Program Files folders, whose bytes equal a member of a
+        downloaded archive. A fact about the file, never evidence against
+        it; decide() is the same with or without."""
         flagged = level in (Level.MALICIOUS, Level.SUSPICIOUS)
-        gated = provenance.is_gated(facts.path)
+        gated = provenance.is_gated(path)
         if not flagged and not gated:
             return []
-        zone = provenance.read_zone(facts.path)
-        if zone is not None:
-            if zone.marked and flagged:
-                return [Finding("provenance", "downloaded", 0, zone.describe())]
-            return []                      # marked, and the mark says where it came from
-        if not gated:
+        zone = provenance.read_zone(path)
+        if zone is not None and zone.marked:
+            return [Finding("provenance", "downloaded", 0, zone.describe())] if flagged else []
+        if not gated or provenance.is_installed(path):
             return []
-        origin = self.provenance.lookup(facts.sha256)
+        origin = self.provenance.lookup(sha256)
         if origin is None:
             return []
-        return [Finding("provenance", "extracted", 0, origin.describe(),
-                        notes=(f"the archive: {origin.container}", f"the member: {origin.member}"))]
+        return [Finding("provenance", "extracted", 0, origin.describe())]
+
+    def _download_unremembered(self, path: Path) -> bool:
+        """A cached archive that carries the mark and none of whose members
+        the store knows (marked after it was cached, or cached before this
+        existed): it is read afresh, so they are remembered. An archive the
+        store knows has its members' date moved instead."""
+        if not self.cfg.archive_scanning_enabled or not archives.is_archive(path):
+            return False
+        zone = provenance.read_zone(path)
+        if zone is None or not zone.marked:
+            return False
+        return not self.provenance.touch_container(path)
 
     def _publisher_trust(self, facts: FileFacts):
         """Authenticode result for a PE, or None if it is not one."""
@@ -1510,12 +1521,18 @@ class Scanner:
 
         if use_cache:
             cached = cache.get(path, size, mtime_ns)
-            if cached and self._cache_still_applies(cached):
+            if cached and self._cache_still_applies(cached) and not self._download_unremembered(path):
                 # The replay carries what decided it: the same findings, score
-                # and digest the first scan had.
-                return Verdict(path, Level(cached["level"]), list(cached["reasons"]),
-                               findings=findings_from_dicts(cached.get("findings")),
-                               sha256=str(cached.get("sha256", "")))
+                # and digest the first scan had. Where the file came from is
+                # read live, never replayed: the mark is a stream the cache
+                # key cannot see, and the store changes under the cache.
+                level = Level(cached["level"])
+                raw = cached.get("findings")
+                core = [f for f in findings_from_dicts(raw) if f.source != "provenance"]
+                digest = str(cached.get("sha256", ""))
+                extra = self._provenance_findings(path, digest, level)
+                reasons = [f.describe() for f in core + extra] if raw is not None else list(cached["reasons"])
+                return Verdict(path, level, reasons, findings=core + extra, sha256=digest)
 
         try:
             facts = self._read_facts(path, size, mtime_ns,
@@ -1620,11 +1637,12 @@ class Scanner:
             if cloud_reasons:
                 level = decide(findings, self.cfg.quarantine_threshold)
 
-        # Where the file came from, after the verdict and without weight in it.
-        findings.extend(self._provenance_findings(facts, level))
-
+        # Where the file came from: after the verdict, without weight in it,
+        # and outside the cache, which keeps the conclusion only.
+        extra = self._provenance_findings(path, facts.sha256, level)
         reasons = [f.describe() for f in findings]
-        verdict = Verdict(path, level, reasons, facts, findings, sha256=facts.sha256)
+        verdict = Verdict(path, level, reasons + [f.describe() for f in extra], facts, findings + extra,
+                          sha256=facts.sha256)
         if use_cache:
             cache.put(path, size, mtime_ns, level, reasons, facts.sha256, findings=findings)
         return verdict

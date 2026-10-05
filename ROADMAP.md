@@ -1166,17 +1166,19 @@ makes impossible rather than rare.
 **Where a file came from, 2026-10-05.** Item 4 of docs/next-6.md, built
 reduced as it was planned. A browser writes an NTFS stream named
 `Zone.Identifier` beside a download (`[ZoneTransfer]`, `ZoneId=3`, usually
-a `HostUrl`); SmartScreen asks before running a marked program and Office
-opens a marked document in Protected View, both on the mark and nothing
-else, and every extraction by 7-Zip loses it. `avguard/provenance.py`
+a `HostUrl`); SmartScreen looks for the mark before running a program and
+Office opens a marked document in Protected View; Explorer's extraction
+keeps the mark, 7-Zip's drops it unless its propagate option is on, most
+other tools drop it. `avguard/provenance.py`
 reads the stream with a plain `open()` (on Linux the same name is a
 sibling file, which is what the tests use), parses it to a `Zone` that
 keeps the host and never the URL, and gives the scanner two findings,
 both weight 0 and soft: "downloaded from host" on a verdict that is
 already SUSPICIOUS or MALICIOUS, and "extracted from x.zip (downloaded
-from host); the extracted file carries no download mark, so SmartScreen
-will not ask before it runs" on a clean program, script or Office document
-whose bytes came out of a marked archive. The second is possible because
+from host); carries no download mark, so SmartScreen will not ask before
+it runs" on a clean program, script or Office document whose bytes equal a
+member of a marked archive (reworded in the second reading, below, to
+"has the bytes of"). The second is possible because
 `_archive_findings` hashes every member it looks at inside a marked
 archive and `ProvenanceStore` (`provenance.sqlite` under the data
 directory, ninety days, fifty thousand rows, one connection per thread
@@ -1192,9 +1194,12 @@ restore and export (`write_zone`, the zone only, Windows only): a restored
 download is still a download to SmartScreen, which the byte copy had
 silently undone. The consent sentences, in their four places, now name
 the host and the archive. No `DETECTION_VERSION` bump: no verdict's level
-or meaning moves, which a test asserts over every rule fixture and the
-self-test marker, with and without the mark, and `decide()` is called
-twice per verdict in that test, with and without the provenance rows.
+moves, which a test asserts over every rule fixture and the self-test
+marker, with and without the mark, and `decide()` is called twice per
+verdict in that test, with and without the provenance rows; and since the
+second reading the provenance rows are computed on every scan, a cache
+replay included, and never stored in the cache, so an entry written before
+this existed replays exactly as a new one does.
 
 Measured here (Linux, python3.13, `tests.test_provenance` prints the
 first two): `read_zone` 17 us per marked file and 6 us per unmarked one,
@@ -1209,6 +1214,94 @@ one, 1,000 of each, warm; a store lookup 4 us per miss; the quarantine
 round trip there reads the zone back off the restored and the exported
 file. Not measured: the owner's real Downloads zips. Tests 699 -> 719,
 both suites green here and 719 in 191 s on the runner.
+
+**Where a file came from, second reading, 2026-10-05.** Three adversarial
+lenses over the change (the scanner and privacy; the surfaces; the tests
+and the claims): 30 findings, 23 distinct, each reproduced with a script
+before it was fixed and each fixed with a test. Measured: 19 of the
+assertions written for this reading fail against the previous commit (15
+tests; `python3.13 -m unittest tests.test_provenance tests.test_cli` on a
+`git archive HEAD` with the new test files copied in), and one more, the
+FIFO test, blocks the old code forever. What mattered most:
+
+- The note said too much. A digest match is "has the bytes of tool.exe
+  from app.zip (downloaded from host)", not "extracted from": a
+  redistributable DLL that a downloaded zip carries and an installer also
+  puts under Program Files has the same bytes, and the old sentence
+  asserted an extraction nobody measured. The sentence now says what was
+  measured, a document gets "Office will not open it in Protected View"
+  instead of "SmartScreen will not ask before it runs", and nothing under
+  the Windows or Program Files folders is said anything about.
+- The rows lived in the cache. A program scanned before its archive (walk
+  order under `scan_tree` is arbitrary: 57 of 60 notes on the reviewer's
+  first pass) was cached without the note for thirty days; a flagged file
+  cached before the change replayed without "downloaded from"; an archive
+  marked after it was cached never had its members remembered. The rows
+  are now computed on every scan, replay included, and never stored (the
+  cache keeps the conclusion), a replayed marked archive the store does not
+  know is read afresh, and one it knows has its members' date moved. That
+  is also why `DETECTION_VERSION` stays at 15: an entry written before this
+  existed replays exactly as a new one does.
+- A clean file's path, hash and archive left the machine under a consent
+  that never named them: the provenance event for a clean file is recorded
+  with `forward=False`, as the paste guard's are, and the four consent
+  sentences now say so and name the member's name that a flagged
+  download's evidence carries.
+- The stream read 4,096 bytes and parsed the cut line whole, so a referrer
+  long enough to push `HostUrl` past the limit had `urlsplit` read the
+  username of `https://alice.smith:pw@...` as the host, and a cut in
+  `ZoneId=` unmarked the file. The limit is 16 KiB, a full read drops its
+  last line, and a host is accepted only if it is one (DNS labels or an IP
+  literal, 253 characters at most; a control character, a space, a
+  percent-escape or `about:internet` is no host). Lines split on the
+  separators Windows writes, not on U+2028; the first block and its first
+  `ZoneId` count; a zone outside 0-4 is not a mark.
+- A corrupt `provenance.sqlite` opened and abandoned one connection per
+  lookup, that is per flagged or gated file (five lookups, five
+  connections, five reclaimed by the collector); the store now closes the
+  connection it could not use and gives up for the life of the process, and
+  catches `OSError` from a folder it cannot make. The row cap sorted the
+  whole table on every marked archive once full (73 ms at 50,000 rows, the
+  GUI thread waiting behind `mark_told` for up to 92 ms): an index on
+  `seen`, the cap checked before the sweep, and the ninety days applied on
+  read as well as on write.
+- The banner shown during a full scan was replaced by "Scan complete"
+  before anyone saw it and the archive counted as announced for the
+  session; under real-time protection it replaced a threat's banner and
+  destroyed its Why? and Never-scan buttons. The History row is recorded
+  whatever the moment; the banner waits for one with no scan running and no
+  danger or warning banner showing, and the archive is counted only when
+  it was shown. The History row itself showed nothing but the path and
+  opened into nothing: the event now carries the finding and `provenance`
+  is a verdict kind, so a double-click opens the account with the row.
+- The account's confidence filter, written for a rule author's note, ate a
+  path with a `%` or a name like `confidential_2024` and said a rule author
+  had stated a confidence figure; it applies to YARA findings only now, and
+  provenance findings carry no notes (the full archive path and the member
+  name, 60 KB of it in one reviewer's zip, no longer ride in the evidence).
+- `quarantine()` raised after the file was moved when the evidence was the
+  documented bare-list form and the file was marked; it wraps the list and
+  cannot raise there now. An extracted copy carrying a zone of 0, 1 or 2
+  was said nothing about; only a mark SmartScreen asks about ends the
+  lookup. On Linux a FIFO named like the stream blocked `read_zone` and the
+  scan behind it; only a regular file is opened there.
+- Three claims were false and are gone from the README, the docstring,
+  this file and the plan: Protected View does not open on the mark "and
+  nothing else"; 7-Zip has propagated the mark since 22.00 when asked (off
+  by default), and Explorer's own extraction keeps it; "every honest
+  extraction loses it" was contradicted by a test's own comment. The suffix
+  sets were revised (drivers, DLLs, `.jar` and `.one` out; Office and ODF
+  documents, `.chm`, `.msc`, `.application`, mounted containers in) and
+  are said to come from the documentation, not from a measurement here,
+  which is still owed on the runner.
+
+The two timings the paragraph above cites now have a command,
+`python tools/measure_provenance.py`; run again after the reading it
+reports the provenance pass at 975 against 1,022 us per file, that is
+inside the noise of a scan that costs a millisecond per file (47 us more in
+one run, 47 us less in another), and 34 ms for the marked 10 MB archive.
+Still owed, as the plan asked: the 978-file corpus and the owner's real
+Downloads zips. Tests 719 -> 733, both suites green.
 
 ## Deliberately not doing
 
