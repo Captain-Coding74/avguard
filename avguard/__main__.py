@@ -14,7 +14,7 @@ import threading
 from pathlib import Path
 
 from . import autoruns, fim, iocs, shellext, tlsh
-from . import config, logsetup, scheduling
+from . import config, logsetup, provenance, scheduling
 from .cloud import VirusTotalClient
 from .instance import InstanceLock
 from .protection import SelfProtection
@@ -88,6 +88,11 @@ def _console_scan(target: Path, quarantine_threats: bool, verbose: bool,
             say(f"[{verdict.level.value.upper()}] {verdict.path}")
             for reason in verdict.reasons:
                 say(f"    {reason}")
+        elif verdict.level is Level.CLEAN and provenance.extracted_finding(verdict.findings) is not None:
+            # Clean, and said so; the note is where it came from, which the
+            # program that would have asked (SmartScreen) can no longer see.
+            say(f"[note] {verdict.path}")
+            say(f"    {provenance.extracted_finding(verdict.findings).describe()}")
         elif verbose:
             say(f"[{verdict.level.value}] {verdict.path}", keep=False)
 

@@ -26,7 +26,8 @@ from ttkbootstrap.constants import (
 )
 from ttkbootstrap.dialogs import Messagebox, Querybox
 
-from . import autoruns, clipguard, config, dialogs, explain, fimpanel, logsetup, scheduling, signing, startuppanel
+from . import (autoruns, clipguard, config, dialogs, explain, fimpanel, logsetup, provenance, scheduling,
+               signing, startuppanel)
 from .events import Event, EventStore
 from .cloud import VirusTotalClient
 from . import iocs as iocs_module
@@ -136,6 +137,9 @@ class AVGuardApp(tb.Window):
         self._scan_active = False
         self._cancel = threading.Event()
         self._threats_this_scan = 0
+        # Archives whose extracted, unmarked programs have had their banner
+        # this session: one per archive, not one per file.
+        self._provenance_banners: set[str] = set()
 
         self._build_widgets()
         self._build_tray()
@@ -578,6 +582,8 @@ class AVGuardApp(tb.Window):
                 score=verdict.score, reasons=list(verdict.reasons),
                 detail=explain.evidence_detail(verdict, self.cfg)))
             self.post(self._report_suspicious, verdict)
+        elif verdict.level is Level.CLEAN and provenance.extracted_finding(verdict.findings) is not None:
+            self.post(self._report_extracted, verdict)
         elif verdict.level is Level.ERROR:
             log.error("%s - %s", verdict.path, "; ".join(verdict.reasons))
         else:
@@ -594,6 +600,29 @@ class AVGuardApp(tb.Window):
         self._banner(f"Unusual file reported, not moved: {verdict.path.name}", "inverse-warning")
         self._offer_account(explain.from_verdict(verdict, self.cfg, self.scanner.packs))
         self._offer_exclusion(verdict.path.parent)
+
+    def _report_extracted(self, verdict: Verdict) -> None:
+        """On the GUI thread. A clean program or document whose bytes came
+        out of a downloaded archive and carries no download mark: SmartScreen
+        will not ask about it, so AVGuard says where it came from, once. One
+        History row per file, ever (the store remembers it was told); one
+        banner per archive per session; no tray notice; nothing moved."""
+        finding = provenance.extracted_finding(verdict.findings)
+        origin = self.scanner.provenance.lookup(verdict.sha256)
+        if finding is None or origin is None:
+            return
+        if not origin.told:
+            self.events.record(Event(
+                kind="provenance", path=str(verdict.path), level="extracted",
+                reasons=[finding.describe()],
+                detail={"sha256": verdict.sha256, "container": origin.container, "host": origin.host}))
+            self.scanner.provenance.mark_told(verdict.sha256)
+        if origin.container not in self._provenance_banners:
+            self._provenance_banners.add(origin.container)
+            where = f" ({origin.host})" if origin.host else ""
+            self._banner(f"From a download: {verdict.path.name} was extracted from "
+                         f"{origin.container_name}{where} and carries no download mark, so SmartScreen "
+                         "will not ask before it runs. Nothing was changed.", "inverse-info")
 
     def _handle_threat(self, verdict: Verdict) -> None:
         """Runs on the GUI thread."""

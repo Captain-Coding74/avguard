@@ -1163,6 +1163,51 @@ folder to move away to start again. Not measured: the race itself, which
 the reviewer replayed by hand on the snapshot store and which the lock
 makes impossible rather than rare.
 
+**Where a file came from, 2026-10-05.** Item 4 of docs/next-6.md, built
+reduced as it was planned. A browser writes an NTFS stream named
+`Zone.Identifier` beside a download (`[ZoneTransfer]`, `ZoneId=3`, usually
+a `HostUrl`); SmartScreen asks before running a marked program and Office
+opens a marked document in Protected View, both on the mark and nothing
+else, and every extraction by 7-Zip loses it. `avguard/provenance.py`
+reads the stream with a plain `open()` (on Linux the same name is a
+sibling file, which is what the tests use), parses it to a `Zone` that
+keeps the host and never the URL, and gives the scanner two findings,
+both weight 0 and soft: "downloaded from host" on a verdict that is
+already SUSPICIOUS or MALICIOUS, and "extracted from x.zip (downloaded
+from host); the extracted file carries no download mark, so SmartScreen
+will not ask before it runs" on a clean program, script or Office document
+whose bytes came out of a marked archive. The second is possible because
+`_archive_findings` hashes every member it looks at inside a marked
+archive and `ProvenanceStore` (`provenance.sqlite` under the data
+directory, ninety days, fifty thousand rows, one connection per thread
+like the blocklist) remembers them. Surfaces: the account's row ("the
+download mark on the file" / "on the archive this was extracted from",
+with the line that where a file came from weighs nothing), the event
+detail through `evidence_detail`, a `[note]` line from `--scan`, and in
+the window one History event of kind `provenance` per file ever (the
+store remembers it was told) and one banner per archive per session, no
+tray notice, nothing moved. The quarantine reads the zone before it
+unlinks the source, keeps it in the evidence sidecar, and puts it back on
+restore and export (`write_zone`, the zone only, Windows only): a restored
+download is still a download to SmartScreen, which the byte copy had
+silently undone. The consent sentences, in their four places, now name
+the host and the archive. No `DETECTION_VERSION` bump: no verdict's level
+or meaning moves, which a test asserts over every rule fixture and the
+self-test marker, with and without the mark, and `decide()` is called
+twice per verdict in that test, with and without the provenance rows.
+
+Measured here (Linux, python3.13, `tests.test_provenance` prints the
+first two): `read_zone` 17 us per marked file and 6 us per unmarked one,
+1,000 of each, warm, the stream a sibling file; a store lookup 6 us per
+miss; over a 167-file corpus (this repository's own files, a quarter of
+them renamed .exe so the gated path runs, 1.5 MB, the cache off, best of
+three) the whole provenance pass costs 47 us per file (929 against 882);
+hashing and remembering the 50 members of a marked 10 MB archive adds
+29 ms to a 156 ms scan. Not measured here: the real stream, which the
+Windows runner's run of the same tests exercises (the timing test prints
+its numbers there too), and the owner's real Downloads zips. Tests 699 ->
+719, both suites green.
+
 ## Deliberately not doing
 
 The paste guard (above) is the one input that is not a file; it watches a user-mode clipboard buffer through documented calls, with no driver, no hook and no process telemetry, so it does not reopen the first decision here. The EDR-shaped extensions of it are refused by name: no keyboard hook to see Win+R, no automation of the Run dialog, no watching what the user then runs.

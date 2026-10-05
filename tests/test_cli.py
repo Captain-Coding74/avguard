@@ -143,6 +143,34 @@ class TestScanning(CliCase):
         self.run_cli("--scan", str(target.parent))
         self.assertTrue(target.exists(), "--scan alone must never move a file")
 
+    def test_a_program_extracted_from_a_download_gets_a_note(self):
+        """The archive carries the download mark; the program 7-Zip took out
+        of it does not, and SmartScreen will not ask. The terminal says so,
+        at weight 0, and the exit code stays clean."""
+        import zipfile
+        from avguard import provenance
+        folder = self.tmp / "dl"
+        folder.mkdir()
+        tool = b"MZ" + b"\x90" * 400
+        archive = folder / "app.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("tool.exe", tool)
+        with open(provenance.stream_path(archive), "w", newline="") as handle:
+            handle.write("[ZoneTransfer]\r\nZoneId=3\r\nHostUrl=https://dl.example.test/app.zip?t=1\r\n")
+        code, output = self.run_cli("--scan", str(archive))
+        self.assertEqual(code, 0, output)
+        extracted = folder / "tool.exe"
+        extracted.write_bytes(tool)
+        code, output = self.run_cli("--scan", str(extracted))
+        self.assertEqual(code, 0, output)
+        self.assertIn("[note]", output)
+        self.assertIn("extracted from app.zip (downloaded from dl.example.test)", output)
+        self.assertNotIn("?t=1", output, "the URL appears nowhere")
+        code, output = self.run_cli("--scan", str(extracted), "--json")
+        self.assertEqual(code, 0, output)
+        self.assertIn('"text": "extracted from app.zip (downloaded from dl.example.test)', output,
+                      "the account object carries the row")
+
     def test_a_missing_path_is_an_error_not_a_crash(self):
         code, output = self.run_cli("--scan", str(self.tmp / "does-not-exist"))
         self.assertEqual(code, 2)

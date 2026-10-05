@@ -28,7 +28,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import config
+from . import config, provenance
 from .allowlist import Allowlist
 from .protection import SelfProtection, path_within
 
@@ -350,6 +350,10 @@ class QuarantineStore:
                 payload.unlink(missing_ok=True)
                 raise
 
+            # The download mark is a stream of the file and goes with it when
+            # the file is unlinked; read first, kept with the evidence, so a
+            # restore can put it back.
+            zone = provenance.read_zone(source)
             try:
                 source.unlink()
             except OSError as exc:
@@ -371,6 +375,9 @@ class QuarantineStore:
                             source.name, exc)
 
         log.warning("quarantined %s (%s)", source, "; ".join(record.reasons) or "no reason given")
+        if zone is not None and zone.marked:
+            evidence = dict(evidence or {})
+            evidence["zone"] = zone.zone_id
         self._keep_evidence(entry_id, evidence)
         return record
 
@@ -445,6 +452,7 @@ class QuarantineStore:
                 os.replace(tmp, target)
             except OSError as exc:
                 raise QuarantineError(f"could not write {target}: {exc}") from exc
+            self._remark(entry_id, target)
 
             payload.unlink(missing_ok=True)
             del self._records[entry_id]
@@ -549,4 +557,15 @@ class QuarantineStore:
         target = Path(destination)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
+        self._remark(entry_id, target)
         return target
+
+    def _remark(self, entry_id: str, target: Path) -> None:
+        """A download is still a download: the zone the file carried when it
+        was taken goes back on the restored or exported copy. The zone only;
+        the URL was never kept. Writing bytes drops the stream, which is why
+        this exists (os.replace within a volume would have kept it)."""
+        kept = self.evidence(entry_id)
+        zone = kept.get("zone") if isinstance(kept, dict) else None
+        if isinstance(zone, int) and zone >= provenance.MARKED_FROM:
+            provenance.write_zone(target, zone)

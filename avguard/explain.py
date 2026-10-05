@@ -203,6 +203,10 @@ def _source_words(finding: Finding, packs) -> tuple[str, str, tuple[str, ...]]:
         return YOUR_DECISION, "your choice to keep this file", ()
     if source == "stored":
         return RECORDED, "a stored finding that could not be read", ()
+    if source == "provenance":
+        words = ("the download mark on the file (where it came from)" if finding.name == "downloaded"
+                 else "the download mark on the archive this was extracted from")
+        return FACT, words, ("where a file came from weighs nothing; it never moves a file",)
     name = f" ({finding.name})" if finding.name else ""
     return (FACT if finding.hard else OPINION), f"{source}{name}", ()
 

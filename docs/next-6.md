@@ -139,7 +139,17 @@ count, the XML byte count, the database size after 1 and after 30
 snapshots, and two snapshots seconds apart on an idle machine differing
 in nothing. Effort L, no dependency.
 
-## 4. Download provenance (Mark-of-the-Web) — build, reduced
+## 4. Download provenance (Mark-of-the-Web) — DONE, reduced as planned
+
+Built 2026-10-05; the record is in ROADMAP.md under "Where a file came
+from". As shaped below, with two departures: the restored or exported
+file gets the zone back and nothing else (the URL was never kept, so there
+is nothing else to put back), and the "downloaded from" row is added only
+to a verdict that is already SUSPICIOUS or MALICIOUS, so a clean download's
+verdict stays empty and the mark is read for flagged files and for the
+kinds a lost mark matters for (programs, scripts, Office documents), not
+for every file. What was planned:
+
 
 **What is right in the proposal.** The mark is an NTFS named stream a
 browser writes on a download (`[ZoneTransfer]`, `ZoneId=3`, often

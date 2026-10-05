@@ -22,7 +22,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Sequence
 
-from . import allowlist as allowlist_module
+from . import allowlist as allowlist_module, provenance
 from . import iocs as iocs_module
 from . import tlsh as tlsh_module
 from . import archives, config, peinfo, rulepacks, signing
@@ -543,6 +543,10 @@ class Scanner:
         # file was re-detected on the very next scan. The decision never
         # reached the code that needed it.
         self.allowlist = allowlist if allowlist is not None else allowlist_module.Allowlist()
+        # Member hashes of downloaded archives, so an unmarked program that
+        # came out of one can be said to have (provenance.py). Replaceable
+        # by assignment; weighs nothing in any verdict.
+        self.provenance = provenance.ProvenanceStore()
         # Injectable, so a caller can scan without whatever packs happen to be
         # installed on this machine. Reaching into global state by default made
         # three tests fail the moment a real pack was added.
@@ -1377,6 +1381,12 @@ class Scanner:
 
         report = archives.inspect(facts.path)
         findings: list[Finding] = []
+        # A downloaded archive: every member looked at is remembered by its
+        # hash, so the program extracted from it, which 7-Zip hands over
+        # without the mark, can be told where it came from.
+        zone = provenance.read_zone(facts.path)
+        downloaded = zone is not None and zone.marked
+        remembered: list[tuple[str, str]] = []
 
         for note in report.notes:
             # Limits of our own scan. Logged so a partial inspection is
@@ -1394,6 +1404,8 @@ class Scanner:
                 "archive is malformed or hostile: " + "; ".join(report.problems[:3])))
 
         for display, payload in archives.iter_nested(report):
+            if downloaded:
+                remembered.append((hashlib.sha256(payload).hexdigest(), display))
             for name, pattern in SIGNATURES.items():
                 if pattern in payload:
                     findings.append(Finding(
@@ -1414,7 +1426,32 @@ class Scanner:
         if report.members and report.inspected:
             log.debug("%s: inspected %d of %d archive members",
                       facts.path.name, report.inspected, len(report.members))
+        if remembered:
+            kept = self.provenance.remember(remembered, facts.path, zone.host)
+            log.debug("%s: %d member(s) of a downloaded archive remembered", facts.path.name, kept)
         return findings
+
+    def _provenance_findings(self, facts: FileFacts, level: Level) -> list[Finding]:
+        """Where the file came from, at weight 0: said of a flagged file that
+        carries the download mark, and of an unmarked program or document
+        whose bytes came out of a downloaded archive. A fact about the file,
+        never evidence against it; decide() is the same with or without."""
+        flagged = level in (Level.MALICIOUS, Level.SUSPICIOUS)
+        gated = provenance.is_gated(facts.path)
+        if not flagged and not gated:
+            return []
+        zone = provenance.read_zone(facts.path)
+        if zone is not None:
+            if zone.marked and flagged:
+                return [Finding("provenance", "downloaded", 0, zone.describe())]
+            return []                      # marked, and the mark says where it came from
+        if not gated:
+            return []
+        origin = self.provenance.lookup(facts.sha256)
+        if origin is None:
+            return []
+        return [Finding("provenance", "extracted", 0, origin.describe(),
+                        notes=(f"the archive: {origin.container}", f"the member: {origin.member}"))]
 
     def _publisher_trust(self, facts: FileFacts):
         """Authenticode result for a PE, or None if it is not one."""
@@ -1582,6 +1619,9 @@ class Scanner:
                                         reason, hard=True))
             if cloud_reasons:
                 level = decide(findings, self.cfg.quarantine_threshold)
+
+        # Where the file came from, after the verdict and without weight in it.
+        findings.extend(self._provenance_findings(facts, level))
 
         reasons = [f.describe() for f in findings]
         verdict = Verdict(path, level, reasons, facts, findings, sha256=facts.sha256)

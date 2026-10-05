@@ -566,6 +566,32 @@ verdict. Nothing here produces a Finding, and nothing can move or disable
 a startup item: the way to act on one is yours, and the entry's location
 and name are in the row.
 
+## Where a file came from
+
+A browser marks a download with a `Zone.Identifier` stream (ZoneId 3, "the
+internet", usually with the host it came from). SmartScreen asks before
+running a marked program and Office opens a marked document in Protected
+View; both gate on the mark and nothing else, and every extraction by
+7-Zip loses it. AVGuard reads the mark and says two things, both
+informational, both at weight 0; a test asserts the verdict is the same
+with and without them:
+
+- A flagged file that carries the mark has "downloaded from host" in its
+  account and its event. The host only, never the URL, which appears
+  nowhere in a verdict, in History, in the log or in a store.
+- A program or document with no mark whose bytes came out of a downloaded
+  archive gets one History row and, in the window, one banner per archive
+  per session: "extracted from x.zip (downloaded from host) and carries no
+  download mark, so SmartScreen will not ask before it runs". The terminal
+  prints a `[note]` line. The scanner remembers the hash of every member
+  it looked at inside a marked archive, for ninety days, under the data
+  directory, which is how it knows. Nothing is moved; nothing scores.
+
+The absence of a mark says nothing: every honest extraction loses it. The
+quarantine keeps the zone of a file it takes and puts it back when the file
+is restored or exported, so a restored download is still a download to
+SmartScreen. The zone only; the URL was never kept.
+
 ## Event forwarding
 
 Off by default. With a URL set in Settings, every recorded event — a
@@ -576,7 +602,9 @@ the file's SHA-256 and the evidence behind the verdict (each finding's
 source, weight, severity and pack, a rule author's note, the counted totals
 and your quarantine threshold); a startup change carries where it is and
 what it is called, its command line with its arguments, old and new, and
-the account a scheduled task runs as. The paste guard's events are the
+the account a scheduled task runs as; a downloaded file's evidence names
+the host it came from and the archive it was extracted from. The paste
+guard's events are the
 exception: they are written to History and never forwarded, so its "sends
 nothing" holds whatever address is set here. A dead or slow endpoint never
 slows a scan: events go onto a bounded queue and a background thread posts
