@@ -123,10 +123,7 @@ class AVGuardApp(tb.Window):
         # the quarantine index from its own stale snapshot.
         self.lock = InstanceLock()
         self.has_lock = self.lock.acquire()
-        if self.has_lock:
-            # Only the lock holder finishes or undoes a move a killed process
-            # left half done; a window without the lock leaves it alone.
-            self.quarantine.reconcile()
+        self._settle_the_store()
 
         # The paste guard reads the clipboard only while cfg.paste_guard_enabled
         # is set; the tick checks that before touching the source.
@@ -676,6 +673,15 @@ class AVGuardApp(tb.Window):
         self._provenance_banners.add(origin.container)
         self._banner(f"From a download: {verdict.path.name} {finding.describe()}. Nothing was changed.",
                      "inverse-info")
+
+    def _settle_the_store(self) -> None:
+        """Only the lock holder finishes or undoes a move a killed process
+        left half done. A window without the lock leaves it alone: one that
+        opened while the holder sat between saving a pending record and
+        unlinking the original deleted the payload, and the holder then
+        deleted the original, the only copy left."""
+        if self.has_lock:
+            self.quarantine.reconcile()
 
     def _handle_threat(self, verdict: Verdict) -> None:
         """Runs on the GUI thread."""

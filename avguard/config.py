@@ -96,7 +96,7 @@ def atomic_write_text(path: Path, text: str) -> None:
         raise
 
 
-def atomic_write_bytes(path: Path, data: bytes) -> None:
+def atomic_write_bytes(path: Path, data: bytes, replace: bool = True) -> None:
     """atomic_write_text for bytes, and durable: the data is flushed to the
     disk before the rename, and the rename itself where the platform allows.
 
@@ -105,6 +105,11 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
     file before its payload is). The journal makes the rename and the unlink
     durable, not the data, so without the fsync a power cut after the unlink
     could leave a payload of zeros and no original.
+
+    `replace=False` never writes over a file at `path`, however late it
+    appeared: FileExistsError instead. A restore checked for one before a
+    multi-second unmask and then replaced whatever the user had saved under
+    that name in the meantime.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     # A short name: the file it stands in for may already be at the 255
@@ -115,7 +120,10 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp, path)
+        if replace:
+            os.replace(tmp, path)
+        else:
+            _place_new(tmp, path, data)
     except BaseException:
         try:
             os.unlink(tmp)
@@ -123,6 +131,30 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
             pass
         raise
     _fsync_directory(path.parent)
+
+
+def _place_new(tmp: str, path: Path, data: bytes) -> None:
+    """Give the flushed `tmp` the name `path` only if nothing has it.
+
+    Windows' rename refuses an existing target. POSIX's replaces it, so
+    there the file is linked under the new name, which refuses, and the
+    temporary name dropped. A volume without hard links gets an exclusive
+    create of the target and the bytes written into it: not atomic, but
+    never over another file.
+    """
+    if os.name == "nt":
+        os.rename(tmp, path)
+        return
+    try:
+        os.link(tmp, path)
+    except FileExistsError:
+        raise
+    except OSError:
+        with open(path, "xb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+    os.unlink(tmp)
 
 
 def _fsync_directory(directory: Path) -> None:
@@ -146,16 +178,7 @@ class UnreadableJSON(ValueError):
     """A settings or store file that exists but is not one JSON object."""
 
 
-def read_json_object(path: Path) -> dict | None:
-    """The JSON object in `path`, or None when there is no such file.
-
-    A byte-order mark is accepted: Notepad's old "UTF-8" and PowerShell 5.1's
-    Set-Content -Encoding UTF8 both write one, and the file is otherwise
-    intact. Anything else that is not one JSON object raises UnreadableJSON,
-    so a caller never mistakes a file it cannot read for an empty one and
-    then saves over it: that is how index.json lost every nonce it held.
-    Other OSErrors (a locked file) propagate as they are.
-    """
+def _read_json(path: Path, kind: type):
     try:
         text = path.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
@@ -166,30 +189,80 @@ def read_json_object(path: Path) -> dict | None:
         raw = json.loads(text)
     except ValueError as exc:
         raise UnreadableJSON(f"{path.name} is not valid JSON ({exc})") from exc
-    if not isinstance(raw, dict):
-        raise UnreadableJSON(f"{path.name} holds a JSON {type(raw).__name__}, not an object")
+    if not isinstance(raw, kind):
+        raise UnreadableJSON(f"{path.name} holds a JSON {type(raw).__name__}, not "
+                             + ("an object" if kind is dict else "a list"))
     return raw
 
 
-def set_aside_if_unreadable(path: Path) -> Path | None:
+def read_json_object(path: Path) -> dict | None:
+    """The JSON object in `path`, or None when there is no such file.
+
+    A byte-order mark is accepted: Notepad's old "UTF-8" and PowerShell 5.1's
+    Set-Content -Encoding UTF8 both write one, and the file is otherwise
+    intact. Anything else that is not one JSON object raises UnreadableJSON,
+    so a caller never mistakes a file it cannot read for an empty one and
+    then saves over it: that is how index.json lost every nonce it held.
+    Other OSErrors (a locked file) propagate as they are.
+    """
+    return _read_json(path, dict)
+
+
+def read_json_strings(path: Path) -> list[str] | None:
+    """read_json_object for a file that holds a JSON list of strings."""
+    raw = _read_json(path, list)
+    if raw is not None and not all(isinstance(item, str) for item in raw):
+        raise UnreadableJSON(f"{path.name} holds something other than text in its list")
+    return raw
+
+
+def set_aside_if_unreadable(path: Path, reader=read_json_object) -> Path | None:
     """Before `path` is written: if what is there now cannot be read, rename
     it to <name>.unreadable-<UTC time> and return the new path, so bytes that
     were not understood are kept for the user instead of written over.
-    Raises OSError if it cannot be moved, which stops the write."""
+    Raises OSError if it cannot be moved, which stops the write. `reader` is
+    what reading it means (read_json_strings for a list)."""
     try:
-        read_json_object(path)
+        reader(path)
         return None
     except UnreadableJSON:
         pass
     except OSError:
         return None             # the write that follows will say what is wrong
+    return keep_aside(path, "unreadable", move=True)
+
+
+def keep_aside(path: Path, why: str, move: bool) -> Path:
+    """Move (or copy) `path` to <name>.<why>-<UTC time>, never over an
+    earlier one: the name was to the second, and a second set-aside within
+    it replaced the first."""
+    import shutil
     from datetime import datetime, timezone
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    aside = path.with_name(f"{path.name}.unreadable-{stamp}")
-    os.replace(path, aside)
-    logging.getLogger(__name__).error(
-        "%s could not be read and was kept as %s; a new one is being started", path, aside.name)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    aside = path.with_name(f"{path.name}.{why}-{stamp}")
+    counter = 1
+    while aside.exists():
+        counter += 1
+        aside = path.with_name(f"{path.name}.{why}-{stamp}-{counter}")
+    if move:
+        os.replace(path, aside)
+        logging.getLogger(__name__).error(
+            "%s could not be read and was kept as %s; a new one is being started", path, aside.name)
+    else:
+        shutil.copy2(path, aside)
     return aside
+
+
+def _kind(default) -> str:
+    if isinstance(default, bool):
+        return "true or false"
+    if isinstance(default, int):
+        return "a whole number"
+    if isinstance(default, float):
+        return "a number"
+    if isinstance(default, list):
+        return "a list of text"
+    return "text"
 
 
 def _fits(value, default) -> bool:
@@ -335,15 +408,28 @@ class Config:
         defaults = cls()
         names = {f.name for f in fields(cls)}
         accepted = {}
+        rejected = []
         for key, value in raw.items():
             if key not in names:
                 continue
             if _fits(value, getattr(defaults, key)):
                 accepted[key] = value
             else:
-                log.warning("config.json: %s = %r is not a %s; the default is used",
-                            key, value, type(getattr(defaults, key)).__name__)
-        return cls(**accepted)
+                rejected.append(key)
+                log.warning("config.json: %s = %r is not %s; the default is used",
+                            key, value, _kind(getattr(defaults, key)))
+        loaded = cls(**accepted)
+        if rejected:
+            # Said, as a whole unreadable file is: one mistyped value was a
+            # log line, the window watched Downloads instead of the user's
+            # folders, and the next unrelated save wrote the default over it.
+            # save_changes() now leaves the value on disk as it is.
+            loaded.load_problem = (
+                f"{path.name}: " + ", ".join(
+                    f"{key} is not {_kind(getattr(defaults, key))}" for key in rejected)
+                + "; AVGuard is using the default until the file is corrected, and leaves "
+                + ("that value" if len(rejected) == 1 else "those values") + " in it as written")
+        return loaded
 
     def save(self, path: Path = CONFIG_PATH) -> None:
         set_aside_if_unreadable(path)
@@ -363,12 +449,22 @@ class Config:
         for key, value in changes.items():
             if key not in names or not _fits(value, getattr(Config(), key)):
                 raise TypeError(f"{key} = {value!r} is not a setting of its type")
-        fresh = Config.load(path)
-        if fresh.load_problem:
-            fresh = Config(**asdict(self))      # the file is unreadable: this object is the copy there is
-        for key, value in changes.items():
-            setattr(fresh, key, value)
-        fresh.save(path)
+        try:
+            on_disk = read_json_object(path)
+        except UnreadableJSON:
+            on_disk = None
+        if on_disk is None:
+            written = asdict(self)      # no file, or one that cannot be read: this object is the copy there is
+        else:
+            # The file as it is, with every usable value filled in: a value of
+            # the wrong type, or a key this version does not know, stays as
+            # the user wrote it instead of being replaced by a default.
+            written = {**asdict(Config.load(path)), **{
+                key: value for key, value in on_disk.items()
+                if key not in names or not _fits(value, getattr(Config(), key))}}
+        written.update(changes)
+        set_aside_if_unreadable(path)
+        atomic_write_text(path, json.dumps(written, indent=2))
         for key, value in changes.items():
             setattr(self, key, value)
 

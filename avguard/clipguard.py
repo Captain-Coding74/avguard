@@ -897,10 +897,10 @@ class PasteGuard:
             return self._ignored
         if mtime != self._ignore_mtime:
             try:
-                raw = json.loads(self.ignore_path.read_text(encoding="utf-8"))
-                self._ignored = {str(item) for item in raw} if isinstance(raw, list) else set()
-            except (OSError, ValueError) as exc:
-                log.warning("the clipboard ignore list could not be read (%s); treating it as empty", exc)
+                self._ignored = set(config.read_json_strings(self.ignore_path) or [])
+            except (OSError, config.UnreadableJSON) as exc:
+                log.warning("the clipboard ignore list could not be read (%s); nothing is ignored "
+                            "until it can be, and it is kept aside before the next one is written", exc)
                 self._ignored = set()
             self._ignore_mtime = mtime
         return self._ignored
@@ -910,6 +910,9 @@ class PasteGuard:
         current = set(self.ignored())
         current.add(match.sha256)
         self.ignore_path.parent.mkdir(parents=True, exist_ok=True)
+        # A list it could not read (a byte-order mark did it) is kept, not
+        # written over with the one decision just made.
+        config.set_aside_if_unreadable(self.ignore_path, config.read_json_strings)
         config.atomic_write_text(self.ignore_path, json.dumps(sorted(current), indent=1))
         self._ignore_mtime = None
 

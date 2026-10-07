@@ -457,6 +457,36 @@ class TestScheduleCommands(CliCase):
         self.assertEqual(code, 0, output)
 
 
+class TestTheCommandLineSettlesTheStore(CliCase):
+    """Round seven: --scan --quarantine holds the lock and is meant to
+    finish or undo a move a killed process left half done before it adds
+    its own; nothing tested that it does, only the store's method."""
+
+    def test_a_move_left_half_done_is_undone_before_new_ones(self):
+        import hashlib
+        import uuid
+        from avguard import config
+        from avguard.quarantine import QuarantineRecord, QuarantineStore, _mask
+        config.ensure_directories()
+        original = self.tmp / "kept.docx"
+        original.write_bytes(b"the original survived the kill")
+        store = QuarantineStore()
+        entry_id, nonce = uuid.uuid4().hex, os.urandom(16)
+        store._payload_path(entry_id).write_bytes(_mask(original.read_bytes(), nonce))
+        store._records[entry_id] = QuarantineRecord(
+            entry_id=entry_id, original_path=str(original), original_name=original.name,
+            quarantined_at="2026-10-07T00:00:00+00:00", size=original.stat().st_size,
+            sha256=hashlib.sha256(original.read_bytes()).hexdigest(), nonce=nonce.hex(),
+            reasons=["planted"], pending=True)
+        store._save()
+        code, output = self.run_cli("--scan", str(self.marker_file().parent), "--quarantine")
+        self.assertEqual(code, 1, output)
+        after = QuarantineStore()
+        self.assertIsNone(after.get(entry_id), "a move nobody finished is still listed as held")
+        self.assertEqual(len(after), 1, output)
+        self.assertTrue(original.exists())
+
+
 class TestTheDailyScanCoversEveryWatchedFolder(CliCase):
     """Round six: "scan the watched folders once a day" scheduled a scan of
     the first of them only, and kept scanning it after the list changed."""

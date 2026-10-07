@@ -107,8 +107,23 @@ def _keystream(nonce: bytes, length: int) -> bytes:
 
 
 def _mask(data: bytes, nonce: bytes) -> bytes:
+    """XOR with the keystream, as one integer: the same bytes as a byte-wise
+    loop, which took 0.63 s for 8 MB, most of the time between reading a
+    file and removing it."""
+    if not data:
+        return b""
     stream = _keystream(nonce, len(data))
-    return bytes(a ^ b for a, b in zip(data, stream))
+    return (int.from_bytes(data, "little") ^ int.from_bytes(stream, "little")).to_bytes(len(data), "little")
+
+
+def _identity(stat: os.stat_result) -> tuple:
+    """Which file a path names, and whether it was written: a save by
+    rename gives a new file id, a write in place a new size or time."""
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+class _Changed(Exception):
+    """The path no longer names the file that was read."""
 
 
 @dataclass
@@ -329,10 +344,19 @@ class QuarantineStore:
 
     def _read_evidence(self) -> dict:
         try:
-            raw = json.loads(self.evidence_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+            return config.read_json_object(self.evidence_path) or {}
+        except config.UnreadableJSON as exc:
+            log.error("the kept evidence could not be read (%s); it is set aside before the next write", exc)
             return {}
-        return raw if isinstance(raw, dict) else {}
+        except OSError:
+            return {}
+
+    def _write_evidence(self, kept: dict) -> None:
+        # Read strictly, and set aside before a write: a byte-order mark read
+        # as {} and the next quarantine wrote over every held file's findings
+        # and its download mark.
+        config.set_aside_if_unreadable(self.evidence_path)
+        config.atomic_write_text(self.evidence_path, json.dumps(kept))
 
     def _keep_evidence(self, entry_id: str, evidence) -> None:
         """Best effort and never raises: the account of a verdict is worth
@@ -345,7 +369,7 @@ class QuarantineStore:
             kept[entry_id] = evidence
             # Rows for entries that no longer exist go with them.
             kept = {k: v for k, v in kept.items() if k in self._records}
-            config.atomic_write_text(self.evidence_path, json.dumps(kept))
+            self._write_evidence(kept)
         except (OSError, TypeError, ValueError) as exc:
             log.warning("could not keep the evidence for %s: %s", entry_id, exc)
 
@@ -356,7 +380,7 @@ class QuarantineStore:
             return
         del kept[entry_id]
         try:
-            config.atomic_write_text(self.evidence_path, json.dumps(kept))
+            self._write_evidence(kept)
         except OSError as exc:
             log.warning("could not drop the evidence for %s: %s", entry_id, exc)
 
@@ -402,6 +426,7 @@ class QuarantineStore:
         with self._lock:
             self._reload_and_merge()
             try:
+                read_as = _identity(os.stat(source))
                 data = source.read_bytes()
             except OSError as exc:
                 raise QuarantineError(f"could not read {source}: {exc}") from exc
@@ -452,14 +477,23 @@ class QuarantineStore:
             # restore can put it back.
             zone = provenance.read_zone(source)
             try:
+                # The file read seconds ago, or nothing: an editor's save by
+                # rename, or a download over the name, landing between the
+                # read and here was unlinked, and only the old bytes were
+                # held. What remains is the moment between this stat and the
+                # unlink.
+                if _identity(os.stat(source)) != read_as:
+                    raise _Changed()
                 source.unlink()
-            except OSError as exc:
+            except (OSError, _Changed) as exc:
                 del self._records[entry_id]
                 payload.unlink(missing_ok=True)
                 try:
                     self._save()
                 except QuarantineError:
                     pass
+                if isinstance(exc, _Changed):
+                    raise QuarantineError(f"{source.name} changed while it was being moved; it was not moved") from None
                 raise QuarantineError(f"could not remove original {source}: {exc}") from exc
 
             # The move is complete. If clearing the flag fails, the next start
@@ -554,8 +588,11 @@ class QuarantineStore:
                 # Flushed before the payload goes: until then the payload is
                 # the only durable copy. Written through a short temporary
                 # name; the file's own name plus ".restoring" was over the
-                # 255-character limit for a name near it.
-                config.atomic_write_bytes(target, data)
+                # 255-character limit for a name near it. Never over a file
+                # saved under that name since _validate_destination looked.
+                config.atomic_write_bytes(target, data, replace=False)
+            except FileExistsError:
+                raise QuarantineError(f"a file already exists at {target}") from None
             except OSError as exc:
                 raise QuarantineError(f"could not write {target}: {exc}") from exc
             self._remark(entry_id, target)

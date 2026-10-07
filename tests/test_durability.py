@@ -132,14 +132,20 @@ class TestQuarantineDurability(TempCase):
                                index_path=directory / "index.json",
                                protection=SelfProtection([self.tmp / "prot"]))
 
-    @staticmethod
-    def _break_the_index(directory: Path) -> None:
-        """Make the index unwritable with a real OS error, not a mock.
+    def _break_the_index(self, directory: Path):
+        """The index can be read and cannot be written: a full disk, as
+        os.replace reports one. (A directory where the file belongs, which
+        these tests used, now fails the READ first, and round seven found
+        the write-failure handler they are named for untested.)"""
+        real = config.atomic_write_text
 
-        A directory sitting where the file belongs makes os.replace fail the
-        same way a full disk or a permission problem would.
-        """
-        (directory / "index.json").mkdir(parents=True, exist_ok=True)
+        def refuse(path, text):
+            if Path(path).name == "index.json":
+                raise OSError(28, "No space left on device")
+            return real(path, text)
+        patcher = mock.patch.object(config, "atomic_write_text", side_effect=refuse)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_a_failed_index_write_does_not_destroy_the_file(self):
         directory = self.tmp / "store"
@@ -152,6 +158,7 @@ class TestQuarantineDurability(TempCase):
 
         self.assertTrue(victim.exists(), "the user's file was destroyed")
         self.assertEqual(victim.read_bytes(), b"THE ONLY COPY")
+        self.assertEqual(len(store), 0)
 
     def test_the_error_is_one_callers_actually_catch(self):
         """A bare OSError escaped gui._handle_threat and produced no message."""
@@ -159,12 +166,8 @@ class TestQuarantineDurability(TempCase):
         store = self.store(directory)
         victim = self.write("t.docx", b"x")
         self._break_the_index(directory)
-        try:
+        with self.assertRaises(QuarantineError):
             store.quarantine(victim, [])
-        except QuarantineError:
-            pass
-        except OSError as exc:
-            self.fail(f"raised a bare {type(exc).__name__}, which no caller catches")
 
     def test_a_failed_write_leaves_no_undecodable_payload(self):
         directory = self.tmp / "store"
@@ -174,6 +177,38 @@ class TestQuarantineDurability(TempCase):
             store.quarantine(self.write("t.docx", b"x"), [])
         self.assertEqual(list(directory.glob("*.quar")), [],
                          "a payload nothing can decode was left behind")
+
+    def test_an_index_that_cannot_be_read_now_is_not_read_as_empty(self):
+        """A locked index (a sharing violation) is not "no records": that
+        wrote this store's snapshot over every other file held."""
+        directory = self.tmp / "store"
+        store = self.store(directory)
+        store.quarantine(self.write("tax.pdf", b"tax"), [])
+        store.quarantine(self.write("thesis.docx", b"thesis"), [])
+        real = config.read_json_object
+
+        def locked(path):
+            if Path(path).name == "index.json":
+                raise PermissionError(13, "being used by another process")
+            return real(path)
+        with mock.patch.object(config, "read_json_object", side_effect=locked):
+            with self.assertRaises(QuarantineError):
+                self.store(directory).quarantine(self.write("new.exe", b"new"), [])
+        self.assertEqual(sorted(r.original_name for r in self.store(directory).records()),
+                         ["tax.pdf", "thesis.docx"])
+
+    def test_a_file_that_cannot_be_read_when_it_is_moved_is_a_quarantine_error(self):
+        victim = self.write("locked.bin", b"held open")
+        real = Path.read_bytes
+
+        def refuse(path):
+            if Path(path).name == "locked.bin":
+                raise PermissionError(32, "being used by another process")
+            return real(path)
+        with mock.patch.object(Path, "read_bytes", refuse):
+            with self.assertRaises(QuarantineError):
+                self.store().quarantine(victim, [])
+        self.assertTrue(victim.exists())
 
     def _plant_pending(self, store, directory: Path, original: Path,
                        payload: bytes) -> QuarantineRecord:
@@ -1515,7 +1550,10 @@ class TestTheConfigIsTypedAndWrittenByChange(TempCase):
                          (False, False, False), "a string or a number is not a yes")
         self.assertEqual((loaded.worker_threads, loaded.watch_paths), (4, []))
         self.assertEqual((loaded.quarantine_threshold, loaded.debounce_seconds), (150, 2))
-        self.assertEqual(loaded.load_problem, "")
+        # Round seven: each dropped value is said, not only logged.
+        for name in ("auto_quarantine", "cloud_enabled", "paste_guard_enabled", "worker_threads", "watch_paths"):
+            self.assertIn(name, loaded.load_problem)
+        self.assertNotIn("quarantine_threshold", loaded.load_problem)
 
     def test_an_unreadable_file_is_said_and_never_saved_into_the_file(self):
         path = self.tmp / "config.json"
@@ -1536,7 +1574,7 @@ class TestTheConfigIsTypedAndWrittenByChange(TempCase):
         on_disk = config.Config.load(path)
         self.assertEqual(on_disk.excluded_globs, ["C:/Users/me/Projects/**"], "the other's change was erased")
         self.assertFalse(on_disk.realtime_enabled)
-        with mock.patch.object(config.Config, "save", side_effect=OSError("disk full")):
+        with mock.patch.object(config, "atomic_write_text", side_effect=OSError("disk full")):
             with self.assertRaises(OSError):
                 mine.save_changes({"auto_quarantine": True, "paste_guard_enabled": True}, path)
         self.assertEqual((mine.auto_quarantine, mine.paste_guard_enabled), (False, False),
@@ -1609,7 +1647,7 @@ class TestTheWindowWithoutTheLock(TempCase):
                        forward_var=self.ns(get=lambda: "", set=lambda value: None),
                        watch_list=self.ns(get=lambda *a: ("D:/x",)), excl_list=self.ns(get=lambda *a: ()),
                        _consent_to_forwarding=lambda: False)
-        with mock.patch.object(config.Config, "save", side_effect=OSError("in use")), \
+        with mock.patch.object(config, "atomic_write_text", side_effect=OSError("in use")), \
                 mock.patch.object(dialogs, "Messagebox") as box:
             dialogs.SettingsDialog._save(fake)
         self.assertIn("Nothing was changed", box.show_error.call_args.args[0])
@@ -1853,6 +1891,215 @@ class TestTheWatchedFoldersAreTheProtectedOnes(TempCase):
         line = self.gui.AVGuardApp._describe_rules(self.ns(scanner=scanner))
         self.assertIn("typo.yara", line)
         self.assertIn("left out", line)
+
+
+class TestRoundSevenNothingIsWrittenOverTheUsersFile(TempCase):
+    """Round seven: quarantine checked a file's digest when it read it, then
+    unlinked whatever had the name seconds later, so an editor's save by
+    rename in between was destroyed and only the old bytes were held; and a
+    restore checked that nothing had the name before a multi-second unmask,
+    then replaced the file the user saved there meanwhile."""
+
+    def store(self) -> QuarantineStore:
+        directory = self.tmp / "store"
+        return QuarantineStore(directory=directory, index_path=directory / "index.json",
+                               protection=SelfProtection([self.tmp / "prot"]))
+
+    def save_by_rename(self, path: Path, data: bytes) -> None:
+        draft = path.with_name(path.name + ".draft")
+        draft.write_bytes(data)
+        os.replace(draft, path)
+
+    def test_a_save_that_lands_during_the_move_is_left_where_it_is(self):
+        import avguard.quarantine as quarantine_module
+        store = self.store()
+        victim = self.write("report.docm", b"MZ the version the scan judged")
+        expected = hashlib.sha256(victim.read_bytes()).hexdigest()
+        real = quarantine_module._mask
+
+        def editor_saves(data, nonce):
+            self.save_by_rename(victim, b"the user's newer draft")
+            return real(data, nonce)
+        with mock.patch.object(quarantine_module, "_mask", side_effect=editor_saves):
+            with self.assertRaises(QuarantineError) as raised:
+                store.quarantine(victim, ["test"], expected_sha256=expected)
+        self.assertIn("changed while it was being moved", str(raised.exception))
+        self.assertEqual(victim.read_bytes(), b"the user's newer draft", "the newer draft was destroyed")
+        self.assertEqual((len(store), list((self.tmp / "store").glob("*.quar"))), (0, []))
+
+    def test_a_write_in_place_during_the_move_is_left_too(self):
+        import avguard.quarantine as quarantine_module
+        store = self.store()
+        victim = self.write("notes.txt", b"before")
+        real = quarantine_module._mask
+
+        def appends(data, nonce):
+            with open(victim, "ab") as handle:
+                handle.write(b" and a line added since")
+            return real(data, nonce)
+        with mock.patch.object(quarantine_module, "_mask", side_effect=appends):
+            with self.assertRaises(QuarantineError):
+                store.quarantine(victim, [])
+        self.assertEqual(victim.read_bytes(), b"before and a line added since")
+
+    def test_a_file_saved_under_the_name_during_a_restore_is_kept(self):
+        import avguard.quarantine as quarantine_module
+        store = self.store()
+        victim = self.write("budget.xlsm", b"the held bytes")
+        record = store.quarantine(victim, [])
+        real = quarantine_module._mask
+
+        def user_saves(data, nonce):
+            victim.write_bytes(b"a new budget, saved during the restore")
+            return real(data, nonce)
+        with mock.patch.object(quarantine_module, "_mask", side_effect=user_saves):
+            with self.assertRaises(QuarantineError) as raised:
+                store.restore(record.entry_id)
+        self.assertIn("a file already exists", str(raised.exception))
+        self.assertEqual(victim.read_bytes(), b"a new budget, saved during the restore")
+        self.assertIsNotNone(store.get(record.entry_id), "the held copy was given up")
+        self.assertTrue(store.payload_path(record.entry_id).is_file()
+                        if hasattr(store, "payload_path") else store._payload_path(record.entry_id).is_file())
+        self.assertEqual(list(self.tmp.glob(".avg-*.tmp")), [], "a temporary file was left beside it")
+        target = store.restore(record.entry_id, self.tmp / "elsewhere" / "budget.xlsm")
+        self.assertEqual(target.read_bytes(), b"the held bytes")
+
+    def test_a_restore_with_nothing_in_the_way_still_restores(self):
+        store = self.store()
+        victim = self.write("plain.txt", b"plain")
+        record = store.quarantine(victim, [])
+        self.assertEqual(store.restore(record.entry_id).read_bytes(), b"plain")
+
+    def test_the_mask_is_the_same_bytes_as_before(self):
+        from avguard.quarantine import _keystream, _mask
+        nonce = os.urandom(16)
+        for size in (0, 1, 31, 32, 33, 4097):
+            data = os.urandom(size)
+            stream = _keystream(nonce, size)
+            self.assertEqual(_mask(data, nonce), bytes(a ^ b for a, b in zip(data, stream)), size)
+
+    def test_the_window_moves_only_the_bytes_it_judged(self):
+        try:
+            from avguard import gui
+        except ImportError:
+            self.skipTest("GUI dependencies are not installed")
+        from types import SimpleNamespace
+        from avguard.events import EventStore
+        from avguard.scanner import Level, Verdict
+        store, banners = self.store(), []
+        victim = self.write("notes.txt", b"what was scanned")
+        verdict = Verdict(path=victim, level=Level.MALICIOUS, reasons=["test"],
+                          sha256=hashlib.sha256(b"what was scanned").hexdigest())
+        victim.write_bytes(b"edited since the scan")
+        fake = SimpleNamespace(cfg=config.Config(auto_quarantine=True), has_lock=True, quarantine=store,
+                               events=EventStore(self.tmp / "events.jsonl"), _threats_this_scan=0,
+                               _banner=lambda text, style="": banners.append(text),
+                               _offer_account=lambda *a, **k: None, _offer_exclusion=lambda *a: None,
+                               scanner=SimpleNamespace(packs=None))
+        with mock.patch.object(gui.explain, "from_verdict", return_value=None):
+            gui.AVGuardApp._handle_threat(fake, verdict)
+        self.assertEqual(victim.read_bytes(), b"edited since the scan")
+        self.assertEqual(len(store), 0)
+        self.assertIn("changed after it was scanned", banners[-1])
+
+    def test_only_the_window_holding_the_lock_settles_the_store(self):
+        try:
+            from avguard import gui
+        except ImportError:
+            self.skipTest("GUI dependencies are not installed")
+        from types import SimpleNamespace
+        settled = []
+        for has_lock in (False, True):
+            fake = SimpleNamespace(has_lock=has_lock,
+                                   quarantine=SimpleNamespace(reconcile=lambda: settled.append(1)))
+            gui.AVGuardApp._settle_the_store(fake)
+        self.assertEqual(settled, [1], "a window without the lock reconciled the store")
+
+
+class TestRoundSevenKeptFilesAreReadStrictly(TempCase):
+    """Round seven: the evidence beside the quarantine index and the
+    clipboard's "never warn about this again" list still read a byte-order
+    mark as empty and were written over; a mistyped config value was a log
+    line, and the next unrelated save wrote the default over it; and two
+    set-asides in the same second kept only the second."""
+
+    BOM = b"\xef\xbb\xbf"
+
+    def test_kept_evidence_with_a_byte_order_mark_survives_the_next_quarantine(self):
+        directory = self.tmp / "store"
+        store = QuarantineStore(directory=directory, index_path=directory / "index.json",
+                                protection=SelfProtection([self.tmp / "prot"]))
+        first = store.quarantine(self.write("first.exe", b"one"), [], evidence={"findings": [], "threshold": 100})
+        sidecar = store.evidence_path
+        sidecar.write_bytes(self.BOM + sidecar.read_bytes())
+        store.quarantine(self.write("second.exe", b"two"), [], evidence={"findings": [], "threshold": 100})
+        self.assertIsNotNone(store.evidence(first.entry_id), "the first file's evidence was written over")
+
+    def test_kept_evidence_that_cannot_be_read_is_set_aside(self):
+        directory = self.tmp / "store"
+        store = QuarantineStore(directory=directory, index_path=directory / "index.json",
+                                protection=SelfProtection([self.tmp / "prot"]))
+        store.quarantine(self.write("first.exe", b"one"), [], evidence={"findings": []})
+        store.evidence_path.write_bytes(b'{"damaged": ')
+        store.quarantine(self.write("second.exe", b"two"), [], evidence={"findings": []})
+        kept = list(directory.glob("index_evidence.json.unreadable-*"))
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].read_bytes(), b'{"damaged": ')
+
+    def test_the_clipboard_ignore_list_is_read_strictly(self):
+        from avguard import clipguard
+        guard = clipguard.PasteGuard(None, None, ignore_path=self.tmp / "clipboard_ignore.json")
+        path = guard.ignore_path
+        decisions = ["a" * 64, "b" * 64, "c" * 64]
+        path.write_bytes(self.BOM + json.dumps(decisions).encode())
+        self.assertEqual(guard.ignored(), set(decisions), "a BOM read as no decisions")
+        path.write_bytes(b'["' + b"d" * 64 + b'", ')
+        guard._ignore_mtime = None
+        self.assertEqual(guard.ignored(), set())
+        guard.ignore(type("M", (), {"sha256": "e" * 64})())
+        kept = list(self.tmp.glob("clipboard_ignore.json.unreadable-*"))
+        self.assertEqual(len(kept), 1, "the list that could not be read was written over")
+
+    def test_a_mistyped_value_is_said_and_stays_in_the_file(self):
+        path = self.tmp / "config.json"
+        path.write_text(json.dumps({"watch_paths": "D:/Work", "auto_quarantine": True,
+                                    "excluded_globs": ["**/vm/**", None]}), encoding="utf-8")
+        loaded = config.Config.load(path)
+        self.assertIn("watch_paths", loaded.load_problem)
+        self.assertIn("excluded_globs", loaded.load_problem)
+        loaded.save_changes({"realtime_enabled": False}, path)
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual((raw["watch_paths"], raw["excluded_globs"]), ("D:/Work", ["**/vm/**", None]),
+                         "the user's value was replaced by the default")
+        self.assertEqual((raw["auto_quarantine"], raw["realtime_enabled"]), (True, False))
+
+    def test_a_file_damaged_after_load_is_saved_from_what_was_loaded(self):
+        path = self.tmp / "config.json"
+        config.Config(watch_paths=["D:/Incoming"], auto_quarantine=True,
+                      excluded_globs=["C:/Projects/**"]).save(path)
+        loaded = config.Config.load(path)
+        path.write_text(path.read_text(encoding="utf-8").rstrip().rstrip("}") + ",}", encoding="utf-8")
+        loaded.save_changes({"realtime_enabled": False}, path)
+        again = config.Config.load(path)
+        self.assertEqual((again.watch_paths, again.auto_quarantine, again.excluded_globs, again.realtime_enabled),
+                         (["D:/Incoming"], True, ["C:/Projects/**"], False))
+        self.assertEqual(len(list(self.tmp.glob("config.json.unreadable-*"))), 1)
+
+    def test_two_set_asides_in_one_second_keep_both(self):
+        path = self.tmp / "allow.json"
+        for damage in (b"{first", b"{second", b"{third"):
+            path.write_bytes(damage)
+            config.set_aside_if_unreadable(path)
+        kept = sorted(p.read_bytes() for p in self.tmp.glob("allow.json.unreadable-*"))
+        self.assertEqual(kept, [b"{first", b"{second", b"{third"])
+
+    def test_a_pack_index_with_a_byte_order_mark_is_read(self):
+        packs = _empty_packs(self.tmp)
+        packs.index_path.parent.mkdir(parents=True, exist_ok=True)
+        packs.index_path.write_bytes(self.BOM + json.dumps(
+            {"acme": {"name": "acme", "trusted": True, "rule_count": 1}}).encode())
+        again = PackStore(directory=packs.directory, index_path=packs.index_path)
+        self.assertEqual([p.name for p in again.packs()], ["acme"], "a BOM read as no packs")
 
 
 class _FakeMonitor:
