@@ -194,16 +194,19 @@ class TestTheBaselineIsATarget(FimCase):
         self.assertNotEqual(self.store.key_path.read_bytes(), b"not a protected key")
         self.assertFalse(self.store.baseline([self.tree]).key_replaced, "and only when it had to be")
 
-    def test_accepting_with_an_unreadable_key_keeps_the_rows_and_says_not_signed(self):
+    def test_accepting_with_an_unreadable_key_is_refused_and_writes_nothing(self):
+        """Round six: it wrote the rows, then said "not signed". Accepting
+        into a baseline nobody can vouch for is refused now; baselining
+        again is the way out, as the message says."""
         self.baseline()
         self.store.key_path.write_bytes(b"not a protected key")
         (self.tree / "f1.txt").write_bytes(b"changed")
-        notes = self.store.accept([self.tree / "f1.txt"])
-        self.assertTrue(any("accepted" in n for n in notes), notes)
-        self.assertTrue(any("not signed" in n for n in notes), notes)
+        with self.assertRaises(fim.Refused) as refused:
+            self.store.accept([self.tree / "f1.txt"])
+        self.assertIn("baseline again", str(refused.exception))
         report = self.store.check()
         self.assertEqual(report.integrity, fim.INTEGRITY_KEY_UNREADABLE)
-        self.assertEqual(report.changes, [], "the acceptance itself was recorded")
+        self.assertEqual([c.kind for c in report.changes], ["modified"], "nothing was accepted")
 
     def test_one_writer_at_a_time_and_a_check_waits_for_it(self):
         self.baseline()
@@ -218,9 +221,13 @@ class TestTheBaselineIsATarget(FimCase):
         self.assertEqual(report.roots, [])
         self.assertTrue(any("in use" in e for e in report.errors), report.errors)
         self.assertEqual(self.store.signature_path.read_text(encoding="utf-8"), signature, "nothing was written")
-        self.assertTrue(any("in use" in n for n in self.store.accept([self.tree / "f2.txt"])))
+        with self.assertRaises(fim.Refused) as refused:
+            self.store.accept([self.tree / "f2.txt"])
+        self.assertIn("in use", str(refused.exception))
         check = self.store.check()
         self.assertEqual((check.examined, check.changes), (0, []))
+        self.assertTrue(check.in_use)
+        self.assertFalse(check.clean, "a check that did not run is not a clean check")
         self.assertTrue(any("in use" in e for e in check.errors), check.errors)
         other.release()
         self.assertEqual([c.kind for c in self.store.check().changes], ["modified"])
@@ -232,6 +239,144 @@ class TestTheBaselineIsATarget(FimCase):
         self.store.accept([self.tree / "f1.txt"])
         self.assertNotEqual(first, self.store.signature_path.read_text(encoding="utf-8"))
         self.assertEqual(self.store.verify_integrity(), fim.INTEGRITY_OK)
+
+
+class TestAnOrdinaryWriteDoesNotLaunderATamper(FimCase):
+    """Round six: baseline() and accept() re-signed the whole database
+    without checking it, so a doctored row, a baseline with no signature or
+    one copied in from elsewhere became genuine on the next ordinary write,
+    and no check ever said so."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.other = self.tmp / "web"
+        self.other.mkdir()
+        (self.other / "index.php").write_bytes(b"<?php echo 'hello';")
+        self.baseline()
+        self.assertEqual(self.store.baseline([self.other]).integrity, fim.INTEGRITY_OK)
+
+    def doctor_a_row(self) -> None:
+        import sqlite3
+        (self.other / "index.php").write_bytes(b"something else entirely")
+        forged = hashlib.sha256(b"something else entirely").digest()
+        with sqlite3.connect(self.store.db_path) as conn:
+            conn.execute("UPDATE files SET sha256 = ?, size = ? WHERE path LIKE ?",
+                         (forged, 23, "%index.php"))
+        conn.close()
+        self.assertEqual(self.store.verify_integrity(), fim.INTEGRITY_TAMPERED)
+
+    def test_baselining_another_folder_drops_what_it_cannot_vouch_for(self):
+        self.doctor_a_row()
+        report = self.store.baseline([self.tree], events=self.events)
+        self.assertEqual(report.integrity, fim.INTEGRITY_TAMPERED)
+        self.assertEqual(report.dropped_roots, [str(self.other)])
+        self.assertEqual(self.store.roots(), [str(self.tree)])
+        self.assertEqual(self.store.file_count(), 7, "the doctored row was carried forward")
+        recorded = self.events.read(kinds={"fim"})
+        self.assertEqual([e.level for e in recorded], ["tampered"])
+        self.assertIn("not carried forward", recorded[0].reasons[0])
+
+    def test_accepting_into_a_doctored_baseline_is_refused(self):
+        self.doctor_a_row()
+        (self.tree / "f1.txt").write_bytes(b"an unrelated change")
+        with self.assertRaises(fim.Refused) as refused:
+            self.store.accept([self.tree / "f1.txt"])
+        self.assertIn("modified outside AVGuard", str(refused.exception))
+        self.assertEqual(self.store.check().integrity, fim.INTEGRITY_TAMPERED, "still said")
+
+    def test_a_copied_in_baseline_is_not_adopted(self):
+        self.store.signature_path.unlink()                   # copied in without its signature
+        report = self.store.baseline([self.tree])
+        self.assertEqual(report.integrity, fim.INTEGRITY_UNSIGNED)
+        self.assertEqual(self.store.roots(), [str(self.tree)])
+        self.assertEqual(self.store.verify_integrity(), fim.INTEGRITY_OK)
+
+
+class TestOneRootPerTree(FimCase):
+    """Round six: a re-baselined subfolder was recorded beside its parent,
+    and every check walked it twice: one new file, two ADDED rows."""
+
+    def test_a_subfolder_baselined_again_is_walked_once(self):
+        self.baseline()
+        self.store.baseline([self.tree / "sub"])
+        self.assertEqual(self.store.roots(), [str(self.tree)])
+        (self.tree / "sub" / "shell.php").write_bytes(b"new")
+        report = self.store.check(events=self.events)
+        self.assertEqual([(c.kind, Path(c.path).name) for c in report.changes], [("added", "shell.php")])
+        self.assertEqual(len(self.events.read(kinds={"fim"})), 1)
+
+    def test_a_parent_baselined_after_its_child_replaces_it(self):
+        self.store.baseline([self.tree / "sub"])
+        self.store.baseline([self.tree])
+        self.assertEqual(self.store.roots(), [str(self.tree)])
+        self.assertEqual(self.store.check().changes, [])
+
+
+class TestASignatureThatIsNotText(FimCase):
+    """Round six: a 0xFF byte in baseline.hmac raised UnicodeDecodeError out
+    of verify_integrity, so the window did not open and the daily check died
+    before recording anything."""
+
+    def test_it_is_a_signature_that_does_not_hold(self):
+        self.baseline()
+        self.store.signature_path.write_bytes(b"\xff\xfe\x00junk")
+        self.assertEqual(self.store.verify_integrity(), fim.INTEGRITY_TAMPERED)
+        report = self.store.check(events=self.events)
+        self.assertEqual(report.integrity, fim.INTEGRITY_TAMPERED)
+        self.assertEqual([e.level for e in self.events.read(kinds={"fim"})], ["tampered"])
+        try:
+            from avguard import fimpanel           # what the window builds at start
+        except ImportError:
+            return
+        ok, text = fimpanel.summarize(self.store)
+        self.assertFalse(ok)
+        self.assertIn("TAMPERED", text)
+
+
+class TestADailyTaskTheExecutableCanRun(unittest.TestCase):
+    """Round six: the three daily tasks hard-coded "-m avguard", which the
+    packaged AVGuard.exe's own parser rejects, so under it they never ran."""
+
+    def test_each_task_command_parses_under_the_frozen_build(self):
+        from avguard import scheduling
+        import avguard.__main__ as cli
+        exe = "C:" + chr(92) + "Program Files" + chr(92) + "AVGuard" + chr(92) + "AVGuard.exe"
+        captured = []
+        with mock.patch.object(sys, "executable", exe), \
+                mock.patch.object(sys, "frozen", True, create=True), \
+                mock.patch.object(scheduling.sys, "platform", "win32"), \
+                mock.patch.object(scheduling, "_run", side_effect=lambda args: captured.append(args) or (True, "")):
+            scheduling.enable_scheduled_fim_check()
+            scheduling.enable_scheduled_autoruns_snapshot()
+            scheduling.enable_scheduled_scan(Path("C:/Users/u/Downloads"))
+        commands = [args[args.index("/TR") + 1] for args in captured if "/TR" in args]
+        self.assertEqual(len(commands), 3)
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertTrue(command.startswith(f'"{exe}" --'), command)
+                self.assertNotIn("-m avguard", command)
+                arguments = command[len(f'"{exe}" '):].replace('"', "").split(" ", 1)
+                self.assertTrue(self._parses(cli, arguments), arguments)
+
+    @staticmethod
+    def _parses(cli, arguments):
+        """The program's own parser on these arguments, stopped before it
+        acts; a rejection is argparse's SystemExit(2), as the daily task saw."""
+        import argparse
+
+        class Parsed(Exception):
+            pass
+        real = argparse.ArgumentParser.parse_args
+
+        def parse_then_stop(parser, args=None, namespace=None):
+            raise Parsed(real(parser, args, namespace))
+        with mock.patch.object(argparse.ArgumentParser, "parse_args", parse_then_stop):
+            try:
+                cli._main(arguments)
+            except Parsed as done:
+                parsed = done.args[0]
+                return parsed.fim_check or parsed.autoruns_snapshot or parsed.scan
+        return False
 
 
 @unittest.skipUnless(sys.platform == "win32", "DPAPI is a Windows API")
@@ -348,6 +493,17 @@ class TestTheCommandLine(FimCase):
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = cli.main(list(args))
         return code, out.getvalue() + err.getvalue()
+
+    def test_a_check_locked_out_says_so_and_does_not_exit_zero(self):
+        self._cli("--fim-baseline", str(self.tree))
+        with mock.patch.object(FimStore, "check", return_value=fim.CheckReport(in_use=True)):
+            code, output = self._cli("--fim-check")
+        self.assertEqual(code, 2, output)
+        self.assertIn("Not checked", output)
+        self.assertNotIn("No changes", output)
+        with mock.patch.object(FimStore, "accept", side_effect=fim.Refused("Nothing was accepted: in use")):
+            code, output = self._cli("--fim-accept", str(self.tree / "f1.txt"))
+        self.assertEqual(code, 2, output)
 
     def test_baseline_check_accept_round_trip(self):
         code, output = self._cli("--fim-baseline", str(self.tree))
@@ -613,6 +769,28 @@ class TestThePanelOnAWindow(FimCase):
         self.assertIn("Accepted 1 change(s)", panel.status_var.get())
         self.assertTrue(self.store.check().clean, "the accepted change is the baseline now")
         self.assertEqual(self.store.verify_integrity(), fim.INTEGRITY_OK, "and it was re-signed")
+
+    def test_a_refused_accept_keeps_the_rows_and_says_nothing_was_accepted(self):
+        """Round six: the tab deleted the selected rows and said "Accepted 1
+        change(s)" when accept() had been locked out and accepted nothing."""
+        panel = self.panel
+        self.baseline()
+        (self.tree / "f3.txt").write_bytes(b"edited")
+        self.assertTrue(panel.check())
+        self.wait()
+        panel.tree.selection_set(panel.tree.get_children())
+        other = fim.FileLock(self.store.lock_path)
+        self.assertTrue(other.acquire(0.1))
+        self.addCleanup(other.release)
+        self.addCleanup(setattr, fim, "LOCK_WAIT", fim.LOCK_WAIT)
+        fim.LOCK_WAIT = 0.2
+        with mock.patch.object(self.fimpanel.Messagebox, "yesno", return_value="Yes"):
+            self.assertTrue(panel.accept_selected())
+        self.wait()
+        self.assertEqual(len(panel.tree.get_children()), 1, "the change is still the change")
+        self.assertIn("Nothing was accepted", panel.status_var.get())
+        other.release()
+        self.assertEqual([c.kind for c in self.store.check().changes], ["modified"])
 
     def test_a_tampered_baseline_turns_the_summary_red(self):
         self.baseline()

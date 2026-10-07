@@ -70,6 +70,15 @@ def _launcher() -> tuple[str, str]:
     return str(runner), '-m avguard'
 
 
+def task_command(*arguments: str) -> str:
+    """The /TR command line of a scheduled task: the launcher, its own
+    arguments when it has any, then `arguments`. The three daily tasks
+    hard-coded "-m avguard", which the packaged AVGuard.exe's parser rejects:
+    under it they failed every day, before logging, with no trace."""
+    runner, own = _launcher()
+    return " ".join(part for part in (f'"{runner}"', own, *arguments) if part)
+
+
 def _run(args: list[str]) -> tuple[bool, str]:
     try:
         result = subprocess.run(args, capture_output=True, text=True, timeout=30,
@@ -148,8 +157,7 @@ def enable_scheduled_scan(target: Path, time_of_day: str = "12:00") -> tuple[boo
     if sys.platform != "win32":
         return False, "only supported on Windows"
 
-    runner, _ = _launcher()
-    command = f'"{runner}" -m avguard --scan "{target}"'
+    command = task_command("--scan", f'"{target}"')
 
     ok, output = _run(["schtasks", "/Create", "/F", "/SC", "DAILY",
                        "/TN", TASK_NAME, "/TR", command, "/ST", time_of_day])
@@ -180,8 +188,7 @@ def enable_scheduled_fim_check(time_of_day: str = "12:30") -> tuple[bool, str]:
     nothing -- a check cannot quarantine at all, scheduled or not."""
     if sys.platform != "win32":
         return False, "only supported on Windows"
-    runner, _ = _launcher()
-    command = f'"{runner}" -m avguard --fim-check'
+    command = task_command("--fim-check")
     ok, output = _run(["schtasks", "/Create", "/F", "/SC", "DAILY",
                        "/TN", FIM_TASK_NAME, "/TR", command, "/ST", time_of_day])
     if not ok:
@@ -211,8 +218,7 @@ def enable_scheduled_autoruns_snapshot(time_of_day: str = "12:45") -> tuple[bool
     what changed since the previous one and changes nothing itself."""
     if sys.platform != "win32":
         return False, "only supported on Windows"
-    runner, _ = _launcher()
-    command = f'"{runner}" -m avguard --autoruns-snapshot'
+    command = task_command("--autoruns-snapshot")
     ok, output = _run(["schtasks", "/Create", "/F", "/SC", "DAILY",
                        "/TN", AUTORUNS_TASK_NAME, "/TR", command, "/ST", time_of_day])
     if not ok:

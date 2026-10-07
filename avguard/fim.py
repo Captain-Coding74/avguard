@@ -49,7 +49,7 @@ from typing import Callable, Iterable
 
 from . import config
 from .events import Event, EventStore
-from .protection import matches_excluded_glob, path_within
+from .protection import matches_excluded_glob
 
 log = logging.getLogger(__name__)
 
@@ -80,6 +80,14 @@ INTEGRITY_MESSAGES = {
     INTEGRITY_KEY_UNREADABLE: "the baseline's signing key cannot be read (another "
                               "user's, or damaged); the signature cannot be checked",
 }
+
+
+
+class Refused(RuntimeError):
+    """accept() wrote nothing: the baseline is in use, or its signature does
+    not hold. Raised, not returned as a note: a note read as success, and the
+    Integrity tab cleared the rows it had not accepted."""
+
 
 # Hooks for a front end: progress(done, total) after each file, should_stop()
 # polled before each one. The CLI passes neither; the Integrity tab passes both.
@@ -189,6 +197,12 @@ class BaselineReport:
     seconds: float = 0.0
     cancelled: bool = False      # stopped early; nothing was written
     key_replaced: bool = False   # the signing key could not be read and a new one signs this baseline
+    in_use: bool = False         # another AVGuard held the lock; nothing was written
+    # The previous baseline's signature state. When it did not hold, its rows
+    # were not carried forward: nothing vouches for them, and signing them
+    # with this baseline would launder whatever was done to them.
+    integrity: str = INTEGRITY_OK
+    dropped_roots: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -201,6 +215,7 @@ class CheckReport:
     fast: bool = False
     seconds: float = 0.0
     cancelled: bool = False      # stopped early; nothing was recorded
+    in_use: bool = False         # another AVGuard held the lock; nothing was checked
 
     def of(self, kind: str) -> list[Change]:
         return [c for c in self.changes if c.kind == kind]
@@ -219,7 +234,8 @@ class CheckReport:
 
     @property
     def clean(self) -> bool:
-        return not self.changes and self.integrity == INTEGRITY_OK and not self.cancelled
+        return (not self.changes and self.integrity == INTEGRITY_OK and not self.cancelled
+                and not self.in_use)
 
     def integrity_event(self) -> Event | None:
         if self.integrity in (INTEGRITY_OK, INTEGRITY_NO_BASELINE):
@@ -253,6 +269,14 @@ def _is_reparse_point(path: Path) -> bool:
 
 def _key(path: str | Path) -> str:
     return os.path.normcase(os.path.abspath(str(path)))
+
+
+def _under(path: str, root: str) -> bool:
+    """`path` is `root` or inside it, by text: no resolve() and no stat, so
+    it costs nothing per row (path_within on 60,000 rows held the lock six
+    seconds)."""
+    a, b = _key(path), _key(root).rstrip(os.sep)
+    return a == b or a.startswith(b + os.sep)
 
 
 # ------------------------------------------------------------------ store
@@ -351,11 +375,18 @@ class FimStore:
         # Rollback journal, not WAL: after commit and close the database is
         # one file, which is what the signature covers.
         conn = sqlite3.connect(self.db_path, timeout=5)
-        conn.execute("CREATE TABLE IF NOT EXISTS files("
-                     "path TEXT PRIMARY KEY, sha256 BLOB NOT NULL, size INTEGER NOT NULL, "
-                     "mtime_ns INTEGER NOT NULL, baselined_at REAL NOT NULL)")
-        conn.execute("CREATE TABLE IF NOT EXISTS roots(path TEXT PRIMARY KEY, added_at REAL NOT NULL)")
-        conn.commit()
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS files("
+                         "path TEXT PRIMARY KEY, sha256 BLOB NOT NULL, size INTEGER NOT NULL, "
+                         "mtime_ns INTEGER NOT NULL, baselined_at REAL NOT NULL)")
+            conn.execute("CREATE TABLE IF NOT EXISTS roots(path TEXT PRIMARY KEY, added_at REAL NOT NULL)")
+            conn.commit()
+        except BaseException:
+            # A file that is not a database fails here, before the caller's
+            # closing() has the connection: closed now, or its handle keeps
+            # the file open (on Windows, unrenamable) until collected.
+            conn.close()
+            raise
         return conn
 
     def _excluded(self, path: Path) -> bool:
@@ -413,7 +444,8 @@ class FimStore:
     # ------------------------------------------------------------ baseline
 
     def baseline(self, roots: Iterable[Path], progress: ProgressHook | None = None,
-                 should_stop: StopHook | None = None) -> BaselineReport:
+                 should_stop: StopHook | None = None,
+                 events: EventStore | None = None) -> BaselineReport:
         """Record what the roots hold now. A root already recorded is replaced.
 
         The roots are walked first and hashed second, so `progress` knows the
@@ -454,30 +486,61 @@ class FimStore:
 
         lock = FileLock(self.lock_path)
         if not lock.acquire(LOCK_WAIT):
+            log.warning("baseline not written: %s", IN_USE)
             report.errors.append(IN_USE)
+            report.in_use = True
             report.roots = []
             report.seconds = time.monotonic() - started
             return report
         try:
+            # Checked before anything is written, under the lock. A baseline
+            # of one folder used to re-sign every other folder's rows as they
+            # stood, so a row doctored outside AVGuard, or a baseline copied
+            # in without its signature, became genuine on the next ordinary
+            # baseline and no check ever said so.
+            report.integrity = self.verify_integrity()
+            untrusted = report.integrity not in (INTEGRITY_OK, INTEGRITY_NO_BASELINE)
             with closing(self._connect()) as conn:
                 with conn:
+                    existing = [row[0] for row in conn.execute("SELECT path FROM files")]
+                    recorded = [row[0] for row in conn.execute("SELECT path FROM roots")]
                     # Rows under a root being re-baselined go first, so a file that
                     # vanished since the last baseline is not carried forward.
-                    existing = [row[0] for row in conn.execute("SELECT path FROM files")]
+                    # When the old signature did not hold, nothing is carried
+                    # forward: what is not baselined again is dropped, and said.
                     stale = [p for p in existing
-                             if any(path_within(p, root) for root in report.roots)]
+                             if untrusted or any(_under(p, root) for root in report.roots)]
                     conn.executemany("DELETE FROM files WHERE path = ?", ((p,) for p in stale))
                     conn.executemany(
                         "INSERT OR REPLACE INTO files(path, sha256, size, mtime_ns, baselined_at) "
                         "VALUES (?, ?, ?, ?, ?)", rows)
+                    # One root per tree: a subfolder of a recorded root is not
+                    # recorded again (every check walked it twice and reported
+                    # each new file under it twice), and recorded roots inside
+                    # one being baselined give way to it.
+                    keep = [r for r in recorded if not untrusted
+                            and not any(_under(r, root) for root in report.roots)]
+                    report.dropped_roots = [r for r in recorded if untrusted
+                                            and not any(_under(r, root) for root in report.roots)]
+                    new_roots = [r for r in report.roots if not any(_under(r, k) for k in keep)]
+                    conn.execute("DELETE FROM roots")
                     conn.executemany("INSERT OR REPLACE INTO roots(path, added_at) VALUES (?, ?)",
-                                     ((r, now) for r in report.roots))
+                                     [(r, now) for r in keep] + [(r, now) for r in new_roots])
             # A baseline is "record what is here now": a key that cannot be
             # read (another user's, or damaged) goes with the old baseline,
             # and the documented way out of key-unreadable is this call.
             report.key_replaced = self._sign(replace_unreadable_key=True)
         finally:
             lock.release()
+        if untrusted:
+            message = (f"{INTEGRITY_MESSAGES[report.integrity]}; it was not carried forward"
+                       + (f", and {len(report.dropped_roots)} folder(s) not baselined again were dropped"
+                          if report.dropped_roots else ""))
+            log.warning("baseline: %s", message)
+            if events is not None:
+                events.record(Event(kind="fim", level="tampered", reasons=[message],
+                                    detail={"integrity": report.integrity,
+                                            "dropped_roots": report.dropped_roots}))
         report.files = len(rows)
         report.seconds = time.monotonic() - started
         log.info("baselined %d file(s) under %d root(s) in %.1fs",
@@ -510,7 +573,11 @@ class FimStore:
         # hashing that follows holds nothing.
         lock = FileLock(self.lock_path)
         if not lock.acquire(LOCK_WAIT):
+            # Not a clean check: nothing was checked. It used to read "No
+            # changes", exit 0, and under the daily task leave no trace.
+            log.warning("integrity check not run: %s", IN_USE)
             report.errors.append(IN_USE)
+            report.in_use = True
             report.seconds = time.monotonic() - started
             return report
         try:
@@ -546,13 +613,20 @@ class FimStore:
         # The roots are walked before anything is hashed, so the total is
         # known from the first progress call; the walk is the cheap part.
         fresh: list[Path] = []
+        walked: set[str] = set()
         for root in roots:
             root_path = Path(root)
             if not root_path.is_dir():
                 report.errors.append(f"root no longer exists: {root}")
                 continue
-            fresh.extend(path for path in self._walk(root_path, report.errors)
-                         if _key(path) not in known)
+            for path in self._walk(root_path, report.errors):
+                key = _key(path)
+                # A root inside another (a baseline from before roots were
+                # kept one per tree) is walked once per root; a file is
+                # reported once.
+                if key not in known and key not in walked:
+                    walked.add(key)
+                    fresh.append(path)
         total = len(candidates) + len(fresh)
         done = 0
 
@@ -635,18 +709,38 @@ class FimStore:
         A user action, never automatic: the alert stops repeating because a
         person decided it should. A path that is gone is dropped from the
         baseline; a new one is added; a changed one is re-hashed.
+
+        Raises Refused, having written nothing, when another AVGuard holds
+        the baseline or its signature does not hold: accepting into a
+        baseline nobody can vouch for signed whatever had been done to it.
+        The files are hashed before the lock is taken, so a large accept
+        does not lock out the daily check.
         """
         done: list[str] = []
+        hashed: list[tuple[Path, tuple[str, int, int] | None]] = []
+        for path in paths:
+            path = Path(os.path.abspath(str(path)))
+            if path.is_file():
+                try:
+                    hashed.append((path, hash_file(path)))
+                except OSError as exc:
+                    done.append(f"{path}: could not be read ({exc}); not accepted")
+            else:
+                hashed.append((path, None))
         lock = FileLock(self.lock_path)
         if not lock.acquire(LOCK_WAIT):
-            return [IN_USE]
+            log.warning("accept refused: %s", IN_USE)
+            raise Refused(f"Nothing was accepted: {IN_USE}.")
         try:
+            integrity = self.verify_integrity()
+            if integrity != INTEGRITY_OK:
+                raise Refused(f"Nothing was accepted: {INTEGRITY_MESSAGES.get(integrity, integrity)}. "
+                              "Check it to see what changed, or baseline again to start over.")
             with closing(self._connect()) as conn:
                 with conn:
-                    for path in paths:
-                        path = Path(os.path.abspath(str(path)))
-                        if path.is_file():
-                            sha, size, mtime_ns = hash_file(path)
+                    for path, facts in hashed:
+                        if facts is not None:
+                            sha, size, mtime_ns = facts
                             conn.execute(
                                 "INSERT OR REPLACE INTO files(path, sha256, size, mtime_ns, "
                                 "baselined_at) VALUES (?, ?, ?, ?, ?)",
@@ -708,7 +802,13 @@ class FimStore:
             key = self._unprotect(self.key_path.read_bytes())
         except (OSError, ValueError):
             return INTEGRITY_KEY_UNREADABLE
-        recorded = self.signature_path.read_text(encoding="utf-8").strip()
+        try:
+            recorded = self.signature_path.read_text(encoding="ascii").strip()
+        except (OSError, ValueError):
+            # A signature file holding a byte that is not text (a disk error,
+            # another tool, someone who wants AVGuard gone) is a signature
+            # that does not hold. It raised, and the window never opened.
+            return INTEGRITY_TAMPERED
         if hmac.compare_digest(recorded, self._signature(key)):
             return INTEGRITY_OK
         return INTEGRITY_TAMPERED

@@ -1399,7 +1399,9 @@ class TestTheWindowsQuarantineActions(TempCase):
             self.gui.AVGuardApp._restore_entry(self.fake, kept.entry_id)
             self.gui.AVGuardApp._delete_selected(self.fake)
         restored, deleted = self.events.read(kinds={"restored"}), self.events.read(kinds={"deleted"})
-        self.assertEqual([e.path for e in restored], [str(self.tmp / "kept.docx")])
+        # The record's path, resolved when the file was taken (on the runner
+        # TEMP is spelled RUNNER~1 and resolves to runneradmin).
+        self.assertEqual([e.path for e in restored], [kept.original_path])
         self.assertEqual([e.path for e in deleted], [gone.original_path])
         self.assertEqual(restored[0].detail, {"sha256": kept.sha256, "from": "quarantine"})
         self.assertNotIn("entry_id", deleted[0].detail, "the consent does not name the store's ids")

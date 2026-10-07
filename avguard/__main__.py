@@ -343,9 +343,13 @@ def _fim_command(args) -> int:
 
     if args.fim_baseline:
         roots = [Path(r) for r in args.fim_baseline]
-        report = store.baseline(roots)
+        report = store.baseline(roots, events=EventStore())
         for problem in report.errors:
             print(f"  skipped: {problem}", file=sys.stderr)
+        if report.in_use:
+            print("Nothing was baselined: the baseline is in use by another AVGuard. "
+                  "Run this again in a moment.", file=sys.stderr)
+            return 2
         if not report.roots:
             print("Nothing was baselined.", file=sys.stderr)
             return 1
@@ -356,6 +360,11 @@ def _fim_command(args) -> int:
             print(f"    {root}")
         if report.key_replaced:
             print("The signing key could not be read and was replaced; this baseline is signed with a new one.")
+        if report.integrity not in (fim.INTEGRITY_OK, fim.INTEGRITY_NO_BASELINE):
+            print(f"The previous baseline was not carried forward: "
+                  f"{fim.INTEGRITY_MESSAGES[report.integrity]}.")
+            for root in report.dropped_roots:
+                print(f"    dropped, baseline it again to watch it: {root}")
         print("The baseline is signed. Check it with:  python -m avguard --fim-check")
         return 0
 
@@ -364,6 +373,11 @@ def _fim_command(args) -> int:
         if report.integrity == fim.INTEGRITY_NO_BASELINE:
             print("No baseline. Create one with:  python -m avguard --fim-baseline <folder>",
                   file=sys.stderr)
+            return 2
+        if report.in_use:
+            # Not "No changes" and not exit 0: nothing was checked.
+            print("Not checked: the baseline is in use by another AVGuard (a baseline, a check "
+                  "or an accept is running). Run this again in a moment.", file=sys.stderr)
             return 2
         integrity_event = report.integrity_event()
         if integrity_event is not None:
@@ -391,7 +405,12 @@ def _fim_command(args) -> int:
         if not store.exists():
             print("No baseline to accept into.", file=sys.stderr)
             return 2
-        for note in store.accept(Path(p) for p in args.fim_accept):
+        try:
+            notes = store.accept(Path(p) for p in args.fim_accept)
+        except fim.Refused as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        for note in notes:
             print(f"  {note}")
         return 0
 

@@ -15,6 +15,7 @@ import tempfile as _tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -653,6 +654,69 @@ class TestTheStore(AutorunsCase):
 
 
 # ------------------------------------------------------------- the tab
+
+class TestRoundSixSnapshots(AutorunsCase):
+    """Round six: the first-read rule could not tell a kind never read from
+    one read fine and empty; the tab recomputed changes without that rule;
+    two overlapping snapshots recorded a false tamper; and a signature file
+    that was not text raised instead of reading as tampered."""
+
+    def test_an_empty_kind_read_once_then_not_still_reports_what_appears_next(self):
+        (self.startup / "Sync.lnk").unlink()
+        self.store.snapshot(self.collect(), events=self.events)          # Startup read fine, empty
+        with mock.patch.object(Path, "iterdir", side_effect=PermissionError(13, "denied")):
+            collected = self.collect()
+        day2 = self.store.snapshot(collected, events=self.events)
+        self.assertIn(autoruns.KIND_STARTUP, day2.snapshot.failed)
+        (self.startup / "svchost.lnk").write_bytes(b"L\x00\x00\x00 a new shortcut")
+        day3 = self.store.snapshot(self.collect(), events=self.events)
+        self.assertEqual([(c.kind, c.entry.name) for c in day3.changes], [("added", "svchost.lnk")],
+                         "swallowed as a first read")
+        self.assertEqual([e.level for e in self.events.read(kinds={"autoruns"})], ["added"])
+
+    def test_the_tab_agrees_with_the_snapshot_after_a_failed_first_read(self):
+        self.store.snapshot(self.collect(runner=lambda: b""), events=self.events)
+        second = self.store.snapshot(self.collect(), events=self.events)
+        self.assertEqual(second.changes, [])
+        self.assertEqual(self.store.last_changes(), [], "every task was NEW on the tab")
+        self.registry.put("HKCU", autoruns.RUN_KEYS[0], "Dropper", "C:" + BS + "d.exe")
+        self.store.snapshot(self.collect(), events=self.events)
+        self.assertEqual([(c.kind, c.entry.name) for c in self.store.last_changes()], [("added", "Dropper")])
+
+    def test_two_overlapping_snapshots_record_no_false_tamper(self):
+        import threading
+        self.store.snapshot(self.collect())
+        other = autoruns.AutorunsStore(self.store.directory, key_protect=stub_protect,
+                                       key_unprotect=stub_unprotect)
+        real_sign = autoruns.AutorunsStore._sign
+        signing = threading.Event()
+
+        def slow_sign(store):
+            if store is self.store:
+                signing.set()               # committed, not yet signed: the window the race lives in
+                time.sleep(0.6)
+            return real_sign(store)
+        with mock.patch.object(autoruns.AutorunsStore, "_sign", slow_sign):
+            first = threading.Thread(target=self.store.snapshot, args=(self.collect(),),
+                                     kwargs={"events": self.events})
+            first.start()
+            self.assertTrue(signing.wait(5))
+            report = other.snapshot(self.collect(), events=self.events)
+            first.join(10)
+        self.assertEqual(report.integrity, autoruns.INTEGRITY_OK)
+        self.assertEqual([e.level for e in self.events.read(kinds={"autoruns"})], [])
+        self.assertEqual(self.store.verify_integrity(), autoruns.INTEGRITY_OK)
+
+    def test_a_signature_that_is_not_text_is_tampered_not_a_crash(self):
+        self.store.snapshot(self.collect())
+        self.store.signature_path.write_bytes(b"\xff\xfe\x00junk")
+        self.assertEqual(self.store.verify_integrity(), autoruns.INTEGRITY_TAMPERED)
+        ok, text = autoruns.summarize(self.store)
+        self.assertFalse(ok)
+        report = self.store.snapshot(self.collect(), events=self.events)
+        self.assertEqual(report.integrity, autoruns.INTEGRITY_TAMPERED)
+        self.assertEqual([e.level for e in self.events.read(kinds={"autoruns"})], ["tampered"])
+
 
 class TestTheTabOnAWindow(AutorunsCase):
     """The Startup tab on the shared withdrawn window: a snapshot through its

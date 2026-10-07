@@ -709,6 +709,15 @@ class AutorunsStore:
     def _connect(self) -> sqlite3.Connection:
         self.directory.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.db_path, timeout=5)
+        try:
+            self._create_tables(conn)
+        except BaseException:
+            conn.close()            # a file that is not a database; see fim.FimStore._connect
+            raise
+        return conn
+
+    @staticmethod
+    def _create_tables(conn: sqlite3.Connection) -> None:
         conn.execute("CREATE TABLE IF NOT EXISTS snapshots("
                      "id INTEGER PRIMARY KEY AUTOINCREMENT, taken_at REAL NOT NULL, "
                      "entries INTEGER NOT NULL, seconds REAL NOT NULL, errors TEXT NOT NULL, "
@@ -721,7 +730,6 @@ class AutorunsStore:
                      "enabled INTEGER NOT NULL, extra TEXT NOT NULL, detail TEXT NOT NULL, "
                      "fingerprint TEXT NOT NULL, PRIMARY KEY(snapshot_id, key))")
         conn.commit()
-        return conn
 
     # ------------------------------------------------------------ reading
 
@@ -784,11 +792,16 @@ class AutorunsStore:
 
     def last_changes(self) -> list[Change]:
         """The difference between the two most recent snapshots, recomputed
-        from what is stored: what the tab shows when it opens."""
+        from what is stored: what the tab shows when it opens. With the same
+        first-read rule the snapshot applied, or every scheduled task was NEW
+        here the day after a failed listing, while the snapshot itself had
+        said nothing changed."""
         found = self.snapshots()
         if len(found) < 2:
             return []
-        return diff(self.entries(found[-2].id), self.entries(found[-1].id))
+        changes = diff(self.entries(found[-2].id), self.entries(found[-1].id))
+        first = _first_read({c.entry.kind for c in changes}, found[:-1], found[-1].failed)
+        return [c for c in changes if c.entry.kind not in first]
 
     # ------------------------------------------------------------ writing
 
@@ -800,15 +813,21 @@ class AutorunsStore:
         task share the files."""
         report = SnapshotReport(errors=list(collected.errors), counts=dict(collected.counts),
                                 seconds=dict(collected.seconds))
-        report.integrity = self.verify_integrity() if self.exists() else INTEGRITY_NO_SNAPSHOT
         if not collected.entries:
+            report.integrity = self.verify_integrity() if self.exists() else INTEGRITY_NO_SNAPSHOT
             report.errors.append("nothing was collected; the snapshot was not recorded")
             return report
         lock = fim.FileLock(self.directory / LOCK_NAME)
         if not lock.acquire(LOCK_WAIT):
+            report.integrity = self.verify_integrity() if self.exists() else INTEGRITY_NO_SNAPSHOT
             report.errors.append("another snapshot is being taken; this one was not recorded")
             return report
         try:
+            # Under the lock, as fim.check() does. Verified before it, a
+            # snapshot overlapping another read that one's committed rows
+            # against the old signature and recorded "modified outside
+            # AVGuard": 15 of 30 pairs started 20-140 ms apart did.
+            report.integrity = self.verify_integrity() if self.exists() else INTEGRITY_NO_SNAPSHOT
             return self._snapshot(collected, events, report)
         finally:
             lock.release()
@@ -845,13 +864,15 @@ class AutorunsStore:
                 report.carried[kind] = len(kept)
                 report.errors.append(f"{kind}: not read this time; the previous snapshot's "
                                      f"{len(kept)} kept")
-        # A kind the previous snapshot could not read, with nothing to
-        # carry, is read for the first time now: recorded, not compared,
-        # or every task would be NEW the day after a bad first read.
-        first_read = {kind for kind in (latest.failed if latest is not None else ())
-                      if kind not in collected.failed and not any(e.kind == kind for e in previous)}
+        # A kind no stored snapshot has ever read is read for the first time
+        # now: recorded, not compared, or every task would be NEW the day
+        # after a bad first read. Decided from history, not from whether the
+        # previous snapshot held entries of the kind: an empty Startup folder
+        # read fine and then once not at all swallowed the next .lnk dropped
+        # into it, which no check ever reported.
         if latest is not None:
             changes = diff(previous, entries)
+            first_read = _first_read({c.entry.kind for c in changes}, self.snapshots(), collected.failed)
             for kind in sorted(first_read):
                 skipped = sum(1 for c in changes if c.entry.kind == kind)
                 if skipped:
@@ -934,10 +955,21 @@ class AutorunsStore:
             key = self._unprotect(self.key_path.read_bytes())
         except (OSError, ValueError):
             return INTEGRITY_KEY_UNREADABLE
-        recorded = self.signature_path.read_text(encoding="utf-8").strip()
+        try:
+            recorded = self.signature_path.read_text(encoding="ascii").strip()
+        except (OSError, ValueError):
+            return INTEGRITY_TAMPERED       # not text: a signature that does not hold, not a crash
         if hmac.compare_digest(recorded, self._signature(key)):
             return INTEGRITY_OK
         return INTEGRITY_TAMPERED
+
+
+def _first_read(kinds, before: Sequence[Snapshot], failed_now) -> set[str]:
+    """Of `kinds`, those read now and by no snapshot in `before`: a snapshot
+    read a kind when the kind is not in its failed list, whether or not it
+    found anything."""
+    return {kind for kind in kinds
+            if kind not in failed_now and before and all(kind in s.failed for s in before)}
 
 
 # ------------------------------------------------------------------- words

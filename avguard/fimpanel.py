@@ -91,6 +91,9 @@ def describe_check(report: fim.CheckReport) -> str:
     """The status line under the list, in the CLI's words."""
     if report.integrity == fim.INTEGRITY_NO_BASELINE:
         return "No baseline to check against. Baseline a folder first."
+    if report.in_use:
+        return ("Not checked: the baseline is in use by another AVGuard (the daily check, or a "
+                "second window). Try again in a moment.")
     parts: list[str] = []
     integrity = report.integrity_event()
     if integrity is not None:
@@ -311,7 +314,7 @@ class IntegrityPanel(tb.Frame):
 
         def work() -> None:
             report = store.baseline([folder], progress=self._progress_hook("Hashed"),
-                                    should_stop=self._cancel.is_set)
+                                    should_stop=self._cancel.is_set, events=self._events)
             self._post(self._baseline_finished, folder, report)
         return self._start("baseline", work)
 
@@ -323,6 +326,10 @@ class IntegrityPanel(tb.Frame):
         if report.cancelled:
             self.status_var.set("Baseline cancelled; nothing was written.")
             return
+        if report.in_use:
+            self.status_var.set("Nothing was baselined: the baseline is in use by another AVGuard. "
+                                "Try again in a moment.")
+            return
         if not report.roots:
             self.status_var.set(f"Nothing was baselined: {'; '.join(report.errors)}")
             return
@@ -330,8 +337,14 @@ class IntegrityPanel(tb.Frame):
         self._clear_rows()
         mb = report.bytes / (1024 * 1024)
         skipped = f", {report.skipped} unreadable file(s) skipped" if report.skipped else ""
+        dropped = ""
+        if report.integrity not in (fim.INTEGRITY_OK, fim.INTEGRITY_NO_BASELINE):
+            dropped = (f" The previous baseline was not carried forward: "
+                       f"{fim.INTEGRITY_MESSAGES[report.integrity]}"
+                       + (f"; {len(report.dropped_roots)} other folder(s) were dropped, baseline them "
+                          "again to watch them" if report.dropped_roots else "") + ".")
         self.status_var.set(f"Baselined {report.files:,} file(s), {mb:,.1f} MB, under {folder} "
-                            f"in {report.seconds:.1f} s{skipped}. The baseline is signed.")
+                            f"in {report.seconds:.1f} s{skipped}. The baseline is signed.{dropped}")
 
     # ------------------------------------------------------------- check
 
@@ -380,9 +393,19 @@ class IntegrityPanel(tb.Frame):
         paths = [Path(change.path) for change in selected]
 
         def work() -> None:
-            notes = store.accept(paths)
+            try:
+                notes = store.accept(paths)
+            except fim.Refused as exc:
+                self._post(self._accept_refused, str(exc))
+                return
             self._post(self._accept_finished, iids, notes)
         return self._start("accept", work)
+
+    def _accept_refused(self, message: str) -> None:
+        """Nothing was accepted, so the rows stay: they are still the changes."""
+        self._set_busy(False)
+        log.warning("integrity: %s", message)
+        self.status_var.set(message)
 
     def _accept_finished(self, iids: list[str], notes: list[str]) -> None:
         self._set_busy(False)
