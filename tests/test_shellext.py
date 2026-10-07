@@ -178,7 +178,8 @@ class TestTheCommandString(unittest.TestCase):
         with mock.patch.object(sys, "executable", exe), \
                 mock.patch.object(sys, "frozen", False, create=True):
             command = shellext.command_string()
-        self.assertTrue(command.startswith(f'"{exe}" -m avguard --scan "%1" --pause'), command)
+        run_py = str(shellext.config.PROJECT_ROOT / "run.py")
+        self.assertEqual(command, f'"{exe}" "{run_py}" --scan "%1" --pause')
 
     def test_frozen_runs_the_executable_itself(self):
         exe = "C:" + BS + "AVGuard" + BS + "AVGuard.exe"
@@ -196,7 +197,29 @@ class TestTheCommandString(unittest.TestCase):
                 mock.patch.object(sys, "frozen", False, create=True):
             exe, args = shellext.runner()
         self.assertEqual(Path(exe).name, "python.exe", "the result has to be visible")
-        self.assertEqual(args, ["-m", "avguard"])
+        self.assertEqual(args, [str(shellext.config.PROJECT_ROOT / "run.py")])
+
+    def test_the_registered_command_runs_from_any_folder(self):
+        """Round six: "-m avguard" found the package only with the checkout
+        as the working directory. Explorer starts a verb in the clicked
+        item's folder and Task Scheduler in System32: "No module named
+        avguard", and the console closed."""
+        import shlex
+        import subprocess
+        tmp = Path(tempfile.mkdtemp(prefix="avguard-shell-"))
+        self.addCleanup(_remove_tree, tmp)
+        clicked = tmp / "elsewhere" / "letter.txt"
+        clicked.parent.mkdir()
+        clicked.write_text("nothing here", encoding="utf-8")
+        with mock.patch.object(sys, "frozen", False, create=True):
+            command = shellext.command_string().replace("%1", str(clicked))
+        # Windows parses the command line itself, as Explorer hands it over.
+        argv = command if sys.platform == "win32" else shlex.split(command)
+        environment = {**os.environ, "AVGUARD_DATA": str(tmp / "data"), "PYTHONPATH": ""}
+        done = subprocess.run(argv, cwd=clicked.parent, env=environment, capture_output=True,
+                              text=True, timeout=120, stdin=subprocess.DEVNULL)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("Threats  : 0", done.stdout)
 
 
 class TestTheCommandLine(unittest.TestCase):
@@ -250,6 +273,28 @@ class TestTheCommandLine(unittest.TestCase):
         self.assertEqual(len(shown), 1)
         self.assertIn("thing.exe", shown[0][0])
         self.assertIn("Examined : 1 file(s)", shown[0][1])
+
+    def test_a_scan_with_no_console_finishes_and_shows_its_summary(self):
+        """Round six: the test above called the pause directly. Through
+        --scan, say() wrote to a sys.stdout that is None under the windowed
+        build and pythonw, the first line raised, and nothing was shown or
+        recorded: not the summary, not the detection."""
+        from avguard.scanner import SELFTEST_MARKER
+        tmp = Path(tempfile.mkdtemp(prefix="avguard-shell-"))
+        self.addCleanup(_remove_tree, tmp)
+        sample = tmp / "threat.bin"
+        sample.write_bytes(SELFTEST_MARKER)
+        shown: list[tuple[str, str]] = []
+        fake_messagebox = mock.MagicMock(showinfo=lambda title, text: shown.append((title, text)))
+        fake_tk = mock.MagicMock(messagebox=fake_messagebox)
+        import avguard.__main__ as cli
+        with mock.patch.dict(sys.modules, {"tkinter": fake_tk, "tkinter.messagebox": fake_messagebox}), \
+                mock.patch.object(sys, "stdout", None), mock.patch.object(sys, "stderr", None):
+            code = cli.main(["--scan", str(sample), "--pause"])
+        self.assertEqual(code, 1, "a threat was found and said so in the exit code")
+        self.assertEqual(len(shown), 1)
+        self.assertIn("Threats  : 1", shown[0][1])
+        self.assertIn("threat.bin", shown[0][1])
 
 
 if __name__ == "__main__":

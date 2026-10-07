@@ -45,7 +45,11 @@ def _console_scan(target: Path, quarantine_threats: bool, verbose: bool,
         with emit_lock:
             if keep:
                 transcript.append(text)
-            console.write(text + "\n")
+            # None under the windowed build and pythonw (the frozen right-click
+            # entry, the daily scan): the transcript is all there is, and the
+            # first line printed used to raise and end the scan.
+            if console is not None:
+                console.write(text + "\n")
 
     cfg = config.Config.load()
     protection = SelfProtection()
@@ -69,6 +73,9 @@ def _console_scan(target: Path, quarantine_threats: bool, verbose: bool,
             # so the output is JSON lines whatever the folder holds.
             line = explain_module.as_json(made)
             with emit_lock:
+                if sys.stdout is None:
+                    transcript.append(line)
+                    return
                 try:
                     sys.stdout.write(line + "\n")
                 except OSError as exc:              # a closed pipe; never silently
@@ -960,10 +967,13 @@ def _main(argv: list[str] | None = None) -> int:
             print(f"Daily scan of {target}: {detail_b if ok_b else 'FAILED - ' + detail_b}")
             print("\nThe scheduled scan only reports. It never moves files.")
             return 0 if (ok_a and ok_b) else 1
-        ok_a, _ = scheduling.disable_start_with_windows()
-        ok_b, _ = scheduling.disable_scheduled_scan()
-        print("Removed." if (ok_a and ok_b) else "Partly removed - see the log.")
-        return 0
+        ok_a, detail_a = scheduling.disable_start_with_windows()
+        ok_b, detail_b = scheduling.disable_scheduled_scan()
+        # Each failure named, and not a success exit: "Partly removed - see
+        # the log" exited 0 and nothing had written to the log.
+        print(f"Start with Windows : {'removed' if ok_a else 'NOT removed - ' + detail_a}")
+        print(f"Daily scan         : {'removed' if ok_b else 'NOT removed - ' + detail_b}")
+        return 0 if (ok_a and ok_b) else 1
 
     if args.packs:
         return _packs_command(args)

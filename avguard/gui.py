@@ -163,12 +163,21 @@ class AVGuardApp(tb.Window):
                 "inverse-danger",
             )
         if not self.has_lock:
+            # Said, and kept out of the Config: setting cfg.auto_quarantine
+            # here was written to config.json by the next save in this window,
+            # and revoked the user's choice for the window that does hold it.
             self._banner(
                 f"Another AVGuard is already running (pid {self.lock.owner_pid or 0}). "
-                "This window will scan and report, but will not move any files.",
+                "This window scans what you ask and reports; the other one moves files, "
+                "watches folders and reads the clipboard.",
                 "inverse-warning",
             )
-            self.cfg.auto_quarantine = False
+        if self.cfg.load_problem:
+            self._banner(f"Settings: {self.cfg.load_problem}.", "inverse-danger")
+        if self.tray is None:
+            # Closing only withdrew the window; with no tray there was then no
+            # way back to it or out of it, and it kept the lock.
+            log.info("no tray icon: closing the window quits AVGuard")
 
         if not self.cfg.onboarding_completed:
             self.after(300, self._ask_first_run)
@@ -484,14 +493,16 @@ class AVGuardApp(tb.Window):
 
     def _apply_first_run(self, auto_quarantine: bool, paste_guard: bool | None = False) -> None:
         """`paste_guard` None means the dialog was dismissed without a choice."""
-        self.cfg.auto_quarantine = auto_quarantine and self.has_lock
-        self.cfg.onboarding_completed = True
-        self.cfg.paste_guard_enabled = bool(paste_guard)
-        self.cfg.paste_guard_offered = paste_guard is not None
+        choice = {"auto_quarantine": bool(auto_quarantine), "onboarding_completed": True,
+                  "paste_guard_enabled": bool(paste_guard),
+                  "paste_guard_offered": paste_guard is not None}
         try:
-            self.cfg.save()
+            self.cfg.save_changes(choice)
         except OSError as exc:
+            # Not remembered, but what was chosen is what runs this session.
             log.warning("could not save your choice: %s", exc)
+            for key, value in choice.items():
+                setattr(self.cfg, key, value)
         log.info("first run: automatic quarantine is %s; the paste guard is %s",
                  "on" if self.cfg.auto_quarantine else "off (detections will be reported only)",
                  "on" if self.cfg.paste_guard_enabled else "off")
@@ -509,7 +520,7 @@ class AVGuardApp(tb.Window):
         dies takes the guard with it and the Health row would still read on.
         """
         try:
-            if self.cfg.paste_guard_enabled and not self._shutting_down:
+            if self.cfg.paste_guard_enabled and self.has_lock and not self._shutting_down:
                 self.pasteguard.tick()
             else:
                 self.pasteguard.disarm()
@@ -571,9 +582,8 @@ class AVGuardApp(tb.Window):
         """
         if self.banner.winfo_ismapped() and self.banner_var.get():
             return
-        self.cfg.paste_guard_offered = True
         try:
-            self.cfg.save()
+            self.cfg.save_changes({"paste_guard_offered": True})
         except OSError as exc:
             log.warning("could not record the paste-guard offer: %s", exc)
         self._banner("New: AVGuard can warn when the clipboard holds a paste-and-run command "
@@ -584,11 +594,10 @@ class AVGuardApp(tb.Window):
                   command=self._enable_paste_guard).pack(side=RIGHT, padx=6)
 
     def _enable_paste_guard(self) -> None:
-        self.cfg.paste_guard_enabled = True
         try:
-            self.cfg.save()
+            self.cfg.save_changes({"paste_guard_enabled": True})
         except OSError as exc:
-            self.cfg.paste_guard_enabled = False     # what is shown is what runs
+            # Not saved, so not on: what is shown is what runs.
             Messagebox.show_error(f"Could not save, so the guard stays off: {exc}", "AVGuard", parent=self)
             return
         log.info("paste guard turned on")
@@ -597,6 +606,8 @@ class AVGuardApp(tb.Window):
     def _describe_paste_guard(self) -> tuple[bool, str]:
         if not self.cfg.paste_guard_enabled:
             return True, "off - the clipboard is never opened"
+        if not self.has_lock:
+            return True, "on, in the other AVGuard window; this one does not read the clipboard"
         if not self.pasteguard.source.available:
             # Off Windows there is no clipboard to read, and that is fine; on
             # Windows a reader that turned itself off (a privacy format it
@@ -675,7 +686,7 @@ class AVGuardApp(tb.Window):
         detail = explain.evidence_detail(verdict, self.cfg)
         record = None
         failure = ""
-        if self.cfg.auto_quarantine:
+        if self.cfg.auto_quarantine and self.has_lock:
             try:
                 record = self.quarantine.quarantine(verdict.path, verdict.reasons, evidence=detail,
                                                     expected_sha256=verdict.sha256)
@@ -691,8 +702,10 @@ class AVGuardApp(tb.Window):
             if failure:
                 self._banner(f"Could not quarantine {verdict.path.name}: {failure}", "inverse-danger")
             else:
-                self._banner(f"Threat found in {verdict.path.name} (not quarantined - "
-                             f"automatic quarantine is off)", "inverse-danger")
+                why = ("automatic quarantine is off" if not self.cfg.auto_quarantine
+                       else "another AVGuard holds the quarantine")
+                self._banner(f"Threat found in {verdict.path.name} (not quarantined - {why})",
+                             "inverse-danger")
             # The account and the way out, for a reported threat as much as
             # for a quarantined one; before this only a quarantine offered them.
             self._offer_account(explain.from_verdict(verdict, self.cfg, self.scanner.packs))
@@ -826,6 +839,11 @@ class AVGuardApp(tb.Window):
         __init__, and the window simply never appeared. Under pythonw there was
         no stderr to say why.
         """
+        if not self.has_lock:
+            # A second watcher on the same folders recorded every detection
+            # twice, once as "not moved" for a file the other had moved.
+            self.status_var.set("Real-time protection runs in the other AVGuard window")
+            return
         try:
             watched = self.monitor.start(self._watch_targets())
         except Exception:
@@ -841,8 +859,9 @@ class AVGuardApp(tb.Window):
                     "folder, which is never scanned.", "inverse-warning")
         else:
             log.warning("no folder could be watched; real-time protection is off")
+            # The switch shows what runs; the user's setting is left alone, so
+            # a drive that is not there yet at logon is watched next time.
             self.realtime_var.set(False)
-            self.cfg.realtime_enabled = False
             detail = (f"{refused[0]} is inside AVGuard's own folder"
                       if refused else "the folder does not exist")
             self._banner(
@@ -855,8 +874,12 @@ class AVGuardApp(tb.Window):
         else:
             self.monitor.stop()
             self.status_var.set("Real-time protection off")
-        self.cfg.realtime_enabled = self.realtime_var.get()
-        self.cfg.save()
+        try:
+            self.cfg.save_changes({"realtime_enabled": bool(self.realtime_var.get())})
+        except OSError as exc:
+            log.warning("could not remember the real-time switch: %s", exc)
+            self._banner(f"Could not save the real-time switch: {exc}. It applies until AVGuard closes.",
+                         "inverse-warning")
 
     def _toggle_cloud(self) -> None:
         enabled = self.cloud_var.get()
@@ -877,8 +900,11 @@ class AVGuardApp(tb.Window):
                 "about them.",
                 "VirusTotal lookups enabled", parent=self,
             )
-        self.cfg.cloud_enabled = enabled
-        self.cfg.save()
+        try:
+            self.cfg.save_changes({"cloud_enabled": bool(enabled)})
+        except OSError as exc:
+            self.cloud_var.set(self.cfg.cloud_enabled)          # not saved, so not changed
+            Messagebox.show_error(f"Could not save: {exc}", "AVGuard", parent=self)
 
     # --------------------------------------------------------- quarantine
 
@@ -1256,8 +1282,12 @@ class AVGuardApp(tb.Window):
         self._show_account(explain.from_event(event, self.cfg, self.scanner.packs))
 
     def _history_cleared(self) -> None:
-        log.info("history cleared at the user's request")
-        self._banner("History cleared.", "inverse-secondary")
+        """The dialog says the history and the scan cache both hold paths
+        and that clearing removes them; only the history went. The cache goes
+        too now, on disk and in memory, so exit does not write it back."""
+        self.cache.clear()
+        log.info("history and scan cache cleared at the user's request")
+        self._banner("History cleared, and the scan cache with it.", "inverse-secondary")
 
     def _describe_rules(self) -> str:
         """What is actually loaded, derived from the compiled ruleset.
@@ -1479,8 +1509,9 @@ class AVGuardApp(tb.Window):
             ("Detection rules", rules_ok, self._describe_rules() if rules_ok
              else "FAILED TO COMPILE - most detection is off. See the log."),
             ("Rule packs", self._packs_ok(), self._describe_packs()),
-            ("Real-time protection", watching,
-             f"watching {len(self.monitor.watched)} folder(s)" if watching
+            ("Real-time protection", watching or not self.has_lock,
+             "runs in the other AVGuard window" if not self.has_lock
+             else f"watching {len(self.monitor.watched)} folder(s)" if watching
              else ("; ".join(broken) if broken else "not running")),
             ("Scan workers", (not self.monitor.watched) or workers > 0,
              f"{workers} alive" if workers else "idle, nothing to do"),
@@ -1488,7 +1519,8 @@ class AVGuardApp(tb.Window):
              f"{len(self.quarantine)} item(s) held" if self.has_lock
              else "another AVGuard holds the lock; this window cannot move files"),
             ("Automatic quarantine", True,
-             "on" if self.cfg.auto_quarantine else "off - detections are reported only"),
+             ("on" if self.has_lock else "on, in the other AVGuard window; this one moves nothing")
+             if self.cfg.auto_quarantine else "off - detections are reported only"),
             ("VirusTotal", True,
              f"on, {self.cloud.spent_today} lookup(s) today" if self.cfg.cloud_enabled
              else "off - no hashes leave this machine"),
@@ -1524,9 +1556,10 @@ class AVGuardApp(tb.Window):
         pattern = dialogs.glob_for(folder)
         if pattern in self.cfg.excluded_globs:
             return
-        self.cfg.excluded_globs.append(pattern)
         try:
-            self.cfg.save()
+            # Live only once saved: it was appended first, and a failed save
+            # left the folder excluded anyway.
+            self.cfg.save_changes({"excluded_globs": [*self.cfg.excluded_globs, pattern]})
         except OSError as exc:
             Messagebox.show_error(f"Could not save: {exc}", "AVGuard", parent=self)
             return
@@ -1540,6 +1573,9 @@ class AVGuardApp(tb.Window):
         self.lift()
 
     def _hide(self) -> None:
+        if self.tray is None:
+            self.shutdown()              # nothing could bring a withdrawn window back
+            return
         self.withdraw()
 
     def shutdown(self) -> None:
@@ -1564,7 +1600,9 @@ class AVGuardApp(tb.Window):
         try:
             self.cache.save()
             self.cloud.save_cache()
-            self.cfg.save()
+            # Not the Config: every change is saved where it is made, and
+            # saving the whole object here wrote back settings another
+            # AVGuard had changed since this one started.
         except Exception:
             log.exception("error saving state")
         if self.forwarder is not None:

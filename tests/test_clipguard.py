@@ -1376,6 +1376,13 @@ class TestTheWindowIntegration(unittest.TestCase):
         cfg = SimpleNamespace(auto_quarantine=False, onboarding_completed=False, paste_guard_enabled=False,
                               paste_guard_offered=False, realtime_enabled=False,
                               save=lambda: saved.append(1), saves=saved)
+
+        def save_changes(changes):
+            # As Config.save_changes: saved first, taken in only once saved.
+            cfg.save()
+            for key, value in changes.items():
+                setattr(cfg, key, value)
+        cfg.save_changes = save_changes
         for key, value in values.items():
             setattr(cfg, key, value)
         return cfg
@@ -1385,7 +1392,7 @@ class TestTheWindowIntegration(unittest.TestCase):
         clip = FakeClipboard(sequence=5)
         guard = PasteGuard(clip, None, ignore_path=self.tmp / "i.json")
         scheduled: list[tuple] = []
-        fake = SimpleNamespace(cfg=self.fake_cfg(paste_guard_enabled=True), pasteguard=guard,
+        fake = SimpleNamespace(cfg=self.fake_cfg(paste_guard_enabled=True), pasteguard=guard, has_lock=True,
                                _shutting_down=False, after=lambda ms, fn: scheduled.append((ms, fn)))
         fake._tick_clipboard = object()
         self.gui.AVGuardApp._tick_clipboard(fake)                 # on: records the sequence
@@ -1402,6 +1409,12 @@ class TestTheWindowIntegration(unittest.TestCase):
         self.assertEqual(clip.read_calls, 1)
         self.assertEqual({ms for ms, _ in scheduled}, {self.gui.CLIPBOARD_TICK_MS})
         self.assertEqual(len(scheduled), 5, "rescheduled from finally every time")
+        # Round six: a window without the lock leaves the clipboard to the
+        # one that has it; two guards gave every warning twice.
+        fake.has_lock = False
+        clip.put(WARN_LINE)
+        self.gui.AVGuardApp._tick_clipboard(fake)
+        self.assertEqual(clip.read_calls, 1, "the window without the lock read the clipboard")
 
     def test_a_tick_that_dies_logs_once(self):
         from types import SimpleNamespace
@@ -1417,7 +1430,7 @@ class TestTheWindowIntegration(unittest.TestCase):
     def test_the_health_row_for_off_unavailable_and_on(self):
         from types import SimpleNamespace
         guard = PasteGuard(FakeClipboard(), None, ignore_path=self.tmp / "i.json")
-        fake = SimpleNamespace(cfg=self.fake_cfg(), pasteguard=guard)
+        fake = SimpleNamespace(cfg=self.fake_cfg(), pasteguard=guard, has_lock=True)
         self.assertEqual(self.gui.AVGuardApp._describe_paste_guard(fake),
                          (True, "off - the clipboard is never opened"))
         fake.cfg.paste_guard_enabled = True

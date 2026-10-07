@@ -1481,6 +1481,185 @@ class TestASettingsFileThatCannotBeReadIsKept(TempCase):
         self.assertEqual(config.Config.load(settings), config.Config())
 
 
+class TestTheConfigIsTypedAndWrittenByChange(TempCase):
+    """Round six, config.json: a quoted "false" switched automatic
+    quarantine on while Settings showed it off; a failed save left the
+    changes live; a save wrote back settings another process had changed;
+    and an old install's data/ was moved into any AVGUARD_DATA and deleted
+    with it."""
+
+    def test_a_value_of_the_wrong_type_is_dropped_not_obeyed(self):
+        path = self.tmp / "config.json"
+        path.write_text(json.dumps({"auto_quarantine": "false", "cloud_enabled": "no",
+                                    "paste_guard_enabled": 1, "worker_threads": True,
+                                    "watch_paths": ["D:/Incoming", 3], "quarantine_threshold": 150,
+                                    "debounce_seconds": 2}), encoding="utf-8")
+        loaded = config.Config.load(path)
+        self.assertEqual((loaded.auto_quarantine, loaded.cloud_enabled, loaded.paste_guard_enabled),
+                         (False, False, False), "a string or a number is not a yes")
+        self.assertEqual((loaded.worker_threads, loaded.watch_paths), (4, []))
+        self.assertEqual((loaded.quarantine_threshold, loaded.debounce_seconds), (150, 2))
+        self.assertEqual(loaded.load_problem, "")
+
+    def test_an_unreadable_file_is_said_and_never_saved_into_the_file(self):
+        path = self.tmp / "config.json"
+        path.write_bytes("{\"watch_paths\": [\"D:/Incoming\"],}".encode())      # a trailing comma
+        loaded = config.Config.load(path)
+        self.assertIn("could not be read", loaded.load_problem)
+        loaded.save(path)
+        self.assertNotIn("load_problem", path.read_text(encoding="utf-8"))
+        self.assertEqual(len(list(self.tmp.glob("config.json.unreadable-*"))), 1)
+
+    def test_save_changes_writes_only_what_changed_and_only_then_applies_it(self):
+        path = self.tmp / "config.json"
+        mine = config.Config()
+        mine.save(path)
+        theirs = config.Config.load(path)
+        theirs.save_changes({"excluded_globs": ["C:/Users/me/Projects/**"]}, path)   # another process
+        mine.save_changes({"realtime_enabled": False}, path)
+        on_disk = config.Config.load(path)
+        self.assertEqual(on_disk.excluded_globs, ["C:/Users/me/Projects/**"], "the other's change was erased")
+        self.assertFalse(on_disk.realtime_enabled)
+        with mock.patch.object(config.Config, "save", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                mine.save_changes({"auto_quarantine": True, "paste_guard_enabled": True}, path)
+        self.assertEqual((mine.auto_quarantine, mine.paste_guard_enabled), (False, False),
+                         "not saved, so not live")
+        with self.assertRaises(TypeError):
+            mine.save_changes({"auto_quarantine": "yes"}, path)
+
+    def test_an_old_install_is_never_moved_into_an_explicit_location(self):
+        legacy = self.tmp / "checkout" / "data"
+        (legacy / "quarantine").mkdir(parents=True)
+        (legacy / "quarantine" / "index.json").write_text("{}", encoding="utf-8")
+        target = self.tmp / "override"
+        with mock.patch.object(config, "LEGACY_DATA_DIR", legacy), \
+                mock.patch.object(config, "DATA_DIR", target), \
+                mock.patch.dict(os.environ, {"AVGUARD_DATA": str(target)}):
+            self.assertFalse(config.migrate_legacy_data())
+        self.assertTrue((legacy / "quarantine" / "index.json").exists(), "the old quarantine was moved")
+        self.assertFalse(target.exists())
+
+
+class TestTheWindowWithoutTheLock(TempCase):
+    """Round six: the second window wrote auto_quarantine=false into the
+    user's config, could switch moving back on in a window that holds no
+    lock, ran a second watcher, and the window's other saves misbehaved."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        try:
+            from avguard import gui
+        except ImportError:
+            self.skipTest("GUI dependencies are not installed")
+        from types import SimpleNamespace
+        self.gui = gui
+        self.path = self.tmp / "config.json"
+        self.cfg = config.Config(auto_quarantine=True, onboarding_completed=True)
+        self.cfg.save(self.path)
+        self.banners = []
+        self.ns = SimpleNamespace
+
+    def window(self, has_lock: bool):
+        from avguard.events import EventStore
+        quarantined = []
+        fake = self.ns(cfg=self.cfg, has_lock=has_lock, events=EventStore(self.tmp / "events.jsonl"),
+                       quarantine=self.ns(quarantine=lambda *a, **k: quarantined.append(a)),
+                       _threats_this_scan=0, _banner=lambda text, style="": self.banners.append(text),
+                       _offer_account=lambda *a: None, _offer_exclusion=lambda *a: None,
+                       scanner=self.ns(packs=None), status_var=self.ns(set=lambda text: self.banners.append(text)),
+                       monitor=self.ns(start=lambda *a: self.fail("a second watcher was started")))
+        fake.quarantined = quarantined
+        return fake
+
+    def test_no_move_no_watcher_and_the_setting_is_left_alone(self):
+        from avguard.scanner import Level, Verdict
+        fake = self.window(has_lock=False)
+        verdict = Verdict(path=self.tmp / "invoice.exe", level=Level.MALICIOUS,
+                          reasons=["test"], sha256="ab" * 32)
+        with mock.patch.object(self.gui.explain, "from_verdict", return_value=None):
+            self.gui.AVGuardApp._handle_threat(fake, verdict)
+        self.assertEqual(fake.quarantined, [], "a window without the lock moved a file")
+        self.assertIn("another AVGuard holds the quarantine", self.banners[-1])
+        self.gui.AVGuardApp._start_realtime(fake)
+        self.assertTrue(self.cfg.auto_quarantine, "the user's choice was changed in memory")
+        self.assertTrue(config.Config.load(self.path).auto_quarantine)
+
+    def test_a_failed_settings_save_changes_nothing_that_runs(self):
+        from avguard import dialogs
+        get = lambda value: self.ns(get=lambda: value)          # noqa: E731
+        fake = self.ns(cfg=self.cfg, auto_var=get(False), archives_var=get(True), pe_var=get(True),
+                       paste_var=get(True), ioc_feed_var=get(True),
+                       forward_var=self.ns(get=lambda: "", set=lambda value: None),
+                       watch_list=self.ns(get=lambda *a: ("D:/x",)), excl_list=self.ns(get=lambda *a: ()),
+                       _consent_to_forwarding=lambda: False)
+        with mock.patch.object(config.Config, "save", side_effect=OSError("in use")), \
+                mock.patch.object(dialogs, "Messagebox") as box:
+            dialogs.SettingsDialog._save(fake)
+        self.assertIn("Nothing was changed", box.show_error.call_args.args[0])
+        self.assertEqual((self.cfg.auto_quarantine, self.cfg.paste_guard_enabled, self.cfg.watch_paths),
+                         (True, False, []), "Cancel, and the clipboard was read anyway")
+
+    def test_clear_history_clears_the_scan_cache_it_names(self):
+        from avguard.scanner import ScanCache
+        cache = ScanCache(path=self.tmp / "scan_cache.json")
+        from avguard.scanner import Level
+        cache.put(self.tmp / "hiv-test-results.pdf", 1, 2, Level.CLEAN, [], "x" * 64)
+        cache.save()
+        fake = self.ns(cache=cache, _banner=lambda text, style="": self.banners.append(text))
+        self.gui.AVGuardApp._history_cleared(fake)
+        self.assertNotIn("hiv-test-results", (self.tmp / "scan_cache.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(cache), 0)
+
+    def test_with_no_tray_closing_quits(self):
+        stopped = []
+        fake = self.ns(tray=None, shutdown=lambda: stopped.append(1), withdraw=lambda: self.fail("withdrawn"))
+        self.gui.AVGuardApp._hide(fake)
+        self.assertEqual(stopped, [1])
+
+
+class TestTheLogSurvivesASecondProcess(TempCase):
+    """Round six: on Windows the live log cannot be renamed while another
+    AVGuard holds it; the standard rollover shifted the backups first, then
+    failed, on every record: all lost, and the backups with them."""
+
+    def test_a_refused_rename_loses_no_record_and_no_backup(self):
+        from avguard import logsetup
+        log_file = self.tmp / "avguard.log"
+        log_file.write_bytes(b"x" * 2048)
+        for index, text in ((1, "yesterday"), (2, "last week"), (3, "last month")):
+            (self.tmp / f"avguard.log.{index}").write_text(text, encoding="utf-8")
+        handler = logsetup.SharedRotatingFileHandler(log_file, maxBytes=1024, backupCount=3,
+                                                     encoding="utf-8")
+        record = logging.LogRecord("avguard", logging.WARNING, __file__, 1, "kept %d", (1,), None)
+        real_replace = os.replace
+
+        def refuse_the_live_file(src, dst):
+            if Path(src) == log_file:
+                raise PermissionError(32, "being used by another process")
+            return real_replace(src, dst)
+        with mock.patch.object(logsetup.os, "replace", refuse_the_live_file):
+            for number in range(3):
+                record.args = (number,)
+                handler.emit(record)
+        handler.close()
+        self.assertEqual(log_file.read_text(encoding="utf-8").count("kept"), 3)
+        self.assertEqual([(self.tmp / f"avguard.log.{i}").read_text(encoding="utf-8") for i in (1, 2, 3)],
+                         ["yesterday", "last week", "last month"])
+
+    def test_schedule_off_says_what_was_not_removed_and_does_not_exit_zero(self):
+        import contextlib
+        import io
+        import avguard.__main__ as cli
+        out = io.StringIO()
+        with mock.patch.object(cli.scheduling, "disable_start_with_windows", return_value=(True, "removed")), \
+                mock.patch.object(cli.scheduling, "disable_scheduled_scan", return_value=(False, "access denied")), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = cli.main(["--schedule", "off"])
+        self.assertEqual(code, 1)
+        self.assertIn("NOT removed - access denied", out.getvalue())
+
+
 class TestLoopbackShares(unittest.TestCase):
     """The administrative share is a spelling of every local file."""
 

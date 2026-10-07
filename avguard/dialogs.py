@@ -499,21 +499,28 @@ class SettingsDialog(tb.Toplevel):
         return problems
 
     def _save(self) -> None:
-        self.cfg.auto_quarantine = self.auto_var.get()
-        self.cfg.archive_scanning_enabled = self.archives_var.get()
-        self.cfg.pe_analysis_enabled = self.pe_var.get()
-        self.cfg.paste_guard_enabled = self.paste_var.get()
-        self.cfg.ioc_feed_enabled = self.ioc_feed_var.get()
+        # The changes go to disk first and into the running Config only once
+        # they are there: written in place before, a failed save left every
+        # switch live (Cancel, and the clipboard was read and files moved
+        # anyway), and the next unrelated save persisted them.
+        changes = {
+            "auto_quarantine": bool(self.auto_var.get()),
+            "archive_scanning_enabled": bool(self.archives_var.get()),
+            "pe_analysis_enabled": bool(self.pe_var.get()),
+            "paste_guard_enabled": bool(self.paste_var.get()),
+            "ioc_feed_enabled": bool(self.ioc_feed_var.get()),
+            "watch_paths": [str(p) for p in self.watch_list.get(0, END)],
+            "excluded_globs": [str(p) for p in self.excl_list.get(0, END)],
+        }
         if self._consent_to_forwarding():
-            self.cfg.event_forward_url = self.forward_var.get().strip()
+            changes["event_forward_url"] = self.forward_var.get().strip()
         else:
             self.forward_var.set(self.cfg.event_forward_url)
-        self.cfg.watch_paths = list(self.watch_list.get(0, END))
-        self.cfg.excluded_globs = list(self.excl_list.get(0, END))
         try:
-            self.cfg.save()
+            self.cfg.save_changes(changes)
         except OSError as exc:
-            Messagebox.show_error(f"Could not save settings: {exc}", "AVGuard", parent=self)
+            Messagebox.show_error(f"Could not save settings: {exc}. Nothing was changed.",
+                                  "AVGuard", parent=self)
             return
 
         problems = self._apply_scheduling() + self._apply_context_menu()

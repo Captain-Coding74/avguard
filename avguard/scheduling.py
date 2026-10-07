@@ -67,7 +67,10 @@ def _launcher() -> tuple[str, str]:
     interpreter = Path(sys.executable)
     windowless = interpreter.with_name("pythonw.exe")
     runner = windowless if windowless.exists() else interpreter
-    return str(runner), '-m avguard'
+    # The checkout's run.py by its absolute path: "-m avguard" needs the
+    # checkout as the working directory, and Task Scheduler starts a task
+    # in System32.
+    return str(runner), f'"{config.PROJECT_ROOT / "run.py"}"'
 
 
 def task_command(*arguments: str) -> str:
@@ -168,6 +171,8 @@ def enable_scheduled_scan(target: Path, time_of_day: str = "12:00") -> tuple[boo
 
 
 def disable_scheduled_scan() -> tuple[bool, str]:
+    if sys.platform != "win32":
+        return True, "nothing is scheduled off Windows"
     ok, output = _run(["schtasks", "/Delete", "/F", "/TN", TASK_NAME])
     if not ok and "cannot find" not in output.lower():
         return False, output
@@ -198,6 +203,8 @@ def enable_scheduled_fim_check(time_of_day: str = "12:30") -> tuple[bool, str]:
 
 
 def disable_scheduled_fim_check() -> tuple[bool, str]:
+    if sys.platform != "win32":
+        return True, "nothing is scheduled off Windows"
     ok, output = _run(["schtasks", "/Delete", "/F", "/TN", FIM_TASK_NAME])
     if not ok and "cannot find" not in output.lower():
         return False, output
@@ -228,6 +235,8 @@ def enable_scheduled_autoruns_snapshot(time_of_day: str = "12:45") -> tuple[bool
 
 
 def disable_scheduled_autoruns_snapshot() -> tuple[bool, str]:
+    if sys.platform != "win32":
+        return True, "nothing is scheduled off Windows"
     ok, output = _run(["schtasks", "/Delete", "/F", "/TN", AUTORUNS_TASK_NAME])
     if not ok and "cannot find" not in output.lower():
         return False, output

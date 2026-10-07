@@ -13,9 +13,11 @@ line can never cause a scan.
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import sys
 import threading
+import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -57,6 +59,57 @@ class QueueLogHandler(logging.Handler):
                 pass
 
 
+class SharedRotatingFileHandler(RotatingFileHandler):
+    """A rotating log that several AVGuard processes write at once: the
+    window, a right-click scan, the daily tasks.
+
+    On Windows a file another process holds open cannot be renamed. The
+    standard rollover shifts the backups first and renames the live file
+    last, so with a second process attached it failed on every record once
+    the log passed MAX_BYTES: each attempt deleted the oldest backup and
+    lost the record (simulated: three records, all lost, two backups gone).
+    Here the live file is moved first. If it cannot be, nothing is shifted,
+    the record is written to the live file anyway, and rotation is tried
+    again a minute later."""
+
+    RETRY_SECONDS = 60.0
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._blocked_until = 0.0
+
+    def shouldRollover(self, record) -> bool:
+        if time.monotonic() < self._blocked_until:
+            return False
+        return bool(super().shouldRollover(record))
+
+    def doRollover(self) -> None:
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+        moving = self.baseFilename + ".rotating"
+        try:
+            os.replace(self.baseFilename, moving)
+        except OSError:
+            self._blocked_until = time.monotonic() + self.RETRY_SECONDS
+            if not self.delay:
+                self.stream = self._open()
+            return
+        for index in range(self.backupCount - 1, 0, -1):
+            older = self.rotation_filename(f"{self.baseFilename}.{index}")
+            if os.path.exists(older):
+                try:
+                    os.replace(older, self.rotation_filename(f"{self.baseFilename}.{index + 1}"))
+                except OSError:
+                    pass
+        try:
+            os.replace(moving, self.rotation_filename(self.baseFilename + ".1"))
+        except OSError:
+            pass                       # kept as .rotating; nothing is lost
+        if not self.delay:
+            self.stream = self._open()
+
+
 def configure(gui_queue: queue.Queue | None = None, level: int = logging.INFO) -> logging.Logger:
     """Set up the `avguard` logger. Safe to call more than once."""
     config.LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -69,7 +122,7 @@ def configure(gui_queue: queue.Queue | None = None, level: int = logging.INFO) -
         logger.removeHandler(handler)
         handler.close()
 
-    file_handler = RotatingFileHandler(
+    file_handler = SharedRotatingFileHandler(
         config.LOG_DIR / "avguard.log",
         maxBytes=MAX_BYTES,
         backupCount=BACKUP_COUNT,

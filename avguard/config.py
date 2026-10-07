@@ -8,7 +8,7 @@ import os
 import shutil
 import sys
 import tempfile
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 APP_NAME = "AVGuard"
@@ -192,9 +192,30 @@ def set_aside_if_unreadable(path: Path) -> Path | None:
     return aside
 
 
+def _fits(value, default) -> bool:
+    """Whether `value` has the type of `default`: a bool is a bool (not 0 or
+    "false"), an int an int (not a bool), a float accepts an int, a list of
+    strings is a list of strings."""
+    if isinstance(default, bool):
+        return isinstance(value, bool)
+    if isinstance(default, int):
+        return isinstance(value, int) and not isinstance(value, bool)
+    if isinstance(default, float):
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if isinstance(default, str):
+        return isinstance(value, str)
+    if isinstance(default, list):
+        return isinstance(value, list) and all(isinstance(item, str) for item in value)
+    return False
+
+
 @dataclass
 class Config:
     """User-tunable settings, persisted to data/config.json."""
+
+    # Not a field (no annotation), so never written to config.json: why the
+    # file could not be read at load, for the window to say. "" when it could.
+    load_problem = ""
 
     # Hashes of the user's files are sent to a third party, so this is off
     # until it is switched on deliberately.
@@ -292,21 +313,64 @@ class Config:
     def load(cls, path: Path = CONFIG_PATH) -> "Config":
         """Read config.json, falling back to defaults for anything missing.
 
-        A file that cannot be read gives the defaults and is logged; save()
-        sets it aside before writing, so the user's settings are never
-        silently replaced by the defaults (a byte-order mark used to do it).
+        A file that cannot be read gives the defaults, is logged, and is
+        named in `load_problem` for the window to say; save() sets it aside
+        before writing, so the user's settings are never silently replaced
+        by the defaults (a byte-order mark used to do it).
+
+        Each value must have its default's type, or it is dropped and logged:
+        "false" in quotes is a non-empty string, which turned automatic
+        quarantine on while Settings showed it off, and the VirusTotal, feed
+        and paste-guard switches on without their consent dialogs.
         """
+        log = logging.getLogger(__name__)
         try:
             raw = read_json_object(path) or {}
         except (OSError, UnreadableJSON) as exc:
-            logging.getLogger(__name__).error("could not read %s (%s); using the defaults", path, exc)
-            return cls()
-        known = {f for f in cls().__dict__}
-        return cls(**{k: v for k, v in raw.items() if k in known})
+            log.error("could not read %s (%s); using the defaults", path, exc)
+            loaded = cls()
+            loaded.load_problem = (f"{path.name} could not be read ({exc}); AVGuard is using its "
+                                   "defaults, and your file is kept beside it when settings are next saved")
+            return loaded
+        defaults = cls()
+        names = {f.name for f in fields(cls)}
+        accepted = {}
+        for key, value in raw.items():
+            if key not in names:
+                continue
+            if _fits(value, getattr(defaults, key)):
+                accepted[key] = value
+            else:
+                log.warning("config.json: %s = %r is not a %s; the default is used",
+                            key, value, type(getattr(defaults, key)).__name__)
+        return cls(**accepted)
 
     def save(self, path: Path = CONFIG_PATH) -> None:
         set_aside_if_unreadable(path)
         atomic_write_text(path, json.dumps(asdict(self), indent=2))
+
+    def save_changes(self, changes: dict, path: Path = CONFIG_PATH) -> None:
+        """Write only `changes`, onto the file as it is on disk now, and take
+        them into this object only once that has worked.
+
+        Saving this whole object wrote back whatever another AVGuard had
+        saved since it was loaded, and a failed save left the changes live
+        anyway: Settings said "could not save", Cancel was pressed, and the
+        clipboard was read and files moved regardless. Raises OSError, with
+        this object untouched.
+        """
+        names = {f.name for f in fields(Config)}
+        for key, value in changes.items():
+            if key not in names or not _fits(value, getattr(Config(), key)):
+                raise TypeError(f"{key} = {value!r} is not a setting of its type")
+        fresh = Config.load(path)
+        if fresh.load_problem:
+            fresh = Config(**asdict(self))      # the file is unreadable: this object is the copy there is
+        for key, value in changes.items():
+            setattr(fresh, key, value)
+        fresh.save(path)
+        for key, value in changes.items():
+            setattr(self, key, value)
 
     @property
     def vt_api_key(self) -> str | None:
@@ -321,6 +385,12 @@ def migrate_legacy_data() -> bool:
     overwrite a newer store with an older one.
     """
     if not LEGACY_DATA_DIR.is_dir() or LEGACY_DATA_DIR.resolve() == DATA_DIR.resolve():
+        return False
+    if os.getenv("AVGUARD_DATA"):
+        # Only the default home is a migration target. With an explicit
+        # location (the tests' per-run temp directory, the smoke check's work
+        # directory, a portable stick) the old install's quarantine, the only
+        # copy of every held file, was moved there and deleted with it.
         return False
 
     moved = False

@@ -25,6 +25,8 @@ import logging
 import sys
 from pathlib import Path
 
+from . import config
+
 log = logging.getLogger(__name__)
 
 VERB = "AVGuard.Scan"
@@ -47,7 +49,10 @@ def runner() -> tuple[str, list[str]]:
     """The executable that scans, and the arguments before `--scan`.
 
     Frozen: the one executable. Otherwise python.exe, deliberately not
-    pythonw.exe: the result has to be visible.
+    pythonw.exe: the result has to be visible, running the checkout's
+    run.py by its absolute path. "-m avguard" found the package only with
+    the checkout as the working directory, and Explorer starts a verb in the
+    clicked item's folder: "No module named avguard", and the console closed.
     """
     if getattr(sys, "frozen", False):
         return sys.executable, []
@@ -56,7 +61,7 @@ def runner() -> tuple[str, list[str]]:
         console = interpreter.with_name("python.exe")
         if console.exists():
             interpreter = console
-    return str(interpreter), ["-m", "avguard"]
+    return str(interpreter), [str(config.PROJECT_ROOT / "run.py")]
 
 
 def _quote(text: str) -> str:
@@ -67,7 +72,7 @@ def _quote(text: str) -> str:
 
 def command_string() -> str:
     exe, args = runner()
-    return " ".join([_quote(exe), *args, "--scan", '"%1"', "--pause"])
+    return " ".join([_quote(exe), *(_quote(a) for a in args), "--scan", '"%1"', "--pause"])
 
 
 def icon_string() -> str:
