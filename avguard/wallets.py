@@ -228,3 +228,70 @@ def _ethereum(text: str) -> Address | None:
     if eip55(body) != "0x" + body:
         return None
     return Address("Ethereum", "account", True)
+
+
+# ------------------------------------------------- comparing two addresses
+
+_PREFIX = {"Bitcoin": ("bc1", "1", "3"), "Litecoin": ("ltc1", "L", "M", "3"), "Dogecoin": ("D", "9", "A"),
+           "Tron": ("T",), "Ethereum": ("0x",)}
+_SHAPES = (
+    ("Ethereum", re.compile(r"^0x[0-9a-fA-F]{40}$")),
+    ("Bitcoin", re.compile(r"^(?:bc1[02-9ac-hj-np-z]{8,87}|BC1[02-9AC-HJ-NP-Z]{8,87}|[13][1-9A-HJ-NP-Za-km-z]{24,34})$")),
+    ("Litecoin", re.compile(r"^(?:ltc1[02-9ac-hj-np-z]{8,86}|LTC1[02-9AC-HJ-NP-Z]{8,86}|[LM][1-9A-HJ-NP-Za-km-z]{24,34})$")),
+    ("Dogecoin", re.compile(r"^[D9A][1-9A-HJ-NP-Za-km-z]{24,34}$")),
+    ("Tron", re.compile(r"^T[1-9A-HJ-NP-Za-km-z]{33}$")),
+)
+
+
+def canonical(text: str) -> str:
+    """The form two copies of one address share: bech32 and Ethereum compare
+    without case (an all-caps bech32 address is the same address; EIP-55 case
+    is a checksum, not a different account), Base58 exactly."""
+    candidate = (text or "").strip()
+    if candidate[:3].lower() in ("bc1", "ltc", "0x0") or candidate[:2].lower() == "0x":
+        return candidate.lower()
+    return candidate
+
+
+def shaped_like(text: str) -> str | None:
+    """The family an address-shaped string would belong to, checksum NOT
+    verified: for telling that a string which fails its checksum was made to
+    look like an address of a family."""
+    candidate = (text or "").strip()
+    for name, shape in _SHAPES:
+        if shape.match(candidate):
+            return name
+    return None
+
+
+def lookalike(first: str, second: str, family_name: str) -> bool:
+    """Whether `second` was made to look like `first`: the same leading and
+    trailing characters after the family's fixed prefix, which is how the
+    lookalike clippers reported so far choose their replacement. Two random
+    addresses share two characters at both ends about once in eleven million."""
+    a, b = canonical(first), canonical(second)
+    for prefix in _PREFIX.get(family_name, ()):
+        if a.startswith(prefix.lower() if a == a.lower() else prefix) and b[:len(prefix)].lower() == prefix.lower():
+            a, b = a[len(prefix):], b[len(prefix):]
+            break
+    head = len(_common(a, b))
+    tail = len(_common(a[::-1], b[::-1]))
+    return (head >= 2 and tail >= 2) or head >= 4 or tail >= 4
+
+
+def differing_characters(first: str, second: str) -> int | None:
+    """How many positions differ between two strings of one length, or None
+    when the lengths differ."""
+    a, b = canonical(first), canonical(second)
+    if len(a) != len(b):
+        return None
+    return sum(1 for x, y in zip(a, b) if x != y)
+
+
+def _common(a: str, b: str) -> str:
+    out = []
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        out.append(x)
+    return "".join(out)

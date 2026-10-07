@@ -513,9 +513,20 @@ class AVGuardApp(tb.Window):
             if not self._shutting_down:
                 self.after(CLIPBOARD_TICK_MS, self._tick_clipboard)
 
-    def _paste_warning(self, match: clipguard.Match, clip: clipguard.ClipText) -> None:
+    def _paste_warning(self, match, clip: clipguard.ClipText) -> None:
         """On the GUI thread (the tick runs there). Says it; moves nothing."""
         sentence = match.sentence(clip.owner)
+        if isinstance(match, clipguard.Swap):
+            # No "don't warn again": the text it would silence is the
+            # replacement, and nothing about it is worth trusting.
+            log.warning("PASTE GUARD: %s", sentence)
+            self._banner(sentence, "inverse-danger")
+            if self.tray is not None:
+                try:
+                    self.tray.notify("The crypto address on your clipboard was replaced", "AVGuard")
+                except Exception:
+                    pass
+            return
         if match.tier == clipguard.WARNING:
             log.warning("PASTE GUARD: %s", sentence)
             self._banner(sentence, "inverse-danger")

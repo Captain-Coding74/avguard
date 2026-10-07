@@ -1388,6 +1388,73 @@ other lure fixtures 40 -> 40 with identical signals; the 43 legitimate
 lines and the new honest "manifest identificator" line 0 -> 0. Tests
 751 -> 752, both suites green.
 
+
+**The swap guard, 2026-10-07.** Item 6 of docs/next-6.md, measured before
+it was built, as the plan asked, on the Windows runner instead of the
+owner's machine. A test (the test writes the clipboard; the module never
+does) wrote two BIP-173 test-vector addresses D ms apart under a poll every
+500 ms at a random phase. Run #67: one write moved
+`GetClipboardSequenceNumber` by 5 with one format and with three, emptying
+alone by 1, and nothing on the runner wrote again within a second; the
+original address was read before the swap 0 of 6 times at 0 ms and at
+50 ms, 4 of 6 at 200 ms and at 400 ms, 6 of 6 at 600 ms. In every trial the
+poll saw one or the other, but a swap between two ticks shows only as a
+larger jump of the sequence number, and research on the counter (Microsoft's
+documentation and Wine's conformance tests) says it counts clipboard calls,
+not copies: a browser's or Office's single copy jumps it as far. So the
+guard can recognise only a swap it saw both halves of. Research on
+clippers, from vendor reports, puts that in context: the event-driven ones
+(clipboard listeners and viewers) rewrite within milliseconds and are not
+seen; the polling ones sleep 200 to 500 ms, so a 500 ms tick reads their
+victim's address about a fifth to a half of the time; Laplas, which looks a
+lookalike up on a server, took about 5 s in one published test. By the
+plan's own sentence that made it a README line; the owner asked for the
+guard, so it is built and the README says what it cannot see.
+
+The rule, in `PasteGuard.tick()` on the text the tick already read, with no
+second reader, no listener, no hook and no clipboard write: an address
+(`avguard/wallets.py`: Base58Check for Bitcoin, Litecoin, Dogecoin and
+Tron; bech32 and bech32m for Bitcoin and Litecoin segwit; Ethereum with
+EIP-55 through a pure-Python Keccak) followed within 2.5 s by a different
+address of the same family, written by another program. Not a swap: the
+same program writing both (two addresses copied in one wallet), a
+remote-desktop or virtual-machine forwarder or a clipboard manager as the
+writer (by image name, which a determined program could borrow), another
+family, the same address in another case, anything copied in between, or
+2.5 s passed. Named in the banner: a replacement that shares two characters
+at each end with the original after the family's prefix (the lookalike
+clippers' choice), and a near copy that fails its checksum (Microsoft's
+2026 table says one stealer changes only the last character of a bech32
+address, which leaves an invalid string). No owner on either write is
+neither exempt nor a sign: Bitwarden writes that way too. The last address
+lives in memory for the window and is forgotten when the guard is off; the
+History event carries the family, the seconds and the two program names,
+never an address, and is never forwarded. The banner has no "don't warn
+again" button: the text it would silence is the replacement.
+
+Found by the same research and fixed here: the guard honoured the two
+monitor-exclusion formats KeePass and 1Password set, but not
+`CanIncludeInClipboardHistory` and `CanUploadToCloudClipboard`, which
+Chromium's password manager and Bitwarden set to 0 on a copied password; it
+was reading those passwords (and keeping nothing, but reading them). A 0 in
+either, or a value that cannot be read, is now private, checked after the
+hung-owner check so no data is asked of a hung program; a history format
+that cannot be registered turns the reader off, as the other two do.
+
+Tests: the rule on a fake clipboard with a controllable clock (a swap, the
+event with no address in it and not forwarded, a lookalike and an invalid
+lookalike, eight things that are not a swap, off forgetting the address,
+writes with no owner), the privacy formats through the fake user32 (four
+zero or unreadable forms private, the text never read, nothing asked of a
+hung owner, a 1 read normally), the window's banner, and on the runner a
+swap on the real clipboard and a password marked the way Chromium marks it.
+The runner measurement stays, trimmed to 0, 200 and 600 ms, and now asserts
+the premise the guard rests on: a swap a tick and more after the copy is
+always seen. Not measured: a real clipper (none was run), what owner a
+browser's or a wallet's copy reports on a desktop, the program behind a
+Windows clipboard-history paste, and the false-positive count over the
+owner's real copying. Tests 752 -> 762, both suites green.
+
 ## Deliberately not doing
 
 The paste guard (above) is the one input that is not a file; it watches a user-mode clipboard buffer through documented calls, with no driver, no hook and no process telemetry, so it does not reopen the first decision here. The EDR-shaped extensions of it are refused by name: no keyboard hook to see Win+R, no automation of the Run dialog, no watching what the user then runs.

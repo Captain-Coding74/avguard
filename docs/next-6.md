@@ -214,7 +214,16 @@ bar English gets). Effort S; it can ride with any paste-guard commit.
 Measured claim to make: 0 of 4 Thai fixtures WARNING before, 4 of 4
 after, the English twins unchanged.
 
-## 6. Crypto clipboard-swap guard — reduced, and measure the tick first
+## 6. Crypto clipboard-swap guard — DONE, reduced to what the tick can see
+
+Measured and built 2026-10-07; the record is in ROADMAP.md under "The swap
+guard". The answer to the question below is "slow ones, and only slow
+ones": the Windows runner read the original address before the swap every
+time at 600 ms, about two times in three at 200 to 400 ms and never at 0 to
+50 ms, and research found the event-driven clippers act within
+milliseconds. Built anyway, at the owner's request, with that limit stated
+where the user reads it. What was planned:
+
 
 The two refutations that did run agree on the design flaw: the assessment
 drew a second clipboard reader (a 50 ms daemon thread with its own

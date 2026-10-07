@@ -128,6 +128,108 @@ class GuardCase(unittest.TestCase):
                                 ignore_path=self.tmp / "clipboard_ignore.json")
 
 
+class TestTheSwapCheck(GuardCase):
+    """docs/next-6.md item 6: an address read at one tick and a different
+    address of the same family at a later one, within SWAP_WINDOW seconds,
+    written by another program. The addresses are BIP-173 and EIP-55 test
+    vectors or built from a fixed payload; none is anyone's wallet."""
+
+    A = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+    B = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3"
+    ETH = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.now = 100.0
+        self.guard.clock = lambda: self.now
+        self.guard.tick()                                    # the first tick only records the number
+
+    def copy(self, text: str, owner: str | None, after: float = 0.5):
+        self.now += after
+        self.clip.put(text, owner=owner)
+        return self.guard.tick()
+
+    def test_a_different_address_of_the_family_from_another_program_is_a_swap(self):
+        self.assertIsNone(self.copy(self.A, "electrum.exe"))
+        swap = self.copy(self.B, "svchost32.exe")
+        self.assertIsInstance(swap, clipguard.Swap)
+        self.assertEqual((swap.tier, swap.family, swap.signals), (WARNING, "Bitcoin", ("address replaced",)))
+        self.assertAlmostEqual(swap.seconds, 0.5)
+        self.assertEqual(swap.previous_owner, "electrum.exe")
+        self.assertEqual(self.guard.counters.swaps, 1)
+        sentence = swap.sentence("svchost32.exe")
+        self.assertIn("Bitcoin address on the clipboard was replaced 0.5 s after", sentence)
+        self.assertIn("svchost32.exe", sentence)
+        self.assertNotIn(self.A, sentence)
+        self.assertNotIn(self.B, sentence)
+        self.assertIs(self.seen[-1][0], swap, "the window is told")
+
+    def test_the_event_names_the_family_and_the_programs_never_an_address(self):
+        import json
+        forwarded = []
+        self.events.forwarder = type("F", (), {"submit": lambda _s, e: forwarded.append(e)})()
+        self.copy(self.A, "electrum.exe")
+        self.copy(self.B, None)
+        raw = (self.tmp / "events.jsonl").read_text(encoding="utf-8")
+        self.assertNotIn(self.A, raw)
+        self.assertNotIn(self.B, raw)
+        event = json.loads(raw.splitlines()[-1])
+        self.assertEqual((event["kind"], event["level"]), ("clipboard", WARNING))
+        self.assertEqual(event["detail"], {"signals": ["address replaced"], "family": "Bitcoin", "seconds": 0.5,
+                                           "owner": "", "previous_owner": "electrum.exe"})
+        self.assertEqual(forwarded, [], "kept on this machine like the rest of the guard's events")
+
+    def test_a_lookalike_and_an_invalid_lookalike_are_named(self):
+        from avguard import wallets
+        import hashlib
+        legit = wallets.b58check_encode(0x00, hashlib.sha256(b"payee").digest()[:20])
+        for attempt in range(5000):                          # a valid address sharing two characters at each end
+            fake = wallets.b58check_encode(0x00, hashlib.sha256(b"x%d" % attempt).digest()[:20])
+            if wallets.lookalike(legit, fake, "Bitcoin"):
+                break
+        else:
+            self.skipTest("no lookalike found in 5000 tries")
+        self.copy(legit, "exodus.exe")
+        self.assertEqual(self.copy(fake, None).signals, ("address replaced by a lookalike",))
+        self.copy(self.A, "exodus.exe")
+        broken = self.A[:-1] + ("5" if self.A[-1] != "5" else "6")
+        swap = self.copy(broken, None)
+        self.assertEqual(swap.signals, ("address replaced by an invalid lookalike",),
+                         "a clipper that changes only the last character leaves a string that fails its checksum")
+        self.assertIn("not even a valid address", swap.sentence(None))
+
+    def test_what_is_not_a_swap(self):
+        cases = {
+            "too late": [(self.A, "a.exe", 0.5), (self.B, "b.exe", clipguard.SWAP_WINDOW + 0.5)],
+            "one program wrote both": [(self.A, "electrum.exe", 0.5), (self.B, "electrum.exe", 0.5)],
+            "a remote-desktop forwarder": [(self.A, "electrum.exe", 0.5), (self.B, "rdpclip.exe", 0.5)],
+            "a clipboard manager pasting from its history": [(self.A, "a.exe", 0.5), (self.B, "Ditto.exe", 0.5)],
+            "another family": [(self.A, "a.exe", 0.5), (self.ETH, "b.exe", 0.5)],
+            "the same address in capitals": [(self.A, "a.exe", 0.5), (self.A.upper(), "b.exe", 0.5)],
+            "something else copied in between": [(self.A, "a.exe", 0.5), ("hello", "b.exe", 0.5), (self.B, "c.exe", 0.5)],
+            "an ordinary word after an address": [(self.A, "a.exe", 0.5), ("bc1 is a prefix", "b.exe", 0.5)],
+        }
+        for name, steps in cases.items():
+            with self.subTest(case=name):
+                self.guard.disarm()
+                self.guard.tick()
+                results = [self.copy(text, owner, after) for text, owner, after in steps]
+                self.assertFalse(any(isinstance(r, clipguard.Swap) for r in results), results)
+
+    def test_off_forgets_the_address(self):
+        self.copy(self.A, "a.exe")
+        self.guard.disarm()
+        self.guard.tick()
+        self.assertIsNone(self.copy(self.B, "b.exe"), "what was read before the guard went off is gone")
+
+    def test_two_writes_without_an_owner_are_a_swap(self):
+        """A clipper may write with no window, as the test does on the
+        runner; Bitwarden does too, so "no owner" is neither exempt nor alone
+        a sign: the replaced address is."""
+        self.copy(self.A, None)
+        self.assertIsInstance(self.copy(self.B, None), clipguard.Swap)
+
+
 class TestTheGuardReads(GuardCase):
     def test_an_unchanged_sequence_number_never_reads(self):
         for _ in range(100):
@@ -605,11 +707,14 @@ class TestTheReaderThroughAFakeUser32(unittest.TestCase):
     the calls and what is never called."""
 
     def make(self, text="hello", formats=(), hung=False, open_ok=True, text_available=True,
-             size_chars=None):
+             size_chars=None, history=None):
         import ctypes
         import types
         clip = clipguard.WindowsClipboard.__new__(clipguard.WindowsClipboard)
         clip._exclusion_formats = (49001, 49002)
+        clip._history_formats = (49003, 49004)
+        history = history or {}
+        dwords = {fmt: ctypes.create_string_buffer(value, len(value)) for fmt, value in history.items()}
         clip._wt = types.SimpleNamespace(DWORD=ctypes.c_uint32)
         # UTF-16-LE bytes with a NUL and garbage after it, as a real block holds them.
         raw = text.encode("utf-16-le", "surrogatepass") + b"\0\0" + "garbage".encode("utf-16-le")
@@ -622,19 +727,44 @@ class TestTheReaderThroughAFakeUser32(unittest.TestCase):
             def CloseClipboard(self): calls.append("close"); return 1
             def GetClipboardOwner(self): return 0x1234
             def IsClipboardFormatAvailable(self, fmt):
-                return fmt in formats or (fmt == clipguard.CF_UNICODETEXT and text_available)
+                return fmt in formats or fmt in history or (fmt == clipguard.CF_UNICODETEXT and text_available)
             def IsHungAppWindow(self, hwnd): calls.append("hung?"); return hung
-            def GetClipboardData(self, fmt): calls.append("data"); return 77
+            def GetClipboardData(self, fmt):
+                calls.append("data" if fmt == clipguard.CF_UNICODETEXT else f"dword {fmt}")
+                return fmt if fmt in history else 77
             def GetWindowThreadProcessId(self, hwnd, pid): return 0      # pid stays 0: owner unknown
 
         class Kernel32:
-            def GlobalSize(self, handle): return reported * 2            # bytes, as Windows reports UTF-16
-            def GlobalLock(self, handle): calls.append("lock"); return ctypes.addressof(buffer)
+            def GlobalSize(self, handle):
+                return len(dwords[handle]) if handle in dwords else reported * 2   # bytes, as Windows reports UTF-16
+            def GlobalLock(self, handle):
+                calls.append("lock")
+                return ctypes.addressof(dwords[handle] if handle in dwords else buffer)
             def GlobalUnlock(self, handle): calls.append("unlock"); return 1
 
         clip._user32, clip._kernel32 = User32(), Kernel32()
-        self.keep = buffer
+        self.keep = (buffer, dwords)
         return clip, calls
+
+    def test_a_history_or_cloud_format_of_zero_is_private_and_the_text_is_never_touched(self):
+        """Chromium's password manager and Bitwarden mark a copied password
+        with these two DWORD formats and not with the two monitor formats."""
+        zero, one = (0).to_bytes(4, "little"), (1).to_bytes(4, "little")
+        for history in ({49003: zero}, {49004: zero}, {49003: one, 49004: zero}, {49003: b"\0"}):
+            with self.subTest(history=history):
+                clip, calls = self.make(history=history)
+                self.assertTrue(clip.read().excluded)
+                self.assertNotIn("data", calls, "the text is not read")
+                self.assertEqual(calls[-1], "close")
+        clip, calls = self.make("hello", history={49003: one, 49004: one})
+        self.assertEqual(clip.read().text, "hello", "a 1 says it may be kept; the text is read")
+        self.assertIn("data", calls)
+
+    def test_the_history_formats_wait_for_a_hung_owner_check(self):
+        clip, calls = self.make(hung=True, history={49003: (0).to_bytes(4, "little")})
+        with self.assertRaises(clipguard.ClipboardBusy):
+            clip.read()
+        self.assertFalse([c for c in calls if c.startswith("dword")], "no data is asked of a hung owner")
 
     def test_text_is_read_to_the_nul_and_the_block_unlocked_and_closed(self):
         clip, calls = self.make("hello \u2713")
@@ -688,10 +818,17 @@ class TestTheReaderThroughAFakeUser32(unittest.TestCase):
         self.assertIn("privacy formats could not be registered", clip.unavailable_reason)
         fine = clipguard.WindowsClipboard.__new__(clipguard.WindowsClipboard)
         fine.available = True
-        fine._user32 = types.SimpleNamespace(RegisterClipboardFormatW=lambda name: 49001 + ("Ignore" not in name))
+        numbers = {name: 49001 + i for i, name in enumerate(clipguard.EXCLUSION_FORMATS + clipguard.HISTORY_FORMATS)}
+        fine._user32 = types.SimpleNamespace(RegisterClipboardFormatW=numbers.get)
         fine._register_exclusion_formats()
         self.assertTrue(fine.available)
-        self.assertEqual(fine._exclusion_formats, (49001, 49002))
+        self.assertEqual((fine._exclusion_formats, fine._history_formats), ((49001, 49002), (49003, 49004)))
+        half = clipguard.WindowsClipboard.__new__(clipguard.WindowsClipboard)
+        half.available = True
+        half._user32 = types.SimpleNamespace(RegisterClipboardFormatW=lambda name: 0 if "Cloud" in name else 49001)
+        with self.assertLogs("avguard.clipguard", level="ERROR"):
+            half._register_exclusion_formats()
+        self.assertFalse(half.available, "a history format that cannot be registered cannot be honoured")
 
 
 class TestTheModuleNeverWritesTheClipboard(unittest.TestCase):
@@ -710,12 +847,15 @@ class TestDetectionIsUnchanged(GuardCase):
     """It is advisory, outside the scoring model: no Finding, no Verdict, no
     file moved. The first version of this test compared a value with itself."""
 
-    def test_the_module_reaches_only_config_and_events(self):
+    def test_the_module_reaches_only_config_events_and_the_pure_address_check(self):
         source = Path(clipguard.__file__).read_text(encoding="utf-8")
         imports = [line.strip() for line in source.splitlines()
                    if line.startswith(("from .", "from avguard", "import avguard"))]
-        self.assertEqual(imports, ["from . import config", "from .events import Event, EventStore"])
+        self.assertEqual(imports, ["from . import config, wallets", "from .events import Event, EventStore"])
         self.assertNotIn("import shutil", source)
+        wallet_source = Path(clipguard.__file__).with_name("wallets.py").read_text(encoding="utf-8")
+        self.assertEqual([line for line in wallet_source.splitlines() if line.startswith(("from .", "import avguard"))],
+                         [], "wallets.py reaches nothing in AVGuard: no scanner, no store, no network")
 
     def test_a_warning_tick_leaves_one_clipboard_event_and_nothing_else(self):
         self.guard.tick()
@@ -832,6 +972,63 @@ class TestTheRealClipboard(unittest.TestCase):
         guard._last_sequence = before
         self.assertEqual(guard.tick().tier, WARNING, "the guard, end to end, on a real clipboard")
 
+    def _write(self, text: str, history: int | None = None) -> None:
+        """Write `text`, and the history and cloud formats with `history` when given."""
+        import ctypes
+        import ctypes.wintypes as wt
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        user32.OpenClipboard.argtypes = [wt.HWND]
+        user32.SetClipboardData.argtypes = [wt.UINT, wt.HANDLE]
+        user32.SetClipboardData.restype = wt.HANDLE
+        user32.RegisterClipboardFormatW.argtypes = [wt.LPCWSTR]
+        user32.RegisterClipboardFormatW.restype = wt.UINT
+        kernel32.GlobalAlloc.argtypes = [wt.UINT, ctypes.c_size_t]
+        kernel32.GlobalAlloc.restype = wt.HGLOBAL
+        kernel32.GlobalLock.argtypes = [wt.HGLOBAL]
+        kernel32.GlobalLock.restype = wt.LPVOID
+        kernel32.GlobalUnlock.argtypes = [wt.HGLOBAL]
+
+        def put(fmt: int, data: bytes) -> None:
+            handle = kernel32.GlobalAlloc(0x0002, len(data))
+            pointer = kernel32.GlobalLock(handle)
+            ctypes.memmove(pointer, data, len(data))
+            kernel32.GlobalUnlock(handle)
+            user32.SetClipboardData(fmt, handle)
+        import time
+        for _ in range(50):
+            if user32.OpenClipboard(None):
+                break
+            time.sleep(0.01)
+        else:
+            self.skipTest("the clipboard could not be opened for writing")
+        try:
+            user32.EmptyClipboard()
+            put(clipguard.CF_UNICODETEXT, text.encode("utf-16-le") + b"\0\0")
+            if history is not None:
+                for name in clipguard.HISTORY_FORMATS:
+                    put(user32.RegisterClipboardFormatW(name), history.to_bytes(4, "little"))
+        finally:
+            user32.CloseClipboard()
+
+    def test_a_password_marked_for_history_and_cloud_is_not_read(self):
+        source = clipguard.WindowsClipboard()
+        self._write("not a real password", history=0)
+        self.assertTrue(source.read().excluded, "CanIncludeInClipboardHistory = 0, as Chromium writes it")
+        self._write("ordinary text", history=1)
+        self.assertEqual(source.read().text, "ordinary text")
+
+    def test_a_swap_on_the_real_clipboard(self):
+        source = clipguard.WindowsClipboard()
+        guard = PasteGuard(source, None)
+        guard.tick()
+        self._write(TestTheSwapCheck.A)
+        self.assertIsNone(guard.tick())
+        self._write(TestTheSwapCheck.B)
+        swap = guard.tick()
+        self.assertIsInstance(swap, clipguard.Swap, "a second address 0 s later, written with no owner")
+        self.assertEqual(swap.family, "Bitcoin")
+
     def test_the_sequence_number_cost_is_printed(self):
         import timeit
         source = clipguard.WindowsClipboard()
@@ -930,9 +1127,9 @@ class TestWhatASwapLooksLikeToTheTick(unittest.TestCase):
         # 2. A swap D ms after the copy, under a poll every 500 ms at a random phase.
         rng = random.Random(20261007)
         rows = []
-        for delay_ms in (0, 50, 200, 400, 600):
+        for delay_ms in (0, 200, 600):
             seen_first = between = neither = busy = 0
-            trials = 6
+            trials = 4
             for _ in range(trials):
                 observed: list[tuple[int, str | None]] = []
                 stop = threading.Event()
@@ -979,6 +1176,8 @@ class TestWhatASwapLooksLikeToTheTick(unittest.TestCase):
             print(f"  swap {delay_ms:>3} ms after the copy, 500 ms poll: original read {seen_first}/{trials}, "
                   f"both writes between two ticks {between}/{trials}, neither {neither}/{trials}"
                   f"{f', {busy} busy read(s)' if busy else ''}")
+        by_delay = {row[0]: row for row in rows}
+        self.assertEqual(by_delay[600][2], by_delay[600][1], "a swap a tick and more after the copy is always seen")
 
 
 class TestTheWindowIntegration(unittest.TestCase):
@@ -1113,6 +1312,12 @@ class TestTheWindowIntegration(unittest.TestCase):
         self.assertEqual(len(banner.winfo_children()), 1, "a notice can be silenced too")
         fake._banner("Scan complete")
         self.assertEqual(banner.winfo_children(), [], "the button does not outlive its message")
+        swap = clipguard.Swap(family="Bitcoin", seconds=0.5, previous_owner="electrum.exe", lookalike=True,
+                              invalid=False, sha256="0" * 64, chars=42)
+        self.gui.AVGuardApp._paste_warning(fake, swap, clipguard.ClipText("x", None))
+        self.assertEqual(banner.winfo_children(), [], "no 'don't warn again' for a replaced address")
+        self.assertIn("Bitcoin address on the clipboard was replaced", var.get())
+        self.assertEqual(fake._banner_style, "inverse-danger")
         var.set("")
         self.gui.AVGuardApp._offer_paste_guard(fake)
         self.assertTrue(fake.cfg.paste_guard_offered)

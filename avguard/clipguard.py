@@ -33,12 +33,13 @@ import logging
 import os
 import re
 import sys
+import time
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from . import config
+from . import config, wallets
 from .events import Event, EventStore
 
 log = logging.getLogger("avguard.clipguard")
@@ -60,6 +61,36 @@ PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 # KeePass sets the first, 1Password and others the second. Present means the
 # text is not read at all.
 EXCLUSION_FORMATS = ("Clipboard Viewer Ignore", "ExcludeClipboardContentFromMonitorProcessing")
+# The two formats Windows' own clipboard history and cloud sync honour, each
+# a DWORD: 0 means "keep this out". Chromium's password manager and
+# Bitwarden mark a copied password with these and not with the two above,
+# so a guard honouring only those read Chrome's and Bitwarden's passwords.
+# A 0 in either, or a value that cannot be read, is private.
+HISTORY_FORMATS = ("CanIncludeInClipboardHistory", "CanUploadToCloudClipboard")
+
+# The swap check (docs/next-6.md item 6). An address read at one tick and a
+# different address of the same family read at a later tick, within this
+# many seconds, written by another program: that is what a clipper does. A
+# person copying a second address takes longer; the clippers reported so far
+# poll every 200 to 500 ms or look a replacement up in about a second. One
+# that rewrites within milliseconds of the copy is never seen: the poll
+# reads only its address, and the sequence number counts clipboard calls,
+# not copies, so its jump looks like one rich copy (measured on the Windows
+# runner, ROADMAP "The swap guard").
+SWAP_WINDOW = 2.5
+# Programs that put on this clipboard what the user copied or chose
+# somewhere else: remote-desktop and virtual-machine clipboard forwarders,
+# clipboard managers pasting from their history, text expanders. A
+# different address from one of them is the user's own doing. By image
+# name, which a determined program can borrow; said so in the README.
+SWAP_FORWARDERS = frozenset({
+    "mstsc.exe", "msrdc.exe", "rdpclip.exe", "vmconnect.exe", "wfica32.exe", "wfshell.exe", "cdviewer.exe",
+    "vmtoolsd.exe", "vmware.exe", "vmware-vmx.exe", "vboxtray.exe", "virtualboxvm.exe",
+    "mousewithoutborders.exe", "mousewithoutbordershelper.exe",
+    "ditto.exe", "copyq.exe", "clipclip.exe", "clipboardfusion.exe", "clipjump.exe", "clipangel.exe",
+    "powertoys.advancedpaste.exe", "espanso.exe", "phraseexpress.exe", "autohotkey.exe",
+    "autohotkey64.exe", "autohotkeyu64.exe", "autohotkey32.exe", "autohotkeyux.exe",
+})
 
 # A Run-box or address-bar command has to name a program. That is the central
 # false-positive control: an install line typed into an open shell, a
@@ -362,6 +393,47 @@ def classify(text: str) -> Match | None:
 # ------------------------------------------------------------- sources
 
 @dataclass(frozen=True)
+class Swap:
+    """An address replaced on the clipboard. Carries the family, how long
+    after the first read it was replaced, the two programs and the hash of
+    the new text, never either address."""
+    family: str
+    seconds: float
+    previous_owner: str | None
+    lookalike: bool
+    invalid: bool
+    sha256: str
+    chars: int
+    tier: str = WARNING
+
+    @property
+    def signals(self) -> tuple[str, ...]:
+        if self.invalid:
+            return ("address replaced by an invalid lookalike",)
+        if self.lookalike:
+            return ("address replaced by a lookalike",)
+        return ("address replaced",)
+
+    def sentence(self, owner: str | None) -> str:
+        by = f"by {owner}" if owner else "by a program that could not be identified"
+        was = f" (it was copied from {self.previous_owner})" if self.previous_owner else ""
+        how = (" with a string made to look like it, which is not even a valid address" if self.invalid
+               else " with one made to look like it" if self.lookalike else "")
+        return (f"The {self.family} address on the clipboard was replaced {self.seconds:.1f} s after it was "
+                f"copied{was}, {by},{how}. This is what clipboard-hijacking malware does. Before you send "
+                "anything, compare every character of the address you paste with the one you meant to copy.")
+
+
+@dataclass(frozen=True)
+class _Address:
+    """The last address read, in memory for SWAP_WINDOW seconds only."""
+    family: str
+    text: str
+    owner: str | None
+    at: float
+
+
+@dataclass(frozen=True)
 class ClipText:
     text: str
     owner: str | None            # the program that wrote the clipboard, if it can be told
@@ -471,12 +543,27 @@ class WindowsClipboard:
         the guard cannot honour it, so it reads nothing rather than read what
         a password manager asked it not to."""
         formats = tuple(int(self._user32.RegisterClipboardFormatW(name)) for name in EXCLUSION_FORMATS)
-        if not all(formats):
+        history = tuple(int(self._user32.RegisterClipboardFormatW(name)) for name in HISTORY_FORMATS)
+        if not all(formats) or not all(history):
             self.available = False
             self.unavailable_reason = ("the clipboard's privacy formats could not be registered "
                                        f"(error {_last_error()}), so the clipboard is not read")
             log.error("paste guard: %s", self.unavailable_reason)
         self._exclusion_formats = formats
+        self._history_formats = history
+
+    def _dword(self, fmt: int) -> int | None:
+        """A clipboard format holding one DWORD, or None if it cannot be read."""
+        handle = self._user32.GetClipboardData(fmt)
+        if not handle or int(self._kernel32.GlobalSize(handle)) < 4:
+            return None
+        pointer = self._kernel32.GlobalLock(handle)
+        if not pointer:
+            return None
+        try:
+            return int.from_bytes(ctypes.string_at(pointer, 4), "little")
+        finally:
+            self._kernel32.GlobalUnlock(handle)
 
     def sequence(self) -> int:
         """Changes on every clipboard write; 0 when this process may not read it."""
@@ -499,6 +586,9 @@ class WindowsClipboard:
                 # An owner that delayed rendering and stopped answering would
                 # hold GetClipboardData, and this thread, until it recovers.
                 raise ClipboardBusy("the clipboard's owner is not responding")
+            for fmt in getattr(self, "_history_formats", ()):
+                if user32.IsClipboardFormatAvailable(fmt) and self._dword(fmt) in (None, 0):
+                    return ClipText("", owner, excluded=True)
             handle = user32.GetClipboardData(CF_UNICODETEXT)
             if not handle:
                 return None
@@ -555,6 +645,7 @@ class Counters:
     ignored: int = 0
     notices: int = 0
     warnings: int = 0
+    swaps: int = 0
     read_failures: int = 0
     consecutive_failures: int = 0
     last_error: str = ""
@@ -579,6 +670,8 @@ class PasteGuard:
         self._last_sequence: int | None = None
         self._ignored: set[str] = set()
         self._ignore_mtime: float | None = None
+        self._last_address: _Address | None = None
+        self.clock: Callable[[], float] = time.monotonic
 
     # ---------------------------------------------------------------- tick
 
@@ -625,6 +718,20 @@ class PasteGuard:
             log.debug("clipboard text of %d characters skipped (above %d)", clip.chars, MAX_TEXT_CHARS)
             return None
         self.counters.texts_read += 1
+        swap = self._swap(clip)
+        if swap is not None:
+            self.counters.swaps += 1
+            if self.events is not None:
+                # Kept on this machine like the rest of the guard's events;
+                # the family, the timing and the programs, never an address.
+                self.events.record(Event(
+                    kind="clipboard", path="", level=WARNING, score=0, reasons=[swap.sentence(clip.owner)],
+                    detail={"signals": list(swap.signals), "family": swap.family,
+                            "seconds": round(swap.seconds, 1), "owner": clip.owner or "",
+                            "previous_owner": swap.previous_owner or ""}), forward=False)
+            if self.notify is not None:
+                self.notify(swap, clip)
+            return swap
         match = classify(clip.text)
         if match is None:
             return None
@@ -654,6 +761,36 @@ class PasteGuard:
         is off, so what was copied in the meantime is never examined: the
         first tick after it comes back only records the sequence number."""
         self._last_sequence = None
+        self._last_address = None
+
+    def _swap(self, clip: ClipText) -> Swap | None:
+        """The swap check, on the text this tick already read. Remembers the
+        last address for SWAP_WINDOW seconds, in memory only."""
+        now = self.clock()
+        text = clip.text.strip()
+        found = wallets.family(text)
+        previous = self._last_address
+        self._last_address = _Address(found.family, text, clip.owner, now) if found else None
+        if previous is None or now - previous.at > SWAP_WINDOW:
+            return None
+        if wallets.canonical(text) == wallets.canonical(previous.text):
+            return None                              # the same address written again
+        owner = (clip.owner or "").lower()
+        if owner in SWAP_FORWARDERS:
+            return None                              # the user's own copy, forwarded or chosen from history
+        if clip.owner and clip.owner == previous.owner:
+            return None                              # one program wrote both: two addresses copied in one app
+        invalid = False
+        if found is None or found.family != previous.family:
+            # Not an address of the family: unless it is a near copy that
+            # fails its checksum, the user copied something else.
+            changed = wallets.differing_characters(text, previous.text)
+            if wallets.shaped_like(text) != previous.family or changed is None or not 0 < changed <= 4:
+                return None
+            invalid = True
+        return Swap(family=previous.family, seconds=now - previous.at, previous_owner=previous.owner,
+                    lookalike=invalid or wallets.lookalike(previous.text, text, previous.family), invalid=invalid,
+                    sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(), chars=len(text))
 
     def _failed(self, exc: BaseException, unexpected: bool = False) -> None:
         c = self.counters
@@ -712,5 +849,6 @@ class PasteGuard:
                     f"({c.last_error}); nothing is being checked")
         skipped = c.skipped_excluded + c.skipped_not_text + c.skipped_too_long
         return (f"on: {c.changes_seen} change(s) seen, {c.texts_read} read as text, {skipped} skipped "
-                f"(private, not text or too long), {c.notices} notice(s), {c.warnings} warning(s); "
+                f"(private, not text or too long), {c.notices} notice(s), {c.warnings} warning(s), "
+                f"{c.swaps} address swap(s); "
                 "nothing is kept and nothing leaves this machine")
