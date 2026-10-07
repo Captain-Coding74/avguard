@@ -907,8 +907,11 @@ class TestWhatASwapLooksLikeToTheTick(unittest.TestCase):
             steps.append((label, written - before, seq() - written))
         print("\n  clipboard sequence per write: " + "; ".join(
             f"{label} +{moved} (then +{late} within 1 s)" for label, moved, late in steps))
-        owner = self.source.read().owner
-        print(f"  owner of a write made with OpenClipboard(NULL): {owner!r}")
+        # The last step left the clipboard empty: write once more, then ask
+        # who owns a write made with no window.
+        self.assertTrue(self.write(self.FIRST))
+        clip = self.source.read()
+        print(f"  owner of a write made with OpenClipboard(NULL): {clip.owner if clip else 'no text read'!r}")
 
         # 2. A swap D ms after the copy, under a poll every 500 ms at a random phase.
         rng = random.Random(20261007)
