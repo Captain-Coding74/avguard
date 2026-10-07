@@ -1303,6 +1303,71 @@ one run, 47 us less in another), and 34 ms for the marked 10 MB archive.
 Still owed, as the plan asked: the 978-file corpus and the owner's real
 Downloads zips. Tests 719 -> 733, both suites green.
 
+
+**Thai lure words, 2026-10-07.** Item 5 of docs/next-6.md, the one part of
+the Thai threat pack with a surface: the paste guard's comment rule in Thai.
+Researched before it was written, by a workflow of four researchers (the
+official Thai strings lures copy; Thai campaign reports; Thai orthography
+and NFKC; honest Thai developer comments), an editor, and one skeptic per
+proposed phrase told to refute it on attestation, spelling and false
+positives. 27 phrases were proposed and 8 kept.
+
+What the research found, and did not. No Thai CERT, Thai press or vendor
+report the researchers could reach attests a Thai-language lure page or a
+Thai comment appended to a pasted command: every Thai-facing campaign they
+found from 2024 to 2026 showed an English reCAPTCHA- or Cloudflare-styled
+page, and the Thai verbs in the reports are the reporters' paraphrase. The
+kits that localise by browser language leave Thai out wherever their lists
+could be read (17 languages in one, 6 in another). What exists is one Thai
+localization table, byte-identical in three public ClickFix lure-page
+repositories and one captured sample, whose appended tail is the Thai twin
+of the English fixture ("ฉันไม่ใช่หุ่นยนต์ - รหัสยืนยัน reCAPTCHA:"); the
+skeptics who opened it found the tail on the page, as what the Run box will
+"show", not on the clipboard. And the real widgets ship Thai: reCAPTCHA's
+checkbox reads "ฉันไม่ใช่โปรแกรมอัตโนมัติ", hCaptcha's "ยืนยันว่าคุณเป็นมนุษย์",
+an archived Cloudflare challenge page "กำลังตรวจสอบว่าคุณเป็นมนุษย์", ALTCHA's
+"ฉันไม่ใช่บอท". So a lure that copies a widget would show Thai to a Thai
+browser, and the words are bought ahead of an attack that has not been
+reported. Most Thai news, CERT and vendor pages were behind this session's
+egress filter and are known from titles and search excerpts only.
+
+The rule. Eight phrases, each counting alone on a line that already
+fetches and runs code, the same gate as the English words: not a robot,
+not an automated program, not a bot (three spellings), I am not, are
+human, verification code, Google's unusual traffic, and Cloudflare's
+security check of your connection. They are phrases, not words, because
+Thai writes no spaces between words and every alternative is a substring:
+"bot" is inside "chatbot", "automated program" inside "run the program
+automatically", "human" inside "human-readable". Refused, on the
+false-positive researcher's evidence from Thai GitHub comments and the
+skeptics': bare ยืนยัน (confirm) and ตรวจสอบ (check), the two most common
+words in honest Thai comments on install lines; ยืนยันตัวตน (authenticate),
+the step after an install; สำเร็จ (success); กด Enter (press Enter); bare
+หุ่นยนต์ (robot) and บอท (bot); the short ตรวจสอบความปลอดภัย (security
+check), found on an honest line above an audit command; and the lure page's
+own headings ("verification steps", "verification window", "complete the
+verification", "verification successful"), which are page text, never the
+pasted line, and generic Thai UI words. Three of those refusals are
+stricter than their English twins ("robot", "press enter" and "security
+check" count alone); the English words are left as they were. Segments may
+be separated by a space; a zero-width space, which Thai pages put between
+words, is gone after `normalize()`. NFKC splits sara am (U+0E33) into two
+characters and a pattern typed with it would never match; none of the eight
+phrases contains it, and `_thai_alternatives()` folds the pattern the same
+way so a future one would match both spellings, which a test checks.
+
+Measured, over every fixture with the previous commit's classifier and this
+one (`git archive HEAD`, then `classify()` on each file under both): the 7
+Thai lure fixtures warn 0 times before and 7 after; the 33 English lure
+fixtures warn 33 times before and after with identical signals; the 5
+honest Thai lines and the 38 other legitimate lines warn 0 times before and
+after. Each phrase is also tested alone, with a space and with a zero-width
+space between its parts, and 19 honest Thai comments are tested to stay a
+notice. Tests 733 -> 736, both suites green. Not measured: a Thai lure in the wild, because
+none has been reported. Found in passing and left for its own change: the
+English tail "Cloud identificator: XXXX" that Microsoft reported in August
+2025 matches none of the English words; only its checkmark catches it.
+
 ## Deliberately not doing
 
 The paste guard (above) is the one input that is not a file; it watches a user-mode clipboard buffer through documented calls, with no driver, no hook and no process telemetry, so it does not reopen the first decision here. The EDR-shaped extensions of it are refused by name: no keyboard hook to see Win+R, no automation of the Run dialog, no watching what the user then runs.

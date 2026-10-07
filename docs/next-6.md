@@ -182,7 +182,17 @@ warm, the facts-pass delta per file over the 978-file corpus with the
 cache off, the member-hashing delta on the real Downloads zips. Effort M,
 no dependency, Windows-only reader behind `available`.
 
-## 5. Thai-focused threat pack — build the one part with a surface
+## 5. Thai-focused threat pack — the part with a surface DONE
+
+Built 2026-10-07; the record is in ROADMAP.md under "Thai lure words". The
+plan below guessed the words; a research pass replaced the guess. Eight
+phrases from real Thai verification widgets and the one Thai ClickFix
+localization table, each put to a skeptic, seven Thai must_warn fixtures
+and five honest Thai must_not_warn ones instead of four and one. None of the
+eight phrases contains sara am, so the NFKC point below turned into a helper
+and a test that keep any future phrase with it matching both spellings.
+What was planned:
+
 
 **The proposal fails the project's own tests before any skeptic.** The
 Thai campaigns of 2023-2026 are real and under-served, and almost none

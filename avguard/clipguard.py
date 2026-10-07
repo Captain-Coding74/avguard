@@ -111,10 +111,44 @@ _DROP = re.compile(r"%(?:temp|tmp|appdata|localappdata|public|programdata)%|\$en
 # Matched line by line: the comment and the lure words must share a line.
 # The words are the lure's, not any comment's: "# verify the server is up"
 # is a comment.
+# The Thai twins of those words, each a phrase, not a word: Thai writes no
+# spaces between words, so every alternative is a substring, and "bot" alone
+# is inside "chatbot", "automated program" inside "run the program
+# automatically", "verify" inside every honest "confirm that the server is
+# up". Each phrase is the text of a real verification widget in Thai (Google
+# reCAPTCHA's checkbox, hCaptcha's, Cloudflare's challenge page, ALTCHA's and
+# Anubis's) or of the one Thai localization table found in public ClickFix
+# kits; each was put to a skeptic who looked for it in honest Thai developer
+# comments. What was refused, and why, is in ROADMAP.md ("Thai lure words").
+# Segments may be written with a space between them; a zero-width space,
+# which Thai pages put between words, is gone after normalize().
+_THAI_LURE_PHRASES = (
+    ("ไม่ใช่", "หุ่นยนต์"),                       # not a robot (the kit, widgets)
+    ("ไม่ใช่", "โปรแกรม", "อัตโนมัติ"),           # not an automated program (reCAPTCHA v2)
+    ("ไม่ใช่", "บอท"), ("ไม่ใช่", "บอต"), ("ไม่ใช่", "บ็อต"),   # not a bot (ALTCHA, Anubis)
+    ("ฉัน", "ไม่ใช่"),                            # I am not
+    ("เป็น", "มนุษย์"),                           # are human (hCaptcha, Cloudflare)
+    ("รหัส", "ยืนยัน"),                           # verification code (the kit's tail)
+    ("การ", "เข้าชม", "ที่", "ผิดปกติ"),          # unusual traffic (Google's block page)
+    ("ตรวจสอบ", "ความปลอดภัย", "ของ", "การเชื่อมต่อ", "ของ", "คุณ"),   # security check of your connection
+)
+
+
+def _thai_alternatives(phrases) -> str:
+    """The phrases as regex alternatives, in the form normalize() leaves text
+    in. NFKC splits SARA AM (U+0E33) into NIKHAHIT + SARA AA, the one Thai
+    character it changes, so a literal typed with it would never match
+    normalized text; folding the pattern the same way makes either spelling
+    match. Thai has no case, so lower() changes nothing here."""
+    return "|".join(" ?".join(re.escape(unicodedata.normalize("NFKC", part)) for part in phrase)
+                    for phrase in phrases)
+
+
 _LURE_COMMENT = re.compile(
     r"(?:^|\s)(?:#|rem\b)[^\n]*?(?:robot|captcha|turnstile|cloudflare|ray id|"
     r"verif(?:y|ication) (?:you|that you|your|i am|i'm|id\b|code\b|hash\b|step\b|token\b|complete|required|success)|"
-    r"(?:are|am|a|not) human|human verification|i am not|i'm not|press enter|unusual traffic|security check)")
+    r"(?:are|am|a|not) human|human verification|i am not|i'm not|press enter|unusual traffic|security check|"
+    + _thai_alternatives(_THAI_LURE_PHRASES) + ")")
 _LURE_MARK = re.compile(r"[\u2705\u2714\u2713\u2611\U0001f512\U0001f6e1]")
 _PADDED_COMMENT = re.compile(r"\S[ \t]{12,}#")
 _CHARCODE = re.compile(r"\[char\]")

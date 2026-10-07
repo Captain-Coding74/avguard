@@ -168,6 +168,8 @@ One thing AVGuard watches that is not a file: the clipboard. The ClickFix scam (
 
 It is advisory and nothing more. It produces no verdict and can never move a file. It keeps none of the text: the warning and the History event carry the shape of the command, the host it names and the program that put it on the clipboard, never the command itself. It sends nothing. It does not read the clipboard when it is off, does not read what was already there when AVGuard started, and does not read text an application has marked private, which is what password managers like KeePass and 1Password do. A command you use yourself can be silenced with one button.
 
+The comment tails are recognised in English and in Thai. The Thai words are phrases from the real Thai verification widgets that lures copy ("ไม่ใช่หุ่นยนต์", Google's "ไม่ใช่โปรแกรมอัตโนมัติ", "เป็นมนุษย์", "รหัสยืนยัน" and four more), not the everyday words honest Thai developer comments use: "ยืนยัน" (confirm), "ตรวจสอบ" (check), "บอท" (bot) or "สำเร็จ" (success) alone never count. No Thai-language lure page has been reported in the wild; the words come from one Thai localization table in public ClickFix kits and from the widgets themselves.
+
 The limits, stated plainly. It warns, it cannot block the paste or the Run box. It knows the shapes seen so far, not every shape. The honest install one-liners developers paste (`irm https://astral.sh/uv/install.ps1 | iex` and the like) share the shape, so they are shown as a quieter notice, not a warning, and counted. It is off until you choose it, in the first-run dialog or in Settings, and `python -m avguard --paste-check FILE` runs the same classifier over a file without touching the clipboard.
 
 ## Tests

