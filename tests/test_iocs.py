@@ -415,6 +415,56 @@ class TestRoundSixFeed(IocCase):
         result = self.store.update_from_feed(session=FakeSession(FakeResponse(200, feed_body(150))))
         self.assertEqual((result.missed_since, self.store.feed_state()["gap_since"]), (0.0, ""))
 
+    def test_the_window_is_forty_eight_hours_to_the_minute(self):
+        import time
+        for hours, gap in ((47.98, False), (48.02, True)):
+            with self.subTest(hours=hours):
+                self.store.update_from_feed(full=True, session=FakeSession(FakeResponse(200, self.zipped())))
+                with self.store._write_lock, self.store._conn() as conn:
+                    self.store._set_meta(conn, "feed_checked_at", str(time.time() - hours * 3600))
+                result = self.store.update_from_feed(session=FakeSession(FakeResponse(200, feed_body(150))))
+                self.assertEqual(bool(result.missed_since), gap)
+
+    def test_a_failed_request_is_retried_in_hours_not_at_the_next_tick(self):
+        """Round seven: the window re-arms hourly and a request that got no
+        feed did not count, so a captive portal was asked every hour while
+        the README and the consent said once a day."""
+        import time
+        now = time.time()
+        self.assertTrue(self.store.feed_due(now))
+        with self.assertRaises(FeedError):
+            self.store.update_from_feed(session=FakeSession(FakeResponse(200, b"<html>sign in</html>")))
+        self.assertFalse(self.store.feed_due(now + 3600), "asked again an hour later")
+        self.assertTrue(self.store.feed_due(now + iocs.FEED_RETRY_SECONDS + 60))
+
+    def test_a_zipped_feed_that_lies_or_is_damaged_is_refused(self):
+        import bz2
+        import struct
+        import zlib as _zlib
+        body = feed_body(200, prefix="lie-")
+        stream = bz2.compress(body)
+        name = b"full_sha256.txt"
+        local = struct.pack("<IHHHHHIIIHH", 0x04034B50, 46, 0, 12, 0, 0x21, _zlib.crc32(body[:100]),
+                            len(stream), 100, len(name), 0) + name + stream
+        central = struct.pack("<IHHHHHHIIIHHHHHII", 0x02014B50, 46, 46, 0, 12, 0, 0x21, _zlib.crc32(body[:100]),
+                              len(stream), 100, len(name), 0, 0, 0, 0, 0, 0) + name
+        lying = local + central + struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, 1, 1, len(central), len(local), 0)
+        stored = io.BytesIO()
+        with zipfile.ZipFile(stored, "w", zipfile.ZIP_STORED) as archive:
+            archive.writestr("full_sha256.txt", body)
+        damaged = bytearray(stored.getvalue())
+        at = damaged.find(feed_body(1, prefix="lie-").splitlines()[-1][:8])
+        self.assertGreater(at, 0)
+        damaged[at] ^= 0x01                                     # one byte of a hash, its CRC left as it was
+        for label, blob, why in (("larger than its header", lying, "larger than its header claims"),
+                                 ("CRC", bytes(damaged), "CRC")):
+            with self.subTest(label=label):
+                before = self.store.count()
+                with self.assertRaises(FeedError) as refused:
+                    self.store.update_from_feed(full=True, session=FakeSession(FakeResponse(200, blob)))
+                self.assertIn(why, str(refused.exception), "refused for another reason")
+                self.assertEqual(self.store.count(), before)
+
     def test_no_credentials_from_the_environment_go_with_the_request(self):
         built = []
 

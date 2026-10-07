@@ -104,7 +104,11 @@ SUSPICIOUS_AT = 50
 # 16: a zip member that produces more than its header declares is a structural
 # problem (SUSPICIOUS), and what it hides past the declared size is inspected;
 # a lying bzip2 header was read as CLEAN after decompressing gigabytes.
-DETECTION_VERSION = 16
+# 17: what one archive down is found to be (a lying header, a bomb, a
+# traversal name) counts, as it does at the top; an archive zipfile refuses
+# is read from its local headers; a member declaring more than 32 MB is read
+# to 32 MB instead of skipped. Each of those was CLEAN.
+DETECTION_VERSION = 17
 
 # The ruleset compiled last time, kept between runs. See _adopt_compiled_cache.
 COMPILED_RULES_PATH = config.DATA_DIR / "rules.compiled"
@@ -374,13 +378,20 @@ def shannon_entropy(histogram: Sequence[int], total: int) -> float:
 
 
 def _cache_entry_ok(value) -> bool:
+    """An entry as put() writes it, down to what the replay reads: a reason
+    that was not text was kept, replayed MALICIOUS, and the window's handler
+    raised on it, so the threat got no banner, no quarantine, no row."""
     if not isinstance(value, dict):
         return False
     at = value.get("at", 0)
     reasons = value.get("reasons", [])
+    findings = value.get("findings", [])
     return (value.get("level") in {level.value for level in Level}
             and isinstance(at, (int, float)) and not isinstance(at, bool)
-            and isinstance(reasons, list) and isinstance(value.get("sha256", ""), str))
+            and isinstance(reasons, list) and all(isinstance(r, str) for r in reasons)
+            and isinstance(findings, list) and all(isinstance(f, dict) for f in findings)
+            and isinstance(value.get("allowed", False), bool)
+            and isinstance(value.get("sha256", ""), str))
 
 
 class ScanCache:
@@ -861,9 +872,35 @@ class Scanner:
             self._report_rule_failure(f"rules failed to compile together: {exc}")
             return False
 
-        problem = self._validate_rules(candidate)
-        if problem:
-            self._report_rule_failure(problem)
+        problem, offenders = self._validate_rules(candidate)
+        if offenders:
+            # A rule of the user's, or of a pack, that matches a file AVGuard
+            # ships costs that file or that pack, as a typo does: one rule for
+            # "https://" (the EICAR rule's reference holds it) refused the
+            # whole load, every shipped rule went with it, and Health blamed
+            # the shipped ruleset.
+            dropped: set[str] = set()
+            for namespace, why in offenders.items():
+                if namespace in pack_of:
+                    broken[pack_of[namespace]] = why
+                    dropped |= {ns for ns, pack in pack_of.items() if pack == pack_of[namespace]}
+                else:
+                    broken_user[Path(namespace).name] = why
+                    dropped.add(namespace)
+                log.error("%s %s and is left out", Path(namespace).name, why)
+            for namespace in dropped:
+                pack_of.pop(namespace, None)
+            counts = {name: n for name, n in counts.items() if name not in broken}
+            sources = [p for p in sources if str(p.resolve()) not in dropped]
+            namespaces = _namespaces(sources)
+            try:
+                candidate = yara.compile(filepaths=namespaces)
+            except yara.Error as exc:
+                self._report_rule_failure(f"rules failed to compile together: {exc}")
+                return False
+            problem, offenders = self._validate_rules(candidate)
+        if problem or offenders:
+            self._report_rule_failure(problem or "a rule still matches AVGuard's own rule files")
             return False
 
         # One object, one assignment: a failed load leaves the previous
@@ -1059,7 +1096,7 @@ class Scanner:
         except Exception as exc:  # a convenience; losing it costs one compile
             log.warning("could not write the compiled rule cache: %s", exc)
 
-    def _validate_rules(self, candidate) -> str:
+    def _validate_rules(self, candidate) -> tuple[str, dict[str, str]]:
         """Check a candidate ruleset before adopting it.
 
         A rule that matches its own file is the v1 disaster in miniature. It is
@@ -1073,17 +1110,29 @@ class Scanner:
         the user wrote are warned about and loaded, with the fix spelled out:
         rejecting somebody's first rule with a lecture just teaches them to
         turn validation off.
+
+        Returns (why the load is refused, or ""; the namespace of each rule
+        file that is not AVGuard's and matches a file AVGuard ships, with
+        why). Only a shipped rule matching a shipped file refuses the load:
+        whose rule matched is read from the match's namespace.
         """
         shipped = self.rules_path.parent.resolve()
+        offenders: dict[str, str] = {}
         for path in self.rule_files():
             try:
-                if not candidate.match(data=path.read_bytes()):
-                    continue
+                matches = candidate.match(data=path.read_bytes())
             except Exception:
                 continue
+            if not matches:
+                continue
             if path.resolve().parent == shipped:
-                return (f"refused: the shipped ruleset matches its own file "
-                        f"{path.name}, which is how v1 destroyed itself")
+                if any(Path(m.namespace).parent == shipped for m in matches):
+                    return (f"refused: the shipped ruleset matches its own file "
+                            f"{path.name}, which is how v1 destroyed itself"), {}
+                for match in matches:
+                    offenders.setdefault(match.namespace,
+                                         f"matches AVGuard's own rule file {path.name} (rule {match.rule})")
+                continue
             log.warning(
                 "your rule file %s matches itself. It still loaded, but it will "
                 "fire on any copy of itself. Write the indicator as hex "
@@ -1097,7 +1146,7 @@ class Scanner:
                     log.warning("a rule matches AVGuard's own source file %s", path.name)
         except Exception:
             pass
-        return ""
+        return "", offenders
 
     def _report_rule_failure(self, message: str) -> None:
         """Keep whatever was working, and be loud about what was not."""
@@ -1440,16 +1489,6 @@ class Scanner:
             # visible, never scored -- they say nothing about the file.
             log.debug("%s: %s", facts.path.name, note)
 
-        if report.problems:
-            # Collapsed into ONE finding on purpose. A bomb and a traversal
-            # name in the same archive is one observation about a hostile
-            # container, and emitting one finding each would let structure
-            # alone reach the quarantine threshold. Structure describes the
-            # file; it never condemns it.
-            findings.append(Finding(
-                "archive", "structure", WEIGHT_ARCHIVE_PROBLEM,
-                "archive is malformed or hostile: " + "; ".join(report.problems[:3])))
-
         for display, payload in archives.iter_nested(report):
             if downloaded:
                 remembered.append((hashlib.sha256(payload).hexdigest(), display))
@@ -1469,6 +1508,18 @@ class Scanner:
                     # Same scoring as a loose file, including the cap on
                     # rules from packs nobody has promoted.
                     findings.append(self._finding_from_match(match, ruleset, inside=display))
+
+        if report.problems:
+            # After the walk: it adds what archives inside this one turned
+            # out to be, which a finding made before it never saw.
+            # Collapsed into ONE finding on purpose. A bomb and a traversal
+            # name in the same archive is one observation about a hostile
+            # container, and emitting one finding each would let structure
+            # alone reach the quarantine threshold. Structure describes the
+            # file; it never condemns it.
+            findings.insert(0, Finding(
+                "archive", "structure", WEIGHT_ARCHIVE_PROBLEM,
+                "archive is malformed or hostile: " + "; ".join(report.problems[:3])))
 
         if report.members and report.inspected:
             log.debug("%s: inspected %d of %d archive members",
@@ -1682,12 +1733,19 @@ class Scanner:
         # SUSPICIOUS, the cloud was never asked, and a sample VirusTotal would
         # have condemned was left alone. "Reports only" must not mean
         # "silences the engine that was going to condemn it".
+        unanswered = False
         if not any(f.hard for f in findings) and self._wants_cloud_lookup(facts):
             try:
                 cloud_reasons = self.cloud_lookup(facts.sha256, facts.path)
             except Exception as exc:
                 log.warning("cloud lookup failed for %s: %s", facts.path, exc)
                 cloud_reasons = []
+                unanswered = True
+            # Asked for and not answered (the rate, the day's budget, no key
+            # in this process's environment, a network error): what was
+            # found locally stands, but a CLEAN is not remembered, or the
+            # next scan replays it without asking for the cache's 30 days.
+            unanswered = unanswered or bool(getattr(cloud_reasons, "unanswered", False))
             for reason in cloud_reasons:
                 findings.append(Finding("cloud", "virustotal", WEIGHT_SIGNATURE,
                                         reason, hard=True))
@@ -1707,7 +1765,7 @@ class Scanner:
                            findings + extra, sha256=facts.sha256)
         verdict = Verdict(path, level, reasons + [f.describe() for f in extra], facts, findings + extra,
                           sha256=facts.sha256)
-        if use_cache:
+        if use_cache and not unanswered:
             cache.put(path, size, mtime_ns, level, reasons, facts.sha256, findings=findings)
         return verdict
 

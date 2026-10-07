@@ -73,6 +73,13 @@ class CloudResult:
     known: bool
 
 
+class Unanswered(list):
+    """reasons_for() when VirusTotal was not asked or did not answer: no
+    reasons, and not a CLEAN worth remembering (the scanner does not cache
+    it)."""
+    unanswered = True
+
+
 class VirusTotalClient:
     """Cached, budgeted access to the VirusTotal file-report endpoint."""
 
@@ -115,7 +122,10 @@ class VirusTotalClient:
         try:
             raw = config.read_json_object(self.cache_path) or {}
         except (OSError, config.UnreadableJSON):
-            return {}
+            # The shape every caller indexes: {} raised KeyError out of the
+            # constructor, built even with lookups off, so a damaged file
+            # stopped every scan and the window starting.
+            return {"entries": {}, "spent_today": 0, "budget_date": ""}
         entries = raw.get("entries")
         return {"entries": entries if isinstance(entries, dict) else {},
                 "spent_today": raw.get("spent_today") if isinstance(raw.get("spent_today"), int) else 0,
@@ -147,10 +157,24 @@ class VirusTotalClient:
                     merged[sha256] = entry
             self._cache = merged
             self._spent_today = spent
+        config.set_aside_if_unreadable(self.cache_path)
         config.atomic_write_text(self.cache_path, json.dumps(
             {"entries": merged, "spent_today": spent, "budget_date": self._budget_date}))
 
+    def _roll_day(self) -> str:
+        """Today's date, and this process's count reset when it changed: a
+        window running past midnight carried yesterday's count into today,
+        so its daily budget was a lifetime one, and the count was written
+        under today's date for every other process too."""
+        today = date.today().isoformat()
+        with self._lock:
+            if today != self._budget_date:
+                self._budget_date = today
+                self._spent_today = 0
+        return today
+
     def save_cache(self) -> None:
+        self._roll_day()
         lock = self._file_lock()
         held = lock.acquire(2.0)
         try:
@@ -196,14 +220,12 @@ class VirusTotalClient:
         under a file lock. False when it is spent. Each process counted its
         own before, so the window and a right-click scan spent 800 of a
         budget of 400 against VirusTotal's 500 a day."""
-        today = date.today().isoformat()
+        today = self._roll_day()
         lock = self._file_lock()
         held = lock.acquire(2.0)
         try:
             if not held:
                 return False                 # another process is mid-charge: skip, never overspend
-            if today != self._budget_date:
-                self._budget_date = today
             disk = self._read_disk()
             spent = max(disk["spent_today"] if disk["budget_date"] == today else 0,
                         self._spent_today if self._budget_date == today else 0)
@@ -326,7 +348,9 @@ class VirusTotalClient:
         low-quality engine.
         """
         result = self.lookup(sha256)
-        if result is None or not result.known:
+        if result is None:
+            return Unanswered()
+        if not result.known:
             return []
         if result.malicious >= 3:
             return [f"VirusTotal: {result.malicious} of {result.total} engines flagged this file"]

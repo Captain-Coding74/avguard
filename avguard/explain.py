@@ -151,8 +151,34 @@ def tally_of(findings: Sequence[Finding], threshold) -> Tally:
                  threshold=threshold, suspicious_at=SUSPICIOUS_AT, count=len(findings))
 
 
+_FIGURE = re.compile(
+    r"\d+(?:[.,]\d+)?\s*(?:%|percent\b|per\s*cent\b)"                       # 97%, 97 percent
+    r"|(?:confiden|probab|likel|certain)\w*\W+(?:\w+\W+){0,3}?\d"              # confidence: 0.97
+    r"|\d(?:[\d.,]*)\W+(?:\w+\W+){0,3}?(?:confiden|probab|likel|certain)"       # 9 in 10 likely
+    r"|\b\d{1,3}\s*(?:in|out\s+of)\s*(?:10|100|1,?000)\b",                           # 9 in 10, not "Windows 10 in 2024"
+    re.IGNORECASE)
+
+# What the scanner makes of a rule's description: "<description> (rule NAME,
+# severity[, from the P pack])[ inside archive!member]".
+_RULE_SENTENCE = re.compile(r"^(?P<said>.*?) \(rule (?P<rule>[^,()]+), [^)]*\)(?P<where>.*)$", re.DOTALL)
+
+
 def _states_a_figure(text: str) -> bool:
-    return bool("%" in text or (re.search(r"\d", text) and re.search(r"confiden|probab", text, re.I)))
+    """A confidence figure: a number with a percent, or a number near a
+    word for confidence or likelihood. Not any "%" (%APPDATA% is a folder)
+    and not any digit (a rule named Loader_v2 "probably" a loader)."""
+    return bool(_FIGURE.search(text))
+
+
+def _without_figures(sentence: str) -> str:
+    """A rule's sentence with its author's description left out when that
+    states a figure, keeping where it matched. Judged on the description
+    alone: a "%" in an archive's name, or a digit in the rule's, made the
+    account say the author stated one."""
+    shaped = _RULE_SENTENCE.match(sentence)
+    if shaped is None or not _states_a_figure(shaped["said"]):
+        return sentence
+    return f"rule {shaped['rule']} matched {DESCRIPTION_LEFT_OUT}{shaped['where']}"
 
 
 def _author_notes(notes: Sequence[str]) -> tuple[str, ...]:
@@ -218,12 +244,10 @@ def _row(finding: Finding, packs) -> Row:
     # The confidence filter is for a rule author's prose; a note the scanner
     # itself wrote (a path, a name) is kept as it is.
     notes = _author_notes(finding.notes) if finding.source == "yara" else tuple(finding.notes)
-    said = finding.describe()
-    if finding.source == "yara" and _states_a_figure(said):
-        # The rule's description is the author's prose too: a pack could put
-        # "97% confidence" in the account a line above the sentence saying
-        # the program has no such number.
-        said = f"rule {finding.name} matched {DESCRIPTION_LEFT_OUT}"
+    # The rule's description is the author's prose too: a pack could put
+    # "97% confidence" in the account a line above the sentence saying the
+    # program has no such number.
+    said = _without_figures(finding.describe()) if finding.source == "yara" else finding.describe()
     return Row(kind, words, int(finding.weight), said, notes + extra)
 
 
@@ -252,14 +276,14 @@ def explain(path: str, level: str, reasons: Sequence[str], findings: Sequence[Fi
     elif kept:
         rows = ()
     else:
-        rows = tuple(Row(RECORDED, NOT_KEPT, 0, reason) for reason in reasons)
+        rows = tuple(Row(RECORDED, NOT_KEPT, 0, _without_figures(str(reason))) for reason in reasons)
     tally = tally_of(findings if kept else [],
                      cfg.quarantine_threshold if threshold is None else threshold)
     happened, actions = _HAPPENED.get(state, _HAPPENED[OTHER])
     return Explanation(path=str(path), level=level, meaning=_meaning(level, rows, state), rows=rows,
                        tally=tally, sha256=sha256, state=state, happened=happened,
                        actions=actions + (("Copy this account", "copy"),), evidence_kept=kept,
-                       reasons=tuple(str(r) for r in reasons))
+                       reasons=tuple(_without_figures(str(r)) for r in reasons))
 
 
 def _recorded_threshold(detail: dict):

@@ -336,7 +336,7 @@ class TestARefusedReloadKeepsTheAdoptedState(CompiledCacheCase):
         rule = self.store.rule_files_for("vendor")[0]
         rule.write_text(rule_text(TRIPWIRE) + "\n"
                         + rule_text(OTHER).replace("Imported", "Second"), encoding="utf-8")
-        with mock.patch.object(Scanner, "_validate_rules", return_value="refused for the test"):
+        with mock.patch.object(Scanner, "_validate_rules", return_value=("refused for the test", {})):
             self.assertFalse(scanner.reload_rules())
         self.assertEqual(scanner.pack_rule_counts, {"vendor": 1},
                          "the refused attempt's count was adopted")

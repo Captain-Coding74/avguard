@@ -98,11 +98,20 @@ class EventStore:
         payload = asdict(event)
         line = json.dumps(payload, ensure_ascii=False)
         try:
+            line.encode("utf-8")
+        except UnicodeEncodeError:
+            # A path Python holds with a lone surrogate (an undecodable byte
+            # on Linux, an unpaired UTF-16 half on Windows) cannot be written
+            # as UTF-8: escaped instead. It raised out of the command line's
+            # quarantine loop, so the next threat was never moved, and out of
+            # --restore after the file was back, so "Restored to" never came.
+            line = json.dumps(payload)
+        try:
             with self._lock:
                 self._rotate_if_needed()
                 with open(self.path, "a", encoding="utf-8") as handle:
                     handle.write(line + "\n")
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             log.warning("could not record an event: %s", exc)
         forwarder = self.forwarder if forward else None
         if forwarder is not None:

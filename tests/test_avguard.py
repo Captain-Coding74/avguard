@@ -721,6 +721,98 @@ class TestVirusTotalClient(TempCase):
         self.assertEqual(len([h for h in (f"{i:064x}" for i in range(8)) if reread._cached(h)]), 8,
                          "the window's save erased what the console scan paid for")
 
+    def _at(self, day: str):
+        """cloud.date, held at `day` until the next call."""
+        import datetime as _datetime
+        from avguard import cloud
+
+        class Day(_datetime.date):
+            current = _datetime.date.fromisoformat(day)
+
+            @classmethod
+            def today(cls):
+                return cls.current
+        patcher = mock.patch.object(cloud, "date", Day)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return Day
+
+    def test_a_window_open_past_midnight_gets_a_new_day(self):
+        """Round seven: the count was not reset with the date, so a window
+        left running had a lifetime budget, and wrote yesterday's count
+        under today's date for every other process too."""
+        self.cfg.cloud_daily_budget = 2
+        day = self._at("2026-10-06")
+        window = self.client(FakeSession([]))
+        window.bucket.tokens = window.bucket.capacity = 1e9
+        for index in range(3):
+            window.lookup(f"{index:064x}")
+        self.assertEqual(window.session.calls, 2)
+        day.current = day.current.fromisoformat("2026-10-07")
+        self.assertEqual(window.spent_today, 0)
+        window.lookup(f"{9:064x}")
+        self.assertEqual(window.session.calls, 3, "no lookup on the new day")
+        window.save_cache()
+        console = self.client(FakeSession([]))
+        self.assertEqual(console.spent_today, 1, "yesterday's count written under today's date")
+
+    def test_a_new_process_does_not_inherit_yesterdays_count(self):
+        self.cfg.cloud_daily_budget = 2
+        day = self._at("2026-10-06")
+        first = self.client(FakeSession([]))
+        first.bucket.tokens = first.bucket.capacity = 1e9
+        for index in range(2):
+            first.lookup(f"{index:064x}")
+        first.save_cache()
+        day.current = day.current.fromisoformat("2026-10-07")
+        second = self.client(FakeSession([]))
+        second.bucket.tokens = second.bucket.capacity = 1e9
+        second.lookup(f"{7:064x}")
+        self.assertEqual(second.session.calls, 1)
+
+    def test_a_cache_file_that_cannot_be_read_does_not_stop_a_scan(self):
+        """Round seven: {} from the reader raised KeyError out of the
+        constructor, built even with lookups off, so --scan exited 1 and
+        the window did not start."""
+        (self.tmp / "vt.json").write_bytes(b'{"entries": \xff')
+        client = self.client(FakeSession([FakeResponse(200, report(0))]))
+        self.assertEqual(client.spent_today, 0)
+        client.lookup("a" * 64)
+        client.save_cache()
+        self.assertEqual(len(list(self.tmp.glob("vt.json.unreadable-*"))), 1)
+        self.assertIsNotNone(self.client(FakeSession([]))._cached("a" * 64))
+
+    def test_the_newer_of_two_answers_is_kept(self):
+        import time as _time
+        old, new = self.client(FakeSession([])), self.client(FakeSession([]))
+        old._cache["b" * 64] = {"malicious": 0, "suspicious": 0, "total": 70, "known": True,
+                                "fetched_at": _time.time() - 10_000}
+        new._cache["b" * 64] = {"malicious": 9, "suspicious": 0, "total": 70, "known": True,
+                                "fetched_at": _time.time()}
+        new.save_cache()
+        old.save_cache()                       # the stale one, saved last
+        self.assertEqual(self.client(FakeSession([]))._cached("b" * 64).malicious, 9)
+
+    def test_no_lookup_while_another_process_holds_the_budget(self):
+        from avguard.fim import FileLock
+        client = self.client(FakeSession([FakeResponse(200, report(0))]))
+        client.bucket.tokens = client.bucket.capacity = 1e9
+        holder = FileLock(client.cache_path.with_name(client.cache_path.name + ".lock"))
+        self.assertTrue(holder.acquire(0.1))
+        self.addCleanup(holder.release)
+        real = FileLock.acquire
+        with mock.patch.object(FileLock, "acquire", lambda lock, wait=0: real(lock, 0.1)):
+            client.lookup("c" * 64)
+        self.assertEqual(client.session.calls, 0, "a lookup went out without the budget's lock")
+
+    def test_health_counts_what_the_other_process_spent(self):
+        window = self.client(FakeSession([]))           # running, and makes no lookup itself
+        console = self.client(FakeSession([]))
+        console.bucket.tokens = console.bucket.capacity = 1e9
+        for index in range(3):
+            console.lookup(f"{index:064x}")
+        self.assertEqual(window.spent_today, 3)
+
     def test_single_detection_is_not_treated_as_a_threat(self):
         session = FakeSession([FakeResponse(200, report(1))])
         client = self.client(session)

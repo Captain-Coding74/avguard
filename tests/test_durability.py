@@ -31,6 +31,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -742,13 +743,42 @@ class TestUserRuleNamespaces(TempCase):
             'rule Extra {\n  meta:\n    description = "x"\n    severity = "low"\n'
             '  strings:\n    $a = { 51 51 51 51 }\n  condition:\n    $a\n}\n', encoding="utf-8")
         (self.user_rules / "typo.yara").write_text("rule Typo {\n  condition:\n    $nope\n}\n", encoding="utf-8")
+        # Older than the two-second rule, or the second scanner recompiles
+        # and the manifest's copy of broken_user_rules is never read (round
+        # seven found this test passing either way).
+        settled = time.time() - 10
+        for rule_file in self.user_rules.iterdir():
+            os.utime(rule_file, (settled, settled))
         scanner = self.scanner()
         self.assertIsNotNone(scanner.rules, "the shipped rules went down with the typo")
         matched = {m.rule for m in scanner.rules.match(data=EICAR + b" QQQQ")}
         self.assertTrue({"Eicar_Test_File", "Extra"} <= matched, matched)
         self.assertEqual(list(scanner.broken_user_rules), ["typo.yara"])
-        again = self.scanner()                     # the compiled ruleset, adopted
+        adopted: list[bool] = []
+        real = Scanner._adopt_compiled_cache
+
+        def recording(scanner_self):
+            adopted.append(real(scanner_self))
+            return adopted[-1]
+        with mock.patch.object(Scanner, "_adopt_compiled_cache", recording):
+            again = self.scanner()
+        self.assertIn(True, adopted, "the second scanner compiled instead of adopting")
         self.assertEqual(list(again.broken_user_rules), ["typo.yara"])
+
+    def test_a_rule_of_yours_that_matches_a_shipped_file_costs_only_that_file(self):
+        """Round seven: a user rule for an ordinary string the shipped rule
+        file holds ("https://" is in the EICAR rule's reference) refused the
+        whole load, every shipped rule with it, and Health blamed the
+        shipped ruleset."""
+        from avguard.scanner import EICAR
+        (self.user_rules / "links.yara").write_text(
+            'rule Links {\n  meta:\n    description = "x"\n    severity = "low"\n'
+            '  strings:\n    $a = "https://"\n  condition:\n    $a\n}\n', encoding="utf-8")
+        scanner = self.scanner()
+        self.assertIsNotNone(scanner.rules)
+        self.assertIn("Eicar_Test_File", {m.rule for m in scanner.rules.match(data=EICAR)})
+        self.assertEqual(list(scanner.broken_user_rules), ["links.yara"])
+        self.assertIn("malware.yara", scanner.broken_user_rules["links.yara"])
 
     def test_both_files_are_reported_as_sources(self):
         (self.user_rules / "extra.yara").write_text(

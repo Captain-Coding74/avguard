@@ -666,6 +666,36 @@ class TestADescriptionThatStatesAFigure(unittest.TestCase):
         self.assertNotIn("97%", text)
         self.assertIn(f"rule Packed_Thing matched {explain.DESCRIPTION_LEFT_OUT}", text)
 
+    def test_a_bare_percentage_or_a_word_figure_is_left_out_too(self):
+        for said in ("packed loader, 97% likely malicious", "seen in 97% of loaders",
+                     "97 percent certain this is a loader",
+                     "confidence 0.97", "9 in 10 of these are loaders"):
+            with self.subTest(said=said):
+                text = explain.render_text(account_for(
+                    [Finding("yara", "R", 50, f"{said} (rule R, medium)", severity="medium")]))
+                self.assertIn(explain.DESCRIPTION_LEFT_OUT, text)
+
+    def test_a_percent_that_is_not_a_figure_is_kept_with_where_it_matched(self):
+        """Round seven: any "%" (an %APPDATA% path, a %20 in a member's
+        name) or any digit in the rule's name beside "probably" dropped an
+        ordinary description and said it stated a confidence figure."""
+        for detail in ("Script that writes under %APPDATA% (rule Env_v2, medium) inside invoice%20copy.zip!a.js",
+                       "Probably a packed loader (rule Loader_v2, medium)",
+                       "packed loader (rule Loader, medium) inside summer sale 50%.zip!readme.txt"):
+            with self.subTest(detail=detail):
+                text = explain.render_text(account_for([Finding("yara", "R", 50, detail, severity="medium")]))
+                self.assertIn(detail, text)
+                self.assertNotIn(explain.DESCRIPTION_LEFT_OUT, text)
+
+    def test_the_json_object_and_recorded_reasons_carry_no_figure(self):
+        loud = "97% confidence: packed loader (rule Loud, medium) inside a.zip!b"
+        account = account_for([Finding("yara", "Loud", 50, loud, severity="medium")])
+        self.assertNotIn("97%", explain.as_json(account))
+        self.assertIn("inside a.zip!b", explain.as_json(account))
+        recorded = explain.explain("C:/x", "suspicious", [loud], None, CFG)
+        self.assertNotIn("97%", explain.render_text(recorded))
+        self.assertNotIn("97%", explain.as_json(recorded))
+
     def test_an_ordinary_description_is_kept_and_the_scanner_own_words_are_not_filtered(self):
         plain = [Finding("yara", "R", 50, "a downloader seen in 2024 lures (rule R, medium)", severity="medium"),
                  Finding("signature", "S", 100, "matched 100% of signature S", hard=True)]

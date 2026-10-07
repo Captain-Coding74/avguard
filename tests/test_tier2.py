@@ -165,6 +165,8 @@ class TestHistoryAndTheCacheSurviveDamage(TempCase):
             handle.write(json.dumps({"kind": "detection", "at": 5}).encode() + b"\n")
             handle.write(json.dumps({"kind": "detection", "reasons": None}).encode() + b"\n")
             handle.write('{"kind": "detection", "path": "C:/งาน'.encode("utf-8")[:-2])   # torn mid-character
+        with open(store.path, "ab") as handle:
+            handle.write(b"\n" + json.dumps({"kind": "health", "reasons": [1]}).encode() + b"\n")
         events = store.read()
         self.assertEqual([e.path for e in events], ["C:/งาน/ไฟล์.exe"])
         self.assertEqual(len(store.read(kinds={"detection"})), 1)
@@ -182,12 +184,150 @@ class TestHistoryAndTheCacheSurviveDamage(TempCase):
         raw["entries"]["bad-list"] = [1, 2]
         raw["entries"]["bad-level"] = {"level": "nonsense", "at": 1.0, "reasons": []}
         raw["entries"]["bad-at"] = {"level": "clean", "at": None, "reasons": []}
+        # Round seven: what the replay reads, checked too.
+        raw["entries"]["bad-reasons"] = {"level": "malicious", "at": 1.0, "reasons": None}
+        raw["entries"]["reason-not-text"] = {"level": "malicious", "at": 1.0, "reasons": [1, None]}
+        raw["entries"]["findings-not-list"] = {"level": "clean", "at": 1.0, "reasons": [], "findings": "x"}
+        raw["entries"]["allowed-not-bool"] = {"level": "clean", "at": 1.0, "reasons": [], "allowed": "no"}
         path.write_text(json.dumps(raw), encoding="utf-8")
         again = self.scanner()
         again.rekey_cache()
         self.assertEqual(len(again.cache), 1)
         again.cache.save()                                        # prune() over every entry
         self.assertIs(again.scan(target).level, Level.CLEAN)
+
+    def test_a_scan_cache_with_a_byte_order_mark_or_a_bad_byte(self):
+        path = self.tmp / "cache.json"
+        scanner = self.scanner()
+        scanner.rekey_cache()
+        target = self.tmp / "a.txt"
+        target.write_text("hello", encoding="utf-8")
+        scanner.scan(target)
+        scanner.cache.save()
+        path.write_bytes(b"\xef\xbb\xbf" + path.read_bytes())
+        again = self.scanner()
+        again.rekey_cache()
+        self.assertEqual(len(again.cache), 1, "a BOM read as an empty cache")
+        path.write_bytes(b'{"schema": \xff}')
+        damaged = self.scanner()                                   # does not raise
+        damaged.rekey_cache()
+        self.assertEqual(len(damaged.cache), 0)
+
+    def test_a_path_that_cannot_be_written_as_utf8_is_still_recorded(self):
+        """Round seven: a path held with a lone surrogate raised out of
+        record(), out of the command line's quarantine loop, so the next
+        threat was never moved."""
+        from avguard.events import Event, EventStore
+        store = EventStore(self.tmp / "events.jsonl")
+        store.record(Event(kind="quarantined", path="/downloads/r\udcffsum\u00e9.exe", level="malicious"))
+        store.record(Event(kind="quarantined", path="/downloads/next.exe", level="malicious"))
+        self.assertEqual([e.path for e in store.read()][0], "/downloads/next.exe")
+        self.assertEqual(len(store.read()), 2)
+
+
+class TestRoundSevenArchives(TempCase):
+    """Round seven: what an archive inside an archive was found to be (a
+    lying header, a bomb, a traversal name) was computed and thrown away;
+    the crafted zips of row 94 with DEFLATED members were CLEAN, cached and
+    "Threats: 0" while unzip extracted the marker; a member declaring more
+    than 32 MB was skipped unread, CLEAN while unzip and jar extracted it;
+    and no test held any decompressor to its output ceiling."""
+
+    def wrap(self, inner: Path, name: str) -> Path:
+        outer = self.tmp / name
+        with zipfile.ZipFile(outer, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(inner.name, inner.read_bytes())
+        return outer
+
+    def crafted(self, how: str) -> Path:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("readme.txt", SELFTEST_MARKER + b" padding " * 20)
+            archive.writestr("other.txt", "nothing")
+        data = bytearray(buffer.getvalue())
+        self.assertNotIn(SELFTEST_MARKER, bytes(data), "deflated: the marker is not in the raw bytes")
+        second = data.find(b"PK\x01\x02", data.find(b"PK\x01\x02") + 4)
+        if how == "name":
+            data[second + 9] |= 0x08
+            data[second + 46:second + 46 + len("other.txt")] = b"\xff" * len("other.txt")
+        else:
+            data[second + 6] = 0xFF
+        path = self.tmp / f"{how}.zip"
+        path.write_bytes(bytes(data))
+        return path
+
+    def test_deflated_crafted_zips_are_read_from_their_local_headers(self):
+        for how in ("name", "version"):
+            with self.subTest(how=how):
+                target = self.crafted(how)
+                verdict = self.scanner().scan(target, use_cache=False)
+                self.assertIs(verdict.level, Level.MALICIOUS, verdict.reasons)
+                self.assertIn("refuses", verdict.reasons[0])
+                wrapped = self.scanner().scan(self.wrap(target, f"outer-{how}.zip"), use_cache=False)
+                self.assertIs(wrapped.level, Level.MALICIOUS, wrapped.reasons)
+
+    def test_what_one_archive_down_is_found_to_be_counts(self):
+        import bz2
+        import zlib as _zlib
+        stream = bz2.compress(b"x" * 300_000)
+        liar = TestArchiveInspection.forge(self.tmp / "liar.zip",
+                                           [("data.bin", 12, stream, 100, _zlib.crc32(b"x" * 100))])
+        traversal = self.tmp / "traversal.zip"
+        with zipfile.ZipFile(traversal, "w") as archive:
+            archive.writestr("../../escape.txt", "hi")
+        for inner in (liar, traversal):
+            with self.subTest(inner=inner.name):
+                top = self.scanner().scan(inner, use_cache=False)
+                wrapped = self.scanner().scan(self.wrap(inner, "wrapped-" + inner.name), use_cache=False)
+                self.assertIs(top.level, Level.SUSPICIOUS)
+                self.assertIs(wrapped.level, Level.SUSPICIOUS, "thrown away one zip deeper")
+                self.assertIn("inside wrapped-", wrapped.reasons[0])
+
+    def test_a_member_declaring_more_than_the_limit_is_read_not_skipped(self):
+        import zlib as _zlib
+        body = SELFTEST_MARKER
+        compressor = _zlib.compressobj(9, _zlib.DEFLATED, -15)
+        stream = compressor.compress(body) + compressor.flush()
+        claims = archives.MAX_MEMBER_BYTES + 1024 * 1024
+        target = TestArchiveInspection.forge(self.tmp / "claims-more.zip",
+                                             [("readme.txt", 8, stream, claims, _zlib.crc32(body))])
+        verdict = self.scanner().scan(target, use_cache=False)
+        self.assertIs(verdict.level, Level.MALICIOUS, verdict.reasons)
+        self.assertIn("smaller than its header claims", verdict.reasons[0])
+
+    def test_every_method_stops_at_its_output_ceiling(self):
+        import tracemalloc
+        plain = bytes(32 * 1024 * 1024)
+        for method in (zipfile.ZIP_DEFLATED, zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA):
+            with self.subTest(method=method):
+                path = self.tmp / f"m{method}.zip"
+                with zipfile.ZipFile(path, "w", method) as archive:
+                    archive.writestr("zeros.bin", plain)
+                with zipfile.ZipFile(path) as archive:
+                    info = archive.infolist()[0]
+                    info.file_size = 100                   # the header lies
+                    tracemalloc.start()
+                    try:
+                        data, disagree = archives._read_member(archive, info, 4096)
+                        peak = tracemalloc.get_traced_memory()[1]
+                    finally:
+                        tracemalloc.stop()
+                self.assertEqual(len(data), 4096)
+                self.assertEqual(disagree, "larger than its header claims")
+                # LZMA's decoder holds its 8 MiB dictionary through Python's
+                # allocator; past the ceiling would be 32 MiB more.
+                self.assertLess(peak, 16 * 1024 * 1024, "decompressed past the ceiling")
+
+    def test_the_budget_is_charged_with_what_was_produced(self):
+        import bz2
+        import zlib as _zlib
+        stream = bz2.compress(b"y" * 3000)
+        members = [(f"m{i}.bin", 12, stream, 100, _zlib.crc32(b"y" * 100)) for i in range(10)]
+        target = TestArchiveInspection.forge(self.tmp / "many-liars.zip", members)
+        with mock.patch.object(archives, "MAX_TOTAL_BYTES", 8000):
+            report = archives.inspect(target)
+        held = sum(len(m.data) for m in report.members if m.data is not None)
+        self.assertLessEqual(held, 8000, "charged by what the headers claimed")
 
 
 class TestVirusTotalIsPartOfWhatAVerdictMeans(TempCase):
@@ -204,9 +344,14 @@ class TestVirusTotalIsPartOfWhatAVerdictMeans(TempCase):
         cfg = config.Config(cloud_enabled=False)
         scanner = Scanner(cfg, SelfProtection([self.tmp / "nothing"]), rules_path=RULES,
                           cache=ScanCache(path=self.tmp / "cache.json"), cloud_lookup=lookup)
+        scanner.rekey_cache()            # a cache with a generation, so the CLEAN is really kept
         target = self.tmp / "invoice.exe"
         target.write_bytes(b"MZ an ordinary little program, nothing in it")
         self.assertIs(scanner.scan(target).level, Level.CLEAN)
+        scanner.cache.save()
+        self.assertEqual(len(ScanCache(path=self.tmp / "cache.json",
+                                       generation=scanner.detection_generation())), 1,
+                         "round seven: this test's CLEAN was never cached, so it could not fail")
         before = scanner.detection_generation()
         cfg.cloud_enabled = True
         self.assertNotEqual(scanner.detection_generation(), before)
@@ -214,8 +359,40 @@ class TestVirusTotalIsPartOfWhatAVerdictMeans(TempCase):
         verdict = scanner.scan(target)
         self.assertEqual(asked, ["invoice.exe"], "the cached CLEAN was replayed")
         self.assertIs(verdict.level, Level.MALICIOUS)
+        with_cloud = scanner.detection_generation()
         cfg.cloud_extensions = [*cfg.cloud_extensions, ".txt"]
-        self.assertNotEqual(scanner.detection_generation(), before)
+        self.assertNotEqual(scanner.detection_generation(), with_cloud, "the extensions are not in it")
+
+    def test_a_lookup_that_did_not_happen_is_not_remembered_as_clean(self):
+        """Round seven: a lookup asked for and not answered (the rate, the
+        day's budget, no key in this process, a network error) gave CLEAN,
+        cached for 30 days under the lookups-on generation, and the replay
+        never asked: a right-click scan without the key in Explorer's
+        environment cached every file CLEAN for the window that had it."""
+        from avguard.cloud import Unanswered
+        answers = [Unanswered(), ["VirusTotal: 41 of 72 engines flagged this file"]]
+        asked: list[str] = []
+
+        def lookup(sha256, path):
+            asked.append(path.name)
+            return answers.pop(0)
+        scanner = Scanner(config.Config(cloud_enabled=True), SelfProtection([self.tmp / "nothing"]),
+                          rules_path=RULES, cache=ScanCache(path=self.tmp / "cache.json"), cloud_lookup=lookup)
+        scanner.rekey_cache()
+        target = self.tmp / "invoice.exe"
+        target.write_bytes(b"MZ an ordinary little program, nothing in it")
+        self.assertIs(scanner.scan(target).level, Level.CLEAN)
+        self.assertIs(scanner.scan(target).level, Level.MALICIOUS, "the unanswered CLEAN was replayed")
+        self.assertEqual(asked, ["invoice.exe", "invoice.exe"])
+
+    def test_the_client_says_when_it_did_not_ask(self):
+        from avguard import cloud
+        client = cloud.VirusTotalClient(config.Config(cloud_enabled=True), cache_path=self.tmp / "vt.json")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("VT_API_KEY", None)
+            answer = client.reasons_for("ab" * 32, self.tmp / "x.exe")
+        self.assertEqual(answer, [])
+        self.assertTrue(getattr(answer, "unanswered", False), "no key: not asked, and not CLEAN")
 
 
 # ------------------------------------------------------------------ archives
@@ -246,12 +423,18 @@ class TestArchiveInspection(TempCase):
         self.scanner().scan(target, use_cache=False)
         self.assertEqual(set(self.tmp.rglob("*")) - before - {self.tmp / "cache.json"}, set())
 
-    def test_a_decompression_bomb_is_refused_not_decompressed(self):
+    def test_a_decompression_bomb_is_said_and_read_no_further_than_the_ceiling(self):
+        """It was refused unread, which protected memory before reads were
+        bounded by what they produce. Since round seven it is said and read
+        to the ceiling: refusing it let a header claiming a bomb's expansion
+        hide what was in the member (SUSPICIOUS, never MALICIOUS)."""
         target = self.zip_of({"bomb.bin": b"\x00" * (30 * 1024 * 1024)}, "bomb.zip")
-        report = archives.inspect(target)
+        with mock.patch.object(archives, "MAX_MEMBER_BYTES", 1024 * 1024):
+            report = archives.inspect(target)
         bomb = [m for m in report.members if m.name == "bomb.bin"][0]
-        self.assertIsNone(bomb.data, "the bomb must never be decompressed")
-        self.assertIn("bomb", bomb.skipped)
+        self.assertTrue(any("expands" in p and "bomb.bin" in p for p in report.problems), report.problems)
+        self.assertIsNotNone(bomb.data)
+        self.assertLessEqual(len(bomb.data), 1024 * 1024, "read past the ceiling")
 
     @staticmethod
     def forge(path: Path, members) -> Path:

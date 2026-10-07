@@ -38,13 +38,11 @@ from __future__ import annotations
 
 import io
 import logging
-import lzma
 import re
 import sqlite3
 import threading
 import time
 import zipfile
-import zlib
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -69,6 +67,10 @@ FEED_INTERVAL_SECONDS = 24 * 3600
 # contact has missed what was published in between, for good: the recent
 # export no longer carries it, and only the full export does.
 FEED_WINDOW_SECONDS = 48 * 3600
+# After a request that got no feed (a captive portal, an HTTP error, a 429),
+# the next waits this long: the window re-arms hourly, and every hour it
+# asked again while the README and the consent said once a day.
+FEED_RETRY_SECONDS = 4 * 3600
 FEED_MAX_BYTES = 256 * 1024 * 1024
 CONNECT_TIMEOUT = 5
 READ_TIMEOUT = 60
@@ -516,13 +518,15 @@ class IocStore:
             return {"checked_at": "", "updated_at": "", "etag": "", "url": "", "gap_since": ""}
 
     def feed_due(self, now: float | None = None) -> bool:
-        """At most once a day, whatever the caller's enthusiasm."""
+        """At most once a day, whatever the caller's enthusiasm; after a
+        failed request, again in FEED_RETRY_SECONDS, not at the next tick."""
         now = time.time() if now is None else now
         try:
             checked = float(self._get_meta("feed_checked_at", "0") or 0)
+            attempted = float(self._get_meta("feed_attempted_at", "0") or 0)
         except ValueError:
-            checked = 0.0
-        return now - checked >= FEED_INTERVAL_SECONDS
+            checked = attempted = 0.0
+        return now - checked >= FEED_INTERVAL_SECONDS and now - attempted >= FEED_RETRY_SECONDS
 
     def update_from_feed(self, session=None, full: bool = False,
                          url: str | None = None) -> FeedResult:
@@ -547,6 +551,10 @@ class IocStore:
         etag = self._get_meta("feed_etag")
         if etag and self._get_meta("feed_url") == url:
             headers["If-None-Match"] = etag
+        with self._write_lock:
+            conn = self._conn()
+            with conn:
+                self._set_meta(conn, "feed_attempted_at", str(time.time()))
         try:
             response = session.get(url, headers=headers,
                                    timeout=(CONNECT_TIMEOUT, READ_TIMEOUT), stream=True)
@@ -634,17 +642,18 @@ def _first_member(content: bytes) -> bytes:
                 raise FeedError("the zipped download expands past the size limit")
             # The scanner's bounded reader: the header's size is a claim, and
             # zipfile decompresses a bzip2 member whole whatever it says.
-            data, lied = archives._read_member(archive, member, FEED_MAX_BYTES)
-            if lied:
-                raise FeedError("the zipped download is larger than its header claims")
+            data, disagree = archives._read_member(archive, member, FEED_MAX_BYTES)
+            if disagree:
+                raise FeedError(f"the zipped download is {disagree}")
             return data
     except FeedError:
         raise
-    except (zipfile.BadZipFile, zlib.error, RuntimeError, NotImplementedError, EOFError,
-            ValueError, OSError, archives._MemberError, lzma.LZMAError) as exc:
-        # Corrupt deflate data, an encrypted member, an unknown method: each
-        # escaped as itself, past every `except IocError`, as a traceback.
-        raise FeedError(f"the zipped download cannot be read: {exc}") from exc
+    except Exception as exc:
+        # Corrupt deflate data, an encrypted member, an unknown method, a
+        # zip64 offset past 2**63 (OverflowError): each escaped as itself,
+        # past every `except IocError`, as a traceback. Whatever a download
+        # does to the unzip, it is a feed that could not be read.
+        raise FeedError(f"the zipped download cannot be read: {type(exc).__name__}: {exc}") from exc
 
 
 def scheduled_update(store: IocStore, enabled: bool, session=None,
