@@ -1455,6 +1455,106 @@ browser's or a wallet's copy reports on a desktop, the program behind a
 Windows clipboard-history paste, and the false-positive count over the
 owner's real copying. Tests 752 -> 762, both suites green.
 
+**The swap guard, second reading, 2026-10-07.** Three adversarial reviews
+of 0365a94 (the rule and its false positives, the reader and privacy, the
+tests against the claims) and a design note found that the first version
+kept less than it promised and trusted more than it said. This supersedes
+three sentences above: the lookalike label is gone, the forwarder list is
+no longer trusted by name alone, and "lives in memory for the window" is
+now true. What was found and changed:
+
+- The last address was held until the next text read, not for the window:
+  an hour of idle ticks still held it, and a private copy, an image or
+  over-long text between two addresses left the first one armed, so A,
+  then a password, then B warned. It now expires on every tick past the
+  window, on every change the guard does not read as text, and when the
+  guard is off. The window is measured from when the change was first
+  seen, not from the read that a busy clipboard delayed.
+- The writer was compared by image name, so a second process named
+  `electrum.exe` was "the same program". It is now the process id; a write
+  with no owner is never the same as anything.
+- The forwarder list trusted five AutoHotkey names, under which every
+  script runs, and trusted every name from any folder. AutoHotkey is gone
+  (a test pins that no script host is listed), and each remaining name is
+  trusted only from the Windows folder outside its user-writable corners
+  (the startup snapshot's list, copied and pinned equal by a test) or from
+  Program Files. A per-user install of a clipboard manager now warns.
+- After a swap, the replacement became the baseline, so the user re-copying
+  the original was reported as a second swap that named their own browser
+  as the replacer. The original coming back within the window is now not a
+  swap.
+- The lookalike label (two characters shared at each end) was silent for
+  the clippers the guard sees best, which match the first two characters
+  including the fixed prefix or only the last one, and its "once in eleven
+  million" was wrong for every alphabet (one in about 16,000 for bech32 v0,
+  the reviewer's Monte Carlo). It is gone; the banner instead tells the
+  user to compare every character. `Swap` no longer carries a SHA-256 of
+  the replacement, which the public ledger could reverse.
+- The banner sentence had a stray ",." in every plain swap and gave a
+  read-to-read time as time since the copy. It now leads with the writer
+  ("The clipboard names X as the writer of a different Bitcoin address,
+  0.5 s after AVGuard read the one you copied from Y"), so the 120-character
+  History cell shows the writer. The log line names only the coin, because
+  avguard.log outlives Clear history.
+- The history and cloud formats: a value other than 1 (Microsoft defines
+  only 0 and 1) is now private, not only 0.
+- `wallets.family` accepted a non-ASCII string: KELVIN SIGN (U+212A) is its
+  own upper case and lowers to "k", so an all-caps bech32 string with it
+  passed. Input is ASCII only. Addresses are compared by decoded payload
+  (version and hash, witness version and program, the twenty Ethereum
+  bytes), so all-caps bech32 and an EIP-55 address and its lowercase are
+  each one address, and a Base58 Litecoin address that begins "LTC" is no
+  longer compared without case.
+- The tests: the lookalike test skipped on every run (its search found a
+  pair at try 1,611,322 of 5000), so the invalid-near-copy path was never
+  exercised, and mutants that disabled it survived the suite. It is now a
+  fixed specification pair (BIP-173's `...v8f3t4` and `...v8f3t5`) and runs
+  everywhere. `tests/test_wallets.py` used the genesis-block address and a
+  vanity address; it now uses only the projects' own vectors (Bitcoin Core
+  and Litecoin Core `key_io_valid.json`, Dogecoin `base58_keys_valid.json`,
+  BIP-173 and BIP-350 valid and invalid lists, EIP-55, TronWeb's test
+  string), checks the Keccak permutation against `hashlib.sha3_256` at
+  seven sizes either side of the rate by switching the padding byte, and
+  rejects 20,000 random Base58 strings and every clipboard fixture. The
+  runner's swap test retries a busy read instead of passing on one; the
+  harness asserts only on trials with no busy read, at 1000 ms (two ticks)
+  instead of 600 ms. The off test gained a positive control; the window's
+  edge, the Health count, the tray text and every forwarder name in and
+  out of Program Files are tested.
+
+Measured: run against 0365a94, 22 of the 130 test methods in the two files
+fail. Six fail on an assertion (two history-format values read as public,
+KELVIN SIGN, a script host listed, Tron's payload key, the "LTC1" case
+fold); the rest error on the fake clipboard's new process-id and path
+arguments, so the behaviour was checked with probes written to 0365a94's
+own API: an hour of idle ticks still held the address; A, a private copy,
+then B warned; a second `electrum.exe` was trusted; `autohotkey64.exe` and
+`ditto.exe` from any folder were trusted; re-copying the original after a
+swap warned again and named the browser. All six probes give the right
+answer on this commit. `python3.13 -m unittest discover -s tests`: 762 ->
+786, both suites green.
+
+Corrections to the record above. `avguard/wallets.py` (9771c15) was
+written before the measurement and the check after it; the "+5 per write"
+was first printed by run #65, which then failed on its own harness. "A
+fifth to a half" is not a measurement: it is P/1000 for a clipper that
+polls every P ms under a uniform random phase, computed, not run. The
+runner's rows are counts, 4 of 6 at 200 and at 400 ms in run #67 and 2 of
+4 at 200 ms in run #69, not "two times in three". The plan's own rule
+made an only-slow-clippers answer a README sentence; the owner asked for
+the guard anyway, in this session ("do the clipboard-swap guard next"), so
+it is built and the README now states its misses: an address inside a
+sentence or a `bitcoin:` link, a lookup slower than 2.5 s, a clipper
+inside the browser (one process writes both), a private replacement, and
+Monero, Solana, XRP and Bitcoin Cash. Still not measured: a real
+clipper's timing, the owner a browser's or a wallet's copy reports on a
+desktop, the program behind a Win+V paste, how far one Office or browser
+copy moves the sequence number (only plain one- and three-format writes
+were), and false positives over the owner's ordinary copying. Not
+reproduced here and noted: a history format offered by delayed rendering
+makes the read wait on its owner's code, and the hung-owner check only
+catches an owner hung for 5 s or more.
+
 ## Deliberately not doing
 
 The paste guard (above) is the one input that is not a file; it watches a user-mode clipboard buffer through documented calls, with no driver, no hook and no process telemetry, so it does not reopen the first decision here. The EDR-shaped extensions of it are refused by name: no keyboard hook to see Win+R, no automation of the Run dialog, no watching what the user then runs.

@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 import queue
+import sys
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -449,12 +450,14 @@ class AVGuardApp(tb.Window):
         paste_var = tk.BooleanVar(value=True)
         tb.Checkbutton(
             body, variable=paste_var, bootstyle="round-toggle",
-            text="Also warn when the clipboard holds a paste-and-run command",
+            text="Also watch what you copy: paste-and-run commands and replaced crypto addresses",
         ).pack(anchor="w", pady=(0, 2))
         tb.Label(body, bootstyle="secondary", wraplength=520, justify="left",
                  text=("The fake-CAPTCHA scam copies a command and tells you to paste it into "
-                       "the Run box. AVGuard would look at text you copy, on this PC, for that "
-                       "shape; it keeps none of it and sends nothing.")).pack(anchor="w", pady=(0, 14))
+                       "the Run box; clipboard-hijacking malware swaps a crypto address you copied "
+                       "for its own. AVGuard would look at text you copy, on this PC, for both; it "
+                       "keeps none of it beyond a few seconds in memory and sends nothing."
+                       )).pack(anchor="w", pady=(0, 14))
 
         def finish(auto: bool, chosen: bool = True) -> None:
             window.grab_release()
@@ -518,8 +521,10 @@ class AVGuardApp(tb.Window):
         sentence = match.sentence(clip.owner)
         if isinstance(match, clipguard.Swap):
             # No "don't warn again": the text it would silence is the
-            # replacement, and nothing about it is worth trusting.
-            log.warning("PASTE GUARD: %s", sentence)
+            # replacement, and nothing about it is worth trusting. The log
+            # line names neither program: it outlives "Clear history".
+            log.warning("PASTE GUARD: a %s address on the clipboard was replaced; the account is in History",
+                        match.family)
             self._banner(sentence, "inverse-danger")
             if self.tray is not None:
                 try:
@@ -565,9 +570,10 @@ class AVGuardApp(tb.Window):
             self.cfg.save()
         except OSError as exc:
             log.warning("could not record the paste-guard offer: %s", exc)
-        self._banner("New: AVGuard can warn when the clipboard holds a paste-and-run command, "
-                     "the fake-CAPTCHA scam. It would look at text you copy, on this PC only, "
-                     "keep none of it and send nothing.", "inverse-secondary")
+        self._banner("New: AVGuard can warn when the clipboard holds a paste-and-run command "
+                     "(the fake-CAPTCHA scam) or when a crypto address you copied is replaced. It "
+                     "would look at text you copy, on this PC only, keep none of it beyond a few "
+                     "seconds in memory and send nothing.", "inverse-secondary")
         tb.Button(self.banner, text="Turn it on", bootstyle="light-outline",
                   command=self._enable_paste_guard).pack(side=RIGHT, padx=6)
 
@@ -586,7 +592,11 @@ class AVGuardApp(tb.Window):
         if not self.cfg.paste_guard_enabled:
             return True, "off - the clipboard is never opened"
         if not self.pasteguard.source.available:
-            return True, getattr(self.pasteguard.source, "unavailable_reason", "unavailable on this platform")
+            # Off Windows there is no clipboard to read, and that is fine; on
+            # Windows a reader that turned itself off (a privacy format it
+            # could not register) is a guard that is on and reads nothing.
+            reason = getattr(self.pasteguard.source, "unavailable_reason", "unavailable on this platform")
+            return sys.platform != "win32", reason
         return self.pasteguard.healthy, self.pasteguard.describe()
 
     # ---------------------------------------------------------- detections

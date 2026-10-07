@@ -217,12 +217,17 @@ after, the English twins unchanged.
 ## 6. Crypto clipboard-swap guard — DONE, reduced to what the tick can see
 
 Measured and built 2026-10-07; the record is in ROADMAP.md under "The swap
-guard". The answer to the question below is "slow ones, and only slow
-ones": the Windows runner read the original address before the swap every
-time at 600 ms, about two times in three at 200 to 400 ms and never at 0 to
-50 ms, and research found the event-driven clippers act within
-milliseconds. Built anyway, at the owner's request, with that limit stated
-where the user reads it. What was planned:
+guard" and "The swap guard, second reading". The answer to the question
+below is "slow ones, and only slow ones": the Windows runner read the
+original address before the swap in 10 of 10 trials at 600 ms, 6 of 10 at
+200 ms, 4 of 6 at 400 ms and 0 of 16 at 0 to 50 ms (runs #67 and #69), and
+vendor reports put the event-driven clippers within milliseconds. Built
+anyway, at the owner's request ("do the clipboard-swap guard next"), with
+that limit and the other misses stated where the user reads it. The second
+reading made the window real, compared writers by process, trusted the
+forwarders only from folders an ordinary user cannot write to, dropped
+AutoHotkey and the lookalike label, and replaced every real wallet in the
+tests with the projects' own vectors. What was planned:
 
 
 The two refutations that did run agree on the design flaw: the assessment

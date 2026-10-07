@@ -129,98 +129,243 @@ class GuardCase(unittest.TestCase):
 
 
 class TestTheSwapCheck(GuardCase):
-    """docs/next-6.md item 6: an address read at one tick and a different
+    """docs/next-6.md item 6: an address seen at one change and a different
     address of the same family at a later one, within SWAP_WINDOW seconds,
-    written by another program. The addresses are BIP-173 and EIP-55 test
-    vectors or built from a fixed payload; none is anyone's wallet."""
+    written by another process. The addresses are BIP-173 and EIP-55 test
+    vectors or Bitcoin Core's key_io vectors; none is anyone's wallet."""
 
     A = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
     B = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3"
+    LEGACY = "1FsSia9rv4NeEwvJ2GvXrX7LyxYspbN2mo"
     ETH = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"
+    LTC = "LT2KVaAy1ppRuxRgrS5RNU3vBsy7RibPeA"
+    SYSTEM = "C:\\Windows\\System32\\"
+    PROGRAMS = "C:\\Program Files\\"
 
     def setUp(self) -> None:
         super().setUp()
+        self._env = {k: _os.environ.get(k) for k in ("SystemRoot", "ProgramFiles")}
+        _os.environ["SystemRoot"], _os.environ["ProgramFiles"] = "C:\\Windows", "C:\\Program Files"
+        self.addCleanup(self._restore_env)
         self.now = 100.0
         self.guard.clock = lambda: self.now
         self.guard.tick()                                    # the first tick only records the number
 
-    def copy(self, text: str, owner: str | None, after: float = 0.5):
+    def _restore_env(self) -> None:
+        for key, value in self._env.items():
+            if value is None:
+                _os.environ.pop(key, None)
+            else:
+                _os.environ[key] = value
+
+    def copy(self, text: str, owner: str | None, pid: int = 0, path: str = "", after: float = 0.5):
         self.now += after
-        self.clip.put(text, owner=owner)
+        self.clip.put(text, owner=owner, pid=pid, path=path)
         return self.guard.tick()
 
-    def test_a_different_address_of_the_family_from_another_program_is_a_swap(self):
-        self.assertIsNone(self.copy(self.A, "electrum.exe"))
-        swap = self.copy(self.B, "svchost32.exe")
+    def idle(self, seconds: float) -> None:
+        for _ in range(int(seconds / 0.5)):
+            self.now += 0.5
+            self.guard.tick()
+
+    def test_a_different_address_of_the_family_from_another_process_is_a_swap(self):
+        self.assertIsNone(self.copy(self.A, "electrum.exe", pid=11))
+        swap = self.copy(self.B, "svchost32.exe", pid=22)
         self.assertIsInstance(swap, clipguard.Swap)
         self.assertEqual((swap.tier, swap.family, swap.signals), (WARNING, "Bitcoin", ("address replaced",)))
         self.assertAlmostEqual(swap.seconds, 0.5)
         self.assertEqual(swap.previous_owner, "electrum.exe")
         self.assertEqual(self.guard.counters.swaps, 1)
-        sentence = swap.sentence("svchost32.exe")
-        self.assertIn("Bitcoin address on the clipboard was replaced 0.5 s after", sentence)
-        self.assertIn("svchost32.exe", sentence)
+        self.assertIs(self.seen[-1][0], swap, "the window is told")
+
+    def test_the_sentence_leads_with_the_writer_and_reads_cleanly(self):
+        self.copy(self.A, "electrum.exe", pid=11)
+        sentence = self.copy(self.B, "svchost32.exe", pid=22).sentence("svchost32.exe")
+        self.assertTrue(sentence.startswith("The clipboard names svchost32.exe as the writer of a different "
+                                            "Bitcoin address, 0.5 s after AVGuard read the one you copied from "
+                                            "electrum.exe. This is what clipboard-hijacking malware does"), sentence)
+        self.assertNotIn(",.", sentence)
         self.assertNotIn(self.A, sentence)
         self.assertNotIn(self.B, sentence)
-        self.assertIs(self.seen[-1][0], swap, "the window is told")
+        nobody = clipguard.Swap(family="Bitcoin", seconds=1.0, previous_owner=None, invalid=True).sentence(None)
+        self.assertIn("names no program as the writer", nobody)
+        self.assertIn("not even a valid address", nobody)
+        self.assertNotIn(",.", nobody)
 
     def test_the_event_names_the_family_and_the_programs_never_an_address(self):
         import json
         forwarded = []
         self.events.forwarder = type("F", (), {"submit": lambda _s, e: forwarded.append(e)})()
-        self.copy(self.A, "electrum.exe")
-        self.copy(self.B, None)
+        self.copy(self.A, "electrum.exe", pid=11)
+        swap = self.copy(self.B, None)
         raw = (self.tmp / "events.jsonl").read_text(encoding="utf-8")
-        self.assertNotIn(self.A, raw)
-        self.assertNotIn(self.B, raw)
+        for text in (self.A, self.B, __import__("hashlib").sha256(self.B.encode()).hexdigest()):
+            self.assertNotIn(text, raw)
+            self.assertNotIn(text, repr(swap))
         event = json.loads(raw.splitlines()[-1])
         self.assertEqual((event["kind"], event["level"]), ("clipboard", WARNING))
         self.assertEqual(event["detail"], {"signals": ["address replaced"], "family": "Bitcoin", "seconds": 0.5,
                                            "owner": "", "previous_owner": "electrum.exe"})
         self.assertEqual(forwarded, [], "kept on this machine like the rest of the guard's events")
 
-    def test_a_lookalike_and_an_invalid_lookalike_are_named(self):
-        from avguard import wallets
-        import hashlib
-        legit = wallets.b58check_encode(0x00, hashlib.sha256(b"payee").digest()[:20])
-        for attempt in range(5000):                          # a valid address sharing two characters at each end
-            fake = wallets.b58check_encode(0x00, hashlib.sha256(b"x%d" % attempt).digest()[:20])
-            if wallets.lookalike(legit, fake, "Bitcoin"):
-                break
-        else:
-            self.skipTest("no lookalike found in 5000 tries")
-        self.copy(legit, "exodus.exe")
-        self.assertEqual(self.copy(fake, None).signals, ("address replaced by a lookalike",))
-        self.copy(self.A, "exodus.exe")
-        broken = self.A[:-1] + ("5" if self.A[-1] != "5" else "6")
-        swap = self.copy(broken, None)
-        self.assertEqual(swap.signals, ("address replaced by an invalid lookalike",),
-                         "a clipper that changes only the last character leaves a string that fails its checksum")
-        self.assertIn("not even a valid address", swap.sentence(None))
+    def test_an_invalid_near_copy_is_named(self):
+        """Microsoft's 2026 table says one stealer changes only the last
+        character of a bech32 address, which leaves a string failing its
+        checksum. BIP-173's own invalid vector is that string."""
+        self.copy(self.A, "exodus.exe", pid=11)
+        swap = self.copy("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t5", None)
+        self.assertEqual(swap.signals, ("address replaced by an invalid near copy",))
 
-    def test_what_is_not_a_swap(self):
+    def test_what_warns(self):
         cases = {
-            "too late": [(self.A, "a.exe", 0.5), (self.B, "b.exe", clipguard.SWAP_WINDOW + 0.5)],
-            "one program wrote both": [(self.A, "electrum.exe", 0.5), (self.B, "electrum.exe", 0.5)],
-            "a remote-desktop forwarder": [(self.A, "electrum.exe", 0.5), (self.B, "rdpclip.exe", 0.5)],
-            "a clipboard manager pasting from its history": [(self.A, "a.exe", 0.5), (self.B, "Ditto.exe", 0.5)],
-            "another family": [(self.A, "a.exe", 0.5), (self.ETH, "b.exe", 0.5)],
-            "the same address in capitals": [(self.A, "a.exe", 0.5), (self.A.upper(), "b.exe", 0.5)],
-            "something else copied in between": [(self.A, "a.exe", 0.5), ("hello", "b.exe", 0.5), (self.B, "c.exe", 0.5)],
-            "an ordinary word after an address": [(self.A, "a.exe", 0.5), ("bc1 is a prefix", "b.exe", 0.5)],
+            "B 2.0 s after A": [(self.A, "a.exe", 11, "", 0.5), (self.B, "b.exe", 22, "", 2.0)],
+            "B with no owner": [(self.A, "a.exe", 11, "", 0.5), (self.B, None, 0, "", 0.5)],
+            "another process with the wallet's name": [(self.A, "electrum.exe", 11, "", 0.5),
+                                                       (self.B, "electrum.exe", 22, "", 0.5)],
+            "a forwarder's name from the profile folder": [
+                (self.A, "a.exe", 11, "", 0.5), (self.B, "ditto.exe", 22, "C:\\Users\\me\\AppData\\Roaming\\ditto.exe", 0.5)],
+            "a forwarder's name from Temp under the Windows folder": [
+                (self.A, "a.exe", 11, "", 0.5), (self.B, "rdpclip.exe", 22, "C:\\Windows\\Temp\\rdpclip.exe", 0.5)],
+            "AutoHotkey, a script host": [(self.A, "a.exe", 11, "", 0.5),
+                                          (self.B, "autohotkey64.exe", 22, self.PROGRAMS + "AutoHotkey\\AutoHotkey64.exe", 0.5)],
+            "legacy replaced by segwit, one coin": [(self.LEGACY, "a.exe", 11, "", 0.5), (self.A, "b.exe", 22, "", 0.5)],
         }
         for name, steps in cases.items():
             with self.subTest(case=name):
                 self.guard.disarm()
                 self.guard.tick()
-                results = [self.copy(text, owner, after) for text, owner, after in steps]
+                results = [self.copy(text, owner, pid, path, after) for text, owner, pid, path, after in steps]
+                self.assertIsInstance(results[-1], clipguard.Swap, results)
+
+    def test_what_is_not_a_swap(self):
+        cases = {
+            "too late": [(self.A, "a.exe", 11, "", 0.5), (self.B, "b.exe", 22, "", clipguard.SWAP_WINDOW + 0.5)],
+            "one process wrote both": [(self.A, "electrum.exe", 11, "", 0.5), (self.B, "electrum.exe", 11, "", 0.5)],
+            "a remote-desktop forwarder in System32": [(self.A, "a.exe", 11, "", 0.5),
+                                                      (self.B, "rdpclip.exe", 22, self.SYSTEM + "rdpclip.exe", 0.5)],
+            "a clipboard manager in Program Files": [(self.A, "a.exe", 11, "", 0.5),
+                                                     (self.B, "ditto.exe", 22, self.PROGRAMS + "Ditto\\Ditto.exe", 0.5)],
+            "another family": [(self.A, "a.exe", 11, "", 0.5), (self.ETH, "b.exe", 22, "", 0.5)],
+            "Bitcoin then a Litecoin L address": [(self.A, "a.exe", 11, "", 0.5), (self.LTC, "b.exe", 22, "", 0.5)],
+            "the same address in capitals": [(self.A, "a.exe", 11, "", 0.5), (self.A.upper(), "b.exe", 22, "", 0.5)],
+            "an EIP-55 address and its lowercase form": [(self.ETH, "a.exe", 11, "", 0.5),
+                                                         (self.ETH.lower(), "b.exe", 22, "", 0.5)],
+            "set then flush: the same text, then no owner": [(self.A, "powershell.exe", 11, "", 0.5),
+                                                             (self.A, None, 0, "", 0.5)],
+            "something else copied in between": [(self.A, "a.exe", 11, "", 0.5), ("hello", "b.exe", 22, "", 0.5),
+                                                 (self.B, "c.exe", 33, "", 0.5)],
+            "an ordinary word after an address": [(self.A, "a.exe", 11, "", 0.5), ("bc1 is a prefix", "b.exe", 22, "", 0.5)],
+            "an address inside a sentence (a documented miss)": [(self.A, "a.exe", 11, "", 0.5),
+                                                                 ("send to " + self.B, "b.exe", 22, "", 0.5)],
+            "a bitcoin: URI (a documented miss)": [(self.A, "a.exe", 11, "", 0.5), ("bitcoin:" + self.B, "b.exe", 22, "", 0.5)],
+            "XRP, which v1 does not cover": [("rDTXLQ7ZKZVKz33zJbHjgVShjsBnqMBhmN", "a.exe", 11, "", 0.5),
+                                            ("rPEPPER7kfTD9w2To4CQk6UCfuHM9c6GDY", "b.exe", 22, "", 0.5)],
+        }
+        for name, steps in cases.items():
+            with self.subTest(case=name):
+                self.guard.disarm()
+                self.guard.tick()
+                results = [self.copy(text, owner, pid, path, after) for text, owner, pid, path, after in steps]
                 self.assertFalse(any(isinstance(r, clipguard.Swap) for r in results), results)
 
+    def test_a_copy_the_guard_does_not_read_forgets_the_address(self):
+        for name, setup in (("private", lambda: setattr(self.clip, "excluded", True)),
+                            ("not text", lambda: setattr(self.clip, "is_text", False)),
+                            ("too long", lambda: setattr(self.clip, "text", "x" * (clipguard.MAX_TEXT_CHARS + 1)))):
+            with self.subTest(between=name):
+                self.guard.disarm()
+                self.guard.tick()
+                self.copy(self.A, "a.exe", pid=11)
+                self.now += 0.5
+                self.clip.put("x", owner="b.exe", pid=22)
+                setup()
+                self.guard.tick()
+                self.assertIsNone(self.guard._last_address, "forgotten when the unread copy is seen")
+                self.clip.excluded, self.clip.is_text = False, True
+                self.assertIsNone(self.copy(self.B, "c.exe", pid=33), "the address before it is gone")
+
+    def test_the_writable_folders_are_the_startup_snapshots_list(self):
+        # Copied, not imported, so clipguard reaches nothing; kept equal here.
+        from avguard import autoruns
+        self.assertEqual(clipguard._WRITABLE_UNDER_ROOT, autoruns.WRITABLE_UNDER_ROOT)
+        for path, installed in (("C:\\Windows\\System32\\rdpclip.exe", True),
+                                ("c:\\windows\\system32\\RDPCLIP.EXE", True),
+                                ("C:\\Windows\\Temp\\rdpclip.exe", False),
+                                ("C:\\Windows\\System32\\Tasks\\rdpclip.exe", False),
+                                ("C:\\Windows\\System32\\..\\Temp\\rdpclip.exe", False),
+                                ("C:\\WindowsApps\\rdpclip.exe", False),
+                                ("C:\\Program Files\\Ditto\\ditto.exe", True),
+                                ("C:\\Program Files Evil\\ditto.exe", False),
+                                ("C:\\Users\\u\\AppData\\Roaming\\ditto.exe", False),
+                                ("", False)):
+            with self.subTest(path=path):
+                self.assertEqual(clipguard._installed(path), installed)
+
+    def test_nothing_is_held_past_the_window(self):
+        self.copy(self.A, "a.exe", pid=11)
+        self.assertIsNotNone(self.guard._last_address)
+        self.idle(clipguard.SWAP_WINDOW + 1.0)
+        self.assertIsNone(self.guard._last_address, "an hour of idle ticks used to keep it")
+
+    def test_the_window_runs_from_when_the_change_was_seen_not_when_it_was_read(self):
+        self.copy(self.A, "a.exe", pid=11)
+        self.now += 0.5
+        self.clip.put(self.B, owner="b.exe", pid=22)
+        self.clip.busy = True
+        for _ in range(5):                                   # 2.5 s of a held clipboard
+            self.guard.tick()
+            self.now += 0.5
+        self.clip.busy = False
+        swap = self.guard.tick()
+        self.assertIsInstance(swap, clipguard.Swap, "the replacement was there 0.5 s after the first address")
+        self.assertAlmostEqual(swap.seconds, 0.5)
+
+    def test_the_original_coming_back_after_a_swap_is_not_a_second_swap(self):
+        self.copy(self.A, "chrome.exe", pid=11)
+        self.assertIsInstance(self.copy(self.B, "x.exe", pid=22), clipguard.Swap)
+        self.assertIsNone(self.copy(self.A, "chrome.exe", pid=11, after=1.0), "the user restoring it")
+        self.assertEqual(self.guard.counters.swaps, 1)
+
     def test_off_forgets_the_address(self):
-        self.copy(self.A, "a.exe")
+        self.copy(self.A, "a.exe", pid=11)
+        self.assertIsInstance(self.copy(self.B, "b.exe", pid=22), clipguard.Swap, "the control: left on, a swap")
+        self.copy(self.LEGACY, "a.exe", pid=11, after=clipguard.SWAP_WINDOW + 1.0)
         self.guard.disarm()
         self.guard.tick()
-        self.assertIsNone(self.copy(self.B, "b.exe"), "what was read before the guard went off is gone")
+        self.assertIsNone(self.copy(self.B, "b.exe", pid=22), "what was read before the guard went off is gone")
+
+    def test_the_window_is_inclusive_to_the_edge(self):
+        for after, expected in ((clipguard.SWAP_WINDOW, True), (clipguard.SWAP_WINDOW + 0.01, False)):
+            with self.subTest(after=after):
+                self.guard.disarm()
+                self.guard.tick()
+                self.copy(self.A, "a.exe", pid=11)
+                swap = self.copy(self.B, "b.exe", pid=22, after=after)
+                self.assertEqual(isinstance(swap, clipguard.Swap), expected)
+
+    def test_health_counts_the_swaps(self):
+        self.copy(self.A, "a.exe", pid=11)
+        self.copy(self.B, "b.exe", pid=22)
+        self.assertIn("1 address swap(s)", self.guard.describe())
+
+    def test_every_forwarder_is_trusted_from_program_files_and_none_from_the_profile(self):
+        for name in sorted(clipguard.SWAP_FORWARDERS):
+            for folder, expected in ((self.PROGRAMS + "Vendor\\", None), (self.SYSTEM, None),
+                                     ("C:\\Users\\u\\AppData\\Local\\Vendor\\", clipguard.Swap)):
+                with self.subTest(writer=name, folder=folder):
+                    self.guard.disarm()
+                    self.guard.tick()
+                    self.copy(self.A, "chrome.exe", pid=11, path=self.PROGRAMS + "Google\\chrome.exe")
+                    swap = self.copy(self.B, name, pid=22, path=folder + name)
+                    self.assertEqual(type(swap) if swap else None, expected)
+
+    def test_no_script_host_is_a_forwarder(self):
+        # A host runs any script under its own signed name, so trusting one
+        # trusts every script it runs, a clipper's included.
+        hosts = ("autohotkey", "python", "pythonw", "powershell", "pwsh", "wscript", "cscript", "cmd",
+                 "mshta", "node", "java", "javaw", "rundll32", "autoit3")
+        for name in clipguard.SWAP_FORWARDERS:
+            self.assertFalse(name.removesuffix(".exe").startswith(hosts), name)
 
     def test_two_writes_without_an_owner_are_a_swap(self):
         """A clipper may write with no window, as the test does on the
@@ -750,7 +895,8 @@ class TestTheReaderThroughAFakeUser32(unittest.TestCase):
         """Chromium's password manager and Bitwarden mark a copied password
         with these two DWORD formats and not with the two monitor formats."""
         zero, one = (0).to_bytes(4, "little"), (1).to_bytes(4, "little")
-        for history in ({49003: zero}, {49004: zero}, {49003: one, 49004: zero}, {49003: b"\0"}):
+        for history in ({49003: zero}, {49004: zero}, {49003: one, 49004: zero}, {49003: b"\0"},
+                        {49003: (2).to_bytes(4, "little")}, {49004: (0xFFFFFFFF).to_bytes(4, "little")}):
             with self.subTest(history=history):
                 clip, calls = self.make(history=history)
                 self.assertTrue(clip.read().excluded)
@@ -994,7 +1140,8 @@ class TestTheRealClipboard(unittest.TestCase):
             pointer = kernel32.GlobalLock(handle)
             ctypes.memmove(pointer, data, len(data))
             kernel32.GlobalUnlock(handle)
-            user32.SetClipboardData(fmt, handle)
+            if not user32.SetClipboardData(fmt, handle):
+                self.skipTest(f"SetClipboardData failed (error {ctypes.get_last_error()})")
         import time
         for _ in range(50):
             if user32.OpenClipboard(None):
@@ -1011,21 +1158,44 @@ class TestTheRealClipboard(unittest.TestCase):
         finally:
             user32.CloseClipboard()
 
+    def _read(self, source):
+        """One read, retried while another program holds the clipboard."""
+        import time
+        for _ in range(50):
+            try:
+                return source.read()
+            except clipguard.ClipboardBusy:
+                time.sleep(0.02)
+        self.skipTest("the clipboard stayed held by another program")
+
+    def _tick_until_read(self, guard):
+        """Tick until the guard has read the change, retrying a busy read the
+        way the next tick would, so one busy read cannot pass as "no swap"."""
+        import time
+        before = guard.counters.changes_seen
+        for _ in range(50):
+            result = guard.tick()
+            if guard.counters.changes_seen > before:
+                return result
+            time.sleep(0.02)
+        self.skipTest("the clipboard stayed held by another program")
+
     def test_a_password_marked_for_history_and_cloud_is_not_read(self):
         source = clipguard.WindowsClipboard()
         self._write("not a real password", history=0)
-        self.assertTrue(source.read().excluded, "CanIncludeInClipboardHistory = 0, as Chromium writes it")
+        self.assertTrue(self._read(source).excluded, "CanIncludeInClipboardHistory = 0, as Chromium writes it")
         self._write("ordinary text", history=1)
-        self.assertEqual(source.read().text, "ordinary text")
+        self.assertEqual(self._read(source).text, "ordinary text")
 
     def test_a_swap_on_the_real_clipboard(self):
         source = clipguard.WindowsClipboard()
         guard = PasteGuard(source, None)
         guard.tick()
         self._write(TestTheSwapCheck.A)
-        self.assertIsNone(guard.tick())
+        self.assertIsNone(self._tick_until_read(guard))
+        self.assertEqual(guard.counters.texts_read, 1, "the first address was read")
         self._write(TestTheSwapCheck.B)
-        swap = guard.tick()
+        swap = self._tick_until_read(guard)
         self.assertIsInstance(swap, clipguard.Swap, "a second address 0 s later, written with no owner")
         self.assertEqual(swap.family, "Bitcoin")
 
@@ -1044,8 +1214,9 @@ class TestWhatASwapLooksLikeToTheTick(unittest.TestCase):
     built: what a 500 ms poll sees when one write replaces another D ms
     later. The test writes the clipboard (the module never does); the two
     texts are BIP-173 test vectors, two valid segwit addresses of one family.
-    Nothing here is asserted beyond the harness working: the numbers are the
-    result, printed for the ROADMAP."""
+    The numbers are the result, printed for the ROADMAP. One premise is
+    asserted: a swap two ticks after the copy is always seen, in every trial
+    with no busy read (a busy read delays the tick, and is counted instead)."""
 
     FIRST = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
     SECOND = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3"
@@ -1127,10 +1298,12 @@ class TestWhatASwapLooksLikeToTheTick(unittest.TestCase):
         # 2. A swap D ms after the copy, under a poll every 500 ms at a random phase.
         rng = random.Random(20261007)
         rows = []
-        for delay_ms in (0, 200, 600):
+        for delay_ms in (0, 200, 600, 1000):
             seen_first = between = neither = busy = 0
+            calm = calm_seen = 0                      # trials with no busy read, and of those the seen
             trials = 4
             for _ in range(trials):
+                busy_before = busy
                 observed: list[tuple[int, str | None]] = []
                 stop = threading.Event()
 
@@ -1164,6 +1337,9 @@ class TestWhatASwapLooksLikeToTheTick(unittest.TestCase):
                 texts = [text for _, text in observed if text]
                 self.assertEqual(texts[-1] if texts else None, self.SECOND, "the harness: the last read is the second write")
                 numbers = [number for number, _ in observed]
+                if busy == busy_before:
+                    calm += 1
+                    calm_seen += self.FIRST in texts
                 if self.FIRST in texts:
                     seen_first += 1
                 elif any(a <= start and b >= after_second for a, b in zip(numbers, numbers[1:])) and \
@@ -1171,13 +1347,13 @@ class TestWhatASwapLooksLikeToTheTick(unittest.TestCase):
                     between += 1
                 else:
                     neither += 1
-            rows.append((delay_ms, trials, seen_first, between, neither, busy))
-        for delay_ms, trials, seen_first, between, neither, busy in rows:
+            rows.append((delay_ms, trials, seen_first, between, neither, busy, calm, calm_seen))
+        for delay_ms, trials, seen_first, between, neither, busy, _calm, _calm_seen in rows:
             print(f"  swap {delay_ms:>3} ms after the copy, 500 ms poll: original read {seen_first}/{trials}, "
                   f"both writes between two ticks {between}/{trials}, neither {neither}/{trials}"
                   f"{f', {busy} busy read(s)' if busy else ''}")
-        by_delay = {row[0]: row for row in rows}
-        self.assertEqual(by_delay[600][2], by_delay[600][1], "a swap a tick and more after the copy is always seen")
+        calm, calm_seen = {row[0]: row for row in rows}[1000][6:]
+        self.assertEqual(calm_seen, calm, "a swap two ticks after the copy is always seen, busy reads aside")
 
 
 class TestTheWindowIntegration(unittest.TestCase):
@@ -1299,7 +1475,8 @@ class TestTheWindowIntegration(unittest.TestCase):
         panes.pack()
         var = tk.StringVar(value="")
         banner = tb.Label(holder, textvariable=var)
-        fake = SimpleNamespace(banner=banner, banner_var=var, _panes=panes, tray=None,
+        tray = mock.Mock()
+        fake = SimpleNamespace(banner=banner, banner_var=var, _panes=panes, tray=tray,
                                cfg=self.fake_cfg(), _ignore_paste_text=lambda m: None,
                                _enable_paste_guard=lambda: None)
         fake._banner = self.gui.AVGuardApp._banner.__get__(fake)
@@ -1312,12 +1489,17 @@ class TestTheWindowIntegration(unittest.TestCase):
         self.assertEqual(len(banner.winfo_children()), 1, "a notice can be silenced too")
         fake._banner("Scan complete")
         self.assertEqual(banner.winfo_children(), [], "the button does not outlive its message")
-        swap = clipguard.Swap(family="Bitcoin", seconds=0.5, previous_owner="electrum.exe", lookalike=True,
-                              invalid=False, sha256="0" * 64, chars=42)
-        self.gui.AVGuardApp._paste_warning(fake, swap, clipguard.ClipText("x", None))
+        swap = clipguard.Swap(family="Bitcoin", seconds=0.5, previous_owner="electrum.exe", invalid=False)
+        with self.assertLogs("avguard.gui", level="WARNING") as logged:
+            self.gui.AVGuardApp._paste_warning(fake, swap, clipguard.ClipText("x", "svchost32.exe"))
         self.assertEqual(banner.winfo_children(), [], "no 'don't warn again' for a replaced address")
-        self.assertIn("Bitcoin address on the clipboard was replaced", var.get())
+        self.assertIn("names svchost32.exe as the writer of a different Bitcoin address", var.get())
+        self.assertNotIn("svchost32.exe", " ".join(logged.output), "the log outlives Clear history")
+        self.assertNotIn("electrum.exe", " ".join(logged.output))
         self.assertEqual(fake._banner_style, "inverse-danger")
+        said = tray.notify.call_args.args[0]
+        self.assertEqual(said, "The crypto address on your clipboard was replaced")
+        self.assertNotIn("svchost32.exe", said, "a tray toast is the most visible place a name could leak")
         var.set("")
         self.gui.AVGuardApp._offer_paste_guard(fake)
         self.assertTrue(fake.cfg.paste_guard_offered)

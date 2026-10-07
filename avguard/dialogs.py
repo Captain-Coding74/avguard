@@ -82,13 +82,14 @@ class SettingsDialog(tb.Toplevel):
                        variable=self.pe_var, bootstyle="round-toggle").pack(anchor="w", pady=2)
 
         self.paste_var = tk.BooleanVar(value=cfg.paste_guard_enabled)
-        tb.Checkbutton(block, text="Warn when the clipboard holds a paste-and-run command",
+        tb.Checkbutton(block, text="Warn about paste-and-run commands and replaced crypto addresses",
                        variable=self.paste_var, bootstyle="round-toggle").pack(anchor="w", pady=2)
         tb.Label(block, bootstyle="secondary", wraplength=520, justify="left",
                  text=("The fake-CAPTCHA scam: a page copies a command and tells you to paste "
-                       "it into the Run box. On: AVGuard looks at text you copy, on this PC, "
-                       "for that shape, keeps none of it and sends nothing. Off: the clipboard "
-                       "is never opened.")).pack(anchor="w", pady=(0, 8))
+                       "it into the Run box. Clipboard-hijacking malware: a crypto address you "
+                       "copied is swapped for the attacker's. On: AVGuard looks at text you copy, "
+                       "on this PC, for both, keeps none of it beyond a few seconds in memory and "
+                       "sends nothing. Off: the clipboard is never opened.")).pack(anchor="w", pady=(0, 8))
 
         # Consent lives here, next to the switch, in the VirusTotal pattern:
         # say exactly what leaves the machine before anything does.

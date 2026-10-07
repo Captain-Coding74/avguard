@@ -52,14 +52,24 @@ class Address:
 def family(text: str) -> Address | None:
     """The address `text` is, if it is exactly one (surrounding whitespace
     ignored), else None."""
+    decoded = _decode(text)
+    return decoded[0] if decoded else None
+
+
+def _decode(text: str) -> tuple[Address, str] | None:
+    """The address and its payload key (what two spellings of one address
+    share), or None."""
     candidate = (text or "").strip()
-    if not candidate or len(candidate) > 100 or any(c.isspace() for c in candidate):
+    # ASCII only: KELVIN SIGN (U+212A) is its own upper case and lowers to
+    # "k", so a non-ASCII string could pass as all-caps bech32.
+    if not candidate or len(candidate) > 100 or not candidate.isascii() or any(c.isspace() for c in candidate):
         return None
     if _ETH_SHAPE.match(candidate):
-        return _ethereum(candidate)
-    found = _segwit(candidate)
-    if found is not None:
-        return found
+        found = _ethereum(candidate)
+        return (found, "eth:" + candidate[2:].lower()) if found else None
+    segwit = _segwit(candidate)
+    if segwit is not None:
+        return segwit
     if _BASE58_SHAPE.match(candidate):
         return _base58check(candidate)
     return None
@@ -91,7 +101,7 @@ def b58check_encode(version: int, payload: bytes) -> str:
     return "1" * (len(raw) - len(raw.lstrip(b"\0"))) + out
 
 
-def _base58check(text: str) -> Address | None:
+def _base58check(text: str) -> tuple[Address, str] | None:
     raw = _b58decode(text)
     if raw is None or len(raw) != 25:
         return None
@@ -101,7 +111,7 @@ def _base58check(text: str) -> Address | None:
     known = _VERSIONS.get(body[0])
     if known is None:
         return None
-    return Address(known[0], known[1], True)
+    return Address(known[0], known[1], True), "b58:" + body.hex()
 
 
 # ------------------------------------------------------------ bech32, bech32m
@@ -136,7 +146,7 @@ def _convertbits(data: list[int], frombits: int, tobits: int) -> list[int] | Non
     return out
 
 
-def _segwit(text: str) -> Address | None:
+def _segwit(text: str) -> tuple[Address, str] | None:
     if text.lower() != text and text.upper() != text:
         return None                                   # mixed case is invalid bech32
     lowered = text.lower()
@@ -158,7 +168,7 @@ def _segwit(text: str) -> Address | None:
         return None
     if version != 0 and const != _BECH32M_CONST:
         return None
-    return Address(_SEGWIT_HRP[hrp], "segwit", True)
+    return Address(_SEGWIT_HRP[hrp], "segwit", True), f"seg:{hrp}:{version}:{bytes(program).hex()}"
 
 
 # ----------------------------------------------------------- Ethereum, EIP-55
@@ -198,10 +208,12 @@ def _keccak_f(state: list[list[int]]) -> None:
         state[0][0] ^= round_constant
 
 
-def keccak256(data: bytes) -> bytes:
-    """Keccak-256 as Ethereum uses it (padding 0x01, not SHA-3's 0x06)."""
+def keccak256(data: bytes, pad: int = 0x01) -> bytes:
+    """Keccak-256 as Ethereum uses it (padding 0x01). With pad=0x06 it is
+    NIST SHA3-256, which is how the tests check the permutation and the
+    multi-block absorption against hashlib."""
     rate = 136
-    padded = bytearray(data) + b"\x01" + b"\0" * ((-len(data) - 1) % rate)
+    padded = bytearray(data) + bytes([pad]) + b"\0" * ((-len(data) - 1) % rate)
     padded[-1] |= 0x80
     state = [[0] * 5 for _ in range(5)]
     for offset in range(0, len(padded), rate):
@@ -232,8 +244,6 @@ def _ethereum(text: str) -> Address | None:
 
 # ------------------------------------------------- comparing two addresses
 
-_PREFIX = {"Bitcoin": ("bc1", "1", "3"), "Litecoin": ("ltc1", "L", "M", "3"), "Dogecoin": ("D", "9", "A"),
-           "Tron": ("T",), "Ethereum": ("0x",)}
 _SHAPES = (
     ("Ethereum", re.compile(r"^0x[0-9a-fA-F]{40}$")),
     ("Bitcoin", re.compile(r"^(?:bc1[02-9ac-hj-np-z]{8,87}|BC1[02-9AC-HJ-NP-Z]{8,87}|[13][1-9A-HJ-NP-Za-km-z]{24,34})$")),
@@ -244,13 +254,23 @@ _SHAPES = (
 
 
 def canonical(text: str) -> str:
-    """The form two copies of one address share: bech32 and Ethereum compare
-    without case (an all-caps bech32 address is the same address; EIP-55 case
-    is a checksum, not a different account), Base58 exactly."""
+    """What two spellings of one address share: its decoded payload (version
+    and hash, witness program, or the twenty Ethereum bytes), so all-caps
+    bech32 and an EIP-55 address and its lowercase form are each one
+    address. Text that is not an address is folded as `_fold` does."""
+    decoded = _decode(text)
+    return decoded[1] if decoded else _fold(text)
+
+
+_CASELESS = re.compile(r"^(?:(?:bc|ltc)1[02-9ac-hj-np-z]+|0x[0-9a-f]{40})$")
+
+
+def _fold(text: str) -> str:
+    """Case is meaningless in bech32 and in Ethereum hex, and meaningful in
+    Base58: fold only a string that is entirely one of the first two once
+    lowered (a Base58 Litecoin address may itself begin "LTC1")."""
     candidate = (text or "").strip()
-    if candidate[:3].lower() in ("bc1", "ltc", "0x0") or candidate[:2].lower() == "0x":
-        return candidate.lower()
-    return candidate
+    return candidate.lower() if _CASELESS.match(candidate.lower()) else candidate
 
 
 def shaped_like(text: str) -> str | None:
@@ -258,40 +278,18 @@ def shaped_like(text: str) -> str | None:
     verified: for telling that a string which fails its checksum was made to
     look like an address of a family."""
     candidate = (text or "").strip()
+    if not candidate.isascii():
+        return None
     for name, shape in _SHAPES:
         if shape.match(candidate):
             return name
     return None
 
 
-def lookalike(first: str, second: str, family_name: str) -> bool:
-    """Whether `second` was made to look like `first`: the same leading and
-    trailing characters after the family's fixed prefix, which is how the
-    lookalike clippers reported so far choose their replacement. Two random
-    addresses share two characters at both ends about once in eleven million."""
-    a, b = canonical(first), canonical(second)
-    for prefix in _PREFIX.get(family_name, ()):
-        if a.startswith(prefix.lower() if a == a.lower() else prefix) and b[:len(prefix)].lower() == prefix.lower():
-            a, b = a[len(prefix):], b[len(prefix):]
-            break
-    head = len(_common(a, b))
-    tail = len(_common(a[::-1], b[::-1]))
-    return (head >= 2 and tail >= 2) or head >= 4 or tail >= 4
-
-
 def differing_characters(first: str, second: str) -> int | None:
-    """How many positions differ between two strings of one length, or None
-    when the lengths differ."""
-    a, b = canonical(first), canonical(second)
+    """How many positions differ between two strings of one length, case
+    folded where the format ignores case, or None when the lengths differ."""
+    a, b = _fold(first), _fold(second)
     if len(a) != len(b):
         return None
     return sum(1 for x, y in zip(a, b) if x != y)
-
-
-def _common(a: str, b: str) -> str:
-    out = []
-    for x, y in zip(a, b):
-        if x != y:
-            break
-        out.append(x)
-    return "".join(out)
