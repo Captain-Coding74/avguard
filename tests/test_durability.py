@@ -1743,6 +1743,12 @@ class TestTheLogSurvivesASecondProcess(TempCase):
     AVGuard holds it; the standard rollover shifted the backups first, then
     failed, on every record: all lost, and the backups with them."""
 
+    def test_every_entry_point_gets_the_shared_handler(self):
+        from avguard import logsetup
+        logger = logsetup.configure()
+        self.addCleanup(logsetup.close_file_handlers)
+        self.assertEqual([type(h) for h in logger.handlers], [logsetup.SharedRotatingFileHandler])
+
     def test_a_refused_rename_loses_no_record_and_no_backup(self):
         from avguard import logsetup
         log_file = self.tmp / "avguard.log"

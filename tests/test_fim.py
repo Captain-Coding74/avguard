@@ -312,6 +312,79 @@ class TestOneRootPerTree(FimCase):
         self.assertEqual(self.store.check().changes, [])
 
 
+class TestRoundSevenOneTreeOnce(FimCase):
+    """Round seven: one root per tree held only between a new root and the
+    recorded ones, by text. "web web/assets" in one call recorded both and
+    counted their files twice, and a folder reached by another name (a
+    symlink, a junction, an 8.3 name) was a second tree, so one new file
+    was two ADDED rows. Nothing tested siblings that share a prefix, or a
+    baseline from before round six that already holds a nested root."""
+
+    def test_one_call_records_each_tree_once(self):
+        report = self.store.baseline([self.tree, self.tree / "sub", self.tree])
+        self.assertEqual((report.files, self.store.roots()), (7, [str(self.tree)]))
+
+    def test_siblings_that_share_a_prefix_are_two_trees(self):
+        sibling = self.tmp / "site2"
+        sibling.mkdir()
+        (sibling / "index.html").write_bytes(b"the second site")
+        self.store.baseline([self.tree, sibling])
+        self.store.baseline([self.tree])
+        self.assertEqual(sorted(self.store.roots()), sorted([str(self.tree), str(sibling)]))
+        self.assertEqual(self.store.file_count(), 8, "re-baselining site dropped site2's rows")
+
+    def test_a_folder_reached_by_another_name_is_one_tree(self):
+        alias = self.tmp / "alias"
+        try:
+            alias.symlink_to(self.tree, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"no symlinks here: {exc}")
+        self.baseline()
+        self.store.baseline([alias / "sub"])
+        self.assertEqual(self.store.roots(), [str(self.tree)])
+        (self.tree / "sub" / "new.js").write_bytes(b"new")
+        report = self.store.check(events=self.events)
+        self.assertEqual([(c.kind, Path(c.path).name) for c in report.changes], [("added", "new.js")])
+
+    def test_a_nested_root_from_an_older_baseline_is_checked_once(self):
+        import sqlite3
+        self.baseline()
+        with sqlite3.connect(self.store.db_path) as conn:
+            conn.execute("INSERT INTO roots(path, added_at) VALUES (?, ?)", (str(self.tree / "sub"), 0.0))
+        conn.close()
+        self.store._sign()
+        (self.tree / "sub" / "shell.php").write_bytes(b"new")
+        report = self.store.check(events=self.events)
+        self.assertEqual([(c.kind, Path(c.path).name) for c in report.changes], [("added", "shell.php")])
+        self.assertEqual(len(self.events.read(kinds={"fim"})), 1)
+
+    def test_a_file_that_cannot_be_read_is_not_accepted_and_is_named(self):
+        self.baseline()
+        (self.tree / "f1.txt").write_bytes(b"edited one")
+        (self.tree / "f2.txt").write_bytes(b"edited two")
+        real = fim.hash_file
+
+        def locked(path, *args, **kwargs):
+            if Path(path).name == "f2.txt":
+                raise PermissionError(32, "being used by another process")
+            return real(path, *args, **kwargs)
+        with mock.patch.object(fim, "hash_file", side_effect=locked):
+            notes = self.store.accept([self.tree / "f1.txt", self.tree / "f2.txt"])
+        self.assertEqual(notes.not_accepted, [os.path.abspath(self.tree / "f2.txt")])
+        self.assertEqual([Path(c.path).name for c in self.store.check().changes], ["f2.txt"])
+
+    def test_a_baseline_locked_out_says_it_is_in_use(self):
+        other = fim.FileLock(self.store.lock_path)
+        self.assertTrue(other.acquire(0.1))
+        self.addCleanup(other.release)
+        self.addCleanup(setattr, fim, "LOCK_WAIT", fim.LOCK_WAIT)
+        fim.LOCK_WAIT = 0.2
+        report = self.store.baseline([self.tree])
+        self.assertTrue(report.in_use)
+        self.assertEqual(report.roots, [])
+
+
+
 class TestASignatureThatIsNotText(FimCase):
     """Round six: a 0xFF byte in baseline.hmac raised UnicodeDecodeError out
     of verify_integrity, so the window did not open and the daily check died
@@ -504,6 +577,36 @@ class TestTheCommandLine(FimCase):
         with mock.patch.object(FimStore, "accept", side_effect=fim.Refused("Nothing was accepted: in use")):
             code, output = self._cli("--fim-accept", str(self.tree / "f1.txt"))
         self.assertEqual(code, 2, output)
+
+    def test_an_accept_that_could_not_read_a_file_does_not_exit_zero(self):
+        self._cli("--fim-baseline", str(self.tree))
+        (self.tree / "f1.txt").write_bytes(b"edited")
+        partial = fim.Accepted()
+        partial.append(f"{self.tree / 'f1.txt'}: could not be read (locked); not accepted")
+        partial.not_accepted.append(str(self.tree / "f1.txt"))
+        with mock.patch.object(FimStore, "accept", return_value=partial):
+            code, output = self._cli("--fim-accept", str(self.tree / "f1.txt"))
+        self.assertEqual(code, 1, output)
+        self.assertIn("not accepted", output)
+
+    def test_a_baseline_locked_out_exits_two_and_says_why(self):
+        with mock.patch.object(FimStore, "baseline",
+                               return_value=fim.BaselineReport(in_use=True, errors=[fim.IN_USE])):
+            code, output = self._cli("--fim-baseline", str(self.tree))
+        self.assertEqual(code, 2, output)
+        self.assertIn("Nothing was baselined: the baseline is in use", output)
+
+    def test_a_baseline_over_a_doctored_one_names_what_it_dropped(self):
+        other = self.tmp / "web"
+        other.mkdir()
+        (other / "index.php").write_bytes(b"<?php")
+        dropped = fim.BaselineReport(roots=[str(self.tree)], files=7, integrity=fim.INTEGRITY_TAMPERED,
+                                     dropped_roots=[str(other)])
+        with mock.patch.object(FimStore, "baseline", return_value=dropped):
+            code, output = self._cli("--fim-baseline", str(self.tree))
+        self.assertEqual(code, 0, output)
+        self.assertIn("was not carried forward", output)
+        self.assertIn(f"dropped, baseline it again to watch it: {other}", output)
 
     def test_baseline_check_accept_round_trip(self):
         code, output = self._cli("--fim-baseline", str(self.tree))
@@ -791,6 +894,43 @@ class TestThePanelOnAWindow(FimCase):
         self.assertIn("Nothing was accepted", panel.status_var.get())
         other.release()
         self.assertEqual([c.kind for c in self.store.check().changes], ["modified"])
+
+    def test_a_partial_accept_keeps_the_row_it_could_not_read(self):
+        panel = self.panel
+        self.baseline()
+        (self.tree / "f1.txt").write_bytes(b"edited one")
+        (self.tree / "f2.txt").write_bytes(b"edited two")
+        self.assertTrue(panel.check())
+        self.wait()
+        panel.tree.selection_set(panel.tree.get_children())
+        real = fim.hash_file
+
+        def locked(path, *args, **kwargs):
+            if Path(path).name == "f2.txt":
+                raise PermissionError(32, "being used by another process")
+            return real(path, *args, **kwargs)
+        with mock.patch.object(self.fimpanel.Messagebox, "yesno", return_value="Yes"), \
+                mock.patch.object(fim, "hash_file", side_effect=locked):
+            self.assertTrue(panel.accept_selected())
+            self.wait()
+        rows = [panel.tree.item(iid)["values"] for iid in panel.tree.get_children()]
+        self.assertEqual(len(rows), 1, rows)
+        self.assertIn("f2.txt", str(rows[0]))
+        self.assertIn("Accepted 1 change(s)", panel.status_var.get())
+        self.assertIn("1 could not be read", panel.status_var.get())
+
+    def test_a_check_locked_out_keeps_the_rows_being_reviewed(self):
+        panel = self.panel
+        self.baseline()
+        (self.tree / "f3.txt").write_bytes(b"edited")
+        self.assertTrue(panel.check())
+        self.wait()
+        self.assertEqual(len(panel.tree.get_children()), 1)
+        with mock.patch.object(FimStore, "check", return_value=fim.CheckReport(in_use=True)):
+            self.assertTrue(panel.check())
+            self.wait()
+        self.assertEqual(len(panel.tree.get_children()), 1, "a check that did not run cleared the list")
+        self.assertIn("Not checked", panel.status_var.get())
 
     def test_a_tampered_baseline_turns_the_summary_red(self):
         self.baseline()

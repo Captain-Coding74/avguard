@@ -660,6 +660,7 @@ class SnapshotReport:
     integrity: str = INTEGRITY_OK
     carried: dict[str, int] = field(default_factory=dict)   # kind -> entries kept from the previous snapshot
     loud: list[Change] | None = None       # judged worth a banner by the window's worker; None: nobody judged
+    in_use: bool = False                   # another snapshot held the lock; nothing was read or recorded
 
     def of(self, kind: str) -> list[Change]:
         return [c for c in self.changes if c.kind == kind]
@@ -813,13 +814,20 @@ class AutorunsStore:
         task share the files."""
         report = SnapshotReport(errors=list(collected.errors), counts=dict(collected.counts),
                                 seconds=dict(collected.seconds))
-        if not collected.entries:
-            report.integrity = self.verify_integrity() if self.exists() else INTEGRITY_NO_SNAPSHOT
-            report.errors.append("nothing was collected; the snapshot was not recorded")
-            return report
         lock = fim.FileLock(self.directory / LOCK_NAME)
+        if not collected.entries:
+            report.errors.append("nothing was collected; the snapshot was not recorded")
+            if lock.acquire(LOCK_WAIT):
+                try:
+                    report.integrity = self.verify_integrity() if self.exists() else INTEGRITY_NO_SNAPSHOT
+                finally:
+                    lock.release()
+            return report
         if not lock.acquire(LOCK_WAIT):
-            report.integrity = self.verify_integrity() if self.exists() else INTEGRITY_NO_SNAPSHOT
+            # Not verified: without the lock, the holder may be between
+            # committing its rows and signing them, and the check read that
+            # as "modified outside AVGuard" (exit 3) for a store nobody touched.
+            report.in_use = True
             report.errors.append("another snapshot is being taken; this one was not recorded")
             return report
         try:
@@ -895,8 +903,8 @@ class AutorunsStore:
                         (snapshot_id, entry.key, entry.kind, entry.location, entry.name, entry.value,
                          int(entry.enabled), entry.extra, json.dumps(entry.detail, ensure_ascii=False),
                          entry.fingerprint))
-                old_ids = [r[0] for r in conn.execute(
-                    "SELECT id FROM snapshots ORDER BY id DESC LIMIT -1 OFFSET ?", (self.keep,))]
+                old_ids = _prunable(conn.execute("SELECT id, failed FROM snapshots ORDER BY id DESC").fetchall(),
+                                    self.keep)
                 for old_id in old_ids:
                     conn.execute("DELETE FROM entries WHERE snapshot_id = ?", (old_id,))
                     conn.execute("DELETE FROM snapshots WHERE id = ?", (old_id,))
@@ -962,6 +970,24 @@ class AutorunsStore:
         if hmac.compare_digest(recorded, self._signature(key)):
             return INTEGRITY_OK
         return INTEGRITY_TAMPERED
+
+
+def _prunable(rows, keep: int) -> list[int]:
+    """Snapshot ids past the newest `keep`, except, for each kind, the
+    newest snapshot that read it. Without that, a kind that failed every day
+    for a month had no snapshot left that read it, its next read counted as
+    the first, and a startup entry added meanwhile was recorded unreported."""
+    kept = {row[0] for row in rows[:keep]}
+    for kind in KINDS:
+        for snapshot_id, failed in rows:
+            try:
+                missed = json.loads(failed) if failed else []
+            except ValueError:
+                missed = []
+            if kind not in missed:
+                kept.add(snapshot_id)
+                break
+    return [row[0] for row in rows if row[0] not in kept]
 
 
 def _first_read(kinds, before: Sequence[Snapshot], failed_now) -> set[str]:

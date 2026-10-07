@@ -451,6 +451,10 @@ def _fim_command(args) -> int:
             return 2
         for note in notes:
             print(f"  {note}")
+        if notes.not_accepted:
+            print(f"{len(notes.not_accepted)} change(s) could not be read and were not accepted.",
+                  file=sys.stderr)
+            return 1
         return 0
 
     if args.fim_schedule:

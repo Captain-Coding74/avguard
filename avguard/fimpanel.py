@@ -366,6 +366,11 @@ class IntegrityPanel(tb.Frame):
         self._set_busy(False)
         self.refresh()
         self._roots = self._store_factory().roots()
+        if report.in_use or report.cancelled:
+            # Nothing was checked: the rows from the last check are still the
+            # changes the user was reviewing. They were cleared first.
+            self.status_var.set(describe_check(report))
+            return
         self._clear_rows()
         for change in report.changes:
             self._add_row(change)
@@ -411,11 +416,16 @@ class IntegrityPanel(tb.Frame):
         self._set_busy(False)
         for note in notes:
             log.info("integrity: %s", note)
-        for iid in iids:
+        refused = {os.path.normcase(p) for p in getattr(notes, "not_accepted", [])}
+        accepted = [iid for iid in iids
+                    if os.path.normcase(os.path.abspath(self._changes[int(iid)].path)) not in refused]
+        for iid in accepted:
             if self.tree.exists(iid):
                 self.tree.delete(iid)
         self.refresh()
         left = len(self.tree.get_children())
-        self.status_var.set(f"Accepted {len(iids)} change(s) into the baseline; "
-                            f"{left} left in the list." if left else
-                            f"Accepted {len(iids)} change(s) into the baseline. The list is empty.")
+        said = f"Accepted {len(accepted)} change(s) into the baseline"
+        if len(accepted) != len(iids):
+            said += (f"; {len(iids) - len(accepted)} could not be read and stay in the list "
+                     "(another program has the file open?)")
+        self.status_var.set(f"{said}; {left} left in the list." if left else f"{said}. The list is empty.")

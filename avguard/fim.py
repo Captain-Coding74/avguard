@@ -205,6 +205,16 @@ class BaselineReport:
     dropped_roots: list[str] = field(default_factory=list)
 
 
+class Accepted(list):
+    """What accept() did, a line per path, and which paths it did not
+    accept: a file it could not read was a line among the others, and the
+    Integrity tab said "Accepted 2 change(s)" and cleared both rows."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.not_accepted: list[str] = []
+
+
 @dataclass
 class CheckReport:
     changes: list[Change] = field(default_factory=list)
@@ -269,6 +279,35 @@ def _is_reparse_point(path: Path) -> bool:
 
 def _key(path: str | Path) -> str:
     return os.path.normcase(os.path.abspath(str(path)))
+
+
+def _real(path: str) -> str:
+    try:
+        return os.path.normcase(os.path.realpath(path))
+    except (OSError, ValueError):
+        return _key(path)
+
+
+def _one_root_per_tree(given: list[Path], recorded: list[str]) -> list[Path]:
+    """The roots of one baseline call, each tree once: a root inside another
+    given root goes, a repeated root goes, and a root that is another name
+    for a folder already held (a symlink, a junction, an 8.3 name) is
+    spelled under the root that holds it, so the text comparisons that
+    follow see one tree. "web web/assets" recorded both and counted their
+    files twice; a symlinked spelling gave two ADDED rows per new file.
+    One realpath per root, not per row."""
+    anchors = [(str(r), _real(str(r))) for r in recorded]
+    out: list[Path] = []
+    for root in given:
+        real = _real(str(root))
+        for anchor, anchor_real in anchors + [(str(r), _real(str(r))) for r in out]:
+            if real == anchor_real or real.startswith(anchor_real.rstrip(os.sep) + os.sep):
+                rest = real[len(anchor_real):].lstrip(os.sep)
+                root = Path(anchor) / rest if rest else Path(anchor)
+                break
+        if not any(_under(str(root), str(kept)) for kept in out):
+            out = [kept for kept in out if not _under(str(kept), str(root))] + [root]
+    return out
 
 
 def _under(path: str, root: str) -> bool:
@@ -456,7 +495,7 @@ class FimStore:
         report = BaselineReport()
         rows: list[tuple[str, bytes, int, int, float]] = []
         now = time.time()
-        wanted = [Path(os.path.abspath(str(root))) for root in roots]
+        wanted = _one_root_per_tree([Path(os.path.abspath(str(root))) for root in roots], self.roots())
         pending: list[Path] = []
         for root in wanted:
             if not root.is_dir():
@@ -716,7 +755,7 @@ class FimStore:
         The files are hashed before the lock is taken, so a large accept
         does not lock out the daily check.
         """
-        done: list[str] = []
+        done = Accepted()
         hashed: list[tuple[Path, tuple[str, int, int] | None]] = []
         for path in paths:
             path = Path(os.path.abspath(str(path)))
@@ -725,6 +764,7 @@ class FimStore:
                     hashed.append((path, hash_file(path)))
                 except OSError as exc:
                     done.append(f"{path}: could not be read ({exc}); not accepted")
+                    done.not_accepted.append(str(path))
             else:
                 hashed.append((path, None))
         lock = FileLock(self.lock_path)

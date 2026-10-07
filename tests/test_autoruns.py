@@ -718,6 +718,43 @@ class TestRoundSixSnapshots(AutorunsCase):
         self.assertEqual([e.level for e in self.events.read(kinds={"autoruns"})], ["tampered"])
 
 
+class TestRoundSevenSnapshots(AutorunsCase):
+    """Round seven: after a kind failed to read for as many days as are
+    kept, no stored snapshot had read it, its recovery counted as a first
+    read, and an entry added meanwhile was recorded unreported; and a
+    snapshot that timed out on the lock verified the signature without it,
+    reading the holder's unsigned rows as "modified outside AVGuard"."""
+
+    def test_a_kind_that_failed_for_longer_than_is_kept_is_still_compared(self):
+        store = autoruns.AutorunsStore(self.tmp / "kept3", keep=3, key_protect=stub_protect,
+                                       key_unprotect=stub_unprotect)
+        store.snapshot(self.collect(), events=self.events)                  # Startup read once
+        with mock.patch.object(Path, "iterdir", side_effect=PermissionError(13, "denied")):
+            for _ in range(4):
+                store.snapshot(self.collect(), events=self.events)
+        (self.startup / "svchost.lnk").write_bytes(b"L\x00\x00\x00 a new shortcut")
+        report = store.snapshot(self.collect(), events=self.events)
+        self.assertEqual([(c.kind, c.entry.name) for c in report.changes], [("added", "svchost.lnk")],
+                         "recorded as a first read and never reported")
+        self.assertLessEqual(len(store.snapshots()), 4, "pruning kept more than one extra snapshot")
+
+    def test_a_snapshot_that_cannot_get_the_lock_reads_nothing(self):
+        self.store.snapshot(self.collect())
+        holder = autoruns.fim.FileLock(self.store.directory / autoruns.LOCK_NAME)
+        self.assertTrue(holder.acquire(0.1))
+        self.addCleanup(holder.release)
+        self.addCleanup(setattr, autoruns, "LOCK_WAIT", autoruns.LOCK_WAIT)
+        autoruns.LOCK_WAIT = 0.2
+        with mock.patch.object(autoruns.AutorunsStore, "verify_integrity",
+                               return_value=autoruns.INTEGRITY_TAMPERED) as verified:
+            report = self.store.snapshot(self.collect(), events=self.events)
+        verified.assert_not_called()
+        self.assertTrue(report.in_use)
+        self.assertIsNone(report.integrity_event())
+        self.assertNotIn("SNAPSHOTS", autoruns.describe_report(report))
+        self.assertEqual(self.events.read(kinds={"autoruns"}), [])
+
+
 class TestTheTabOnAWindow(AutorunsCase):
     """The Startup tab on the shared withdrawn window: a snapshot through its
     button's handler, the worker real, the window's pump played by wait()."""
