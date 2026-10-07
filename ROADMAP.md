@@ -1368,6 +1368,26 @@ none has been reported. Found in passing and left for its own change: the
 English tail "Cloud identificator: XXXX" that Microsoft reported in August
 2025 matches none of the English words; only its checkmark catches it.
 
+**Cloud identificator, 2026-10-07.** That change. Two researchers and two
+skeptics read the reported English tails against the rule: Microsoft's
+August 2025 post (four forms), Unit 42's July 2025 report, ClickGrab's
+nightly captures of live lure sites ("Verification Hash", "Captcha
+Verification Hash") and the open-source reCAPTCHA Phish kit. Every one
+already matched through "robot", "verification", "a human" or "security
+check" except one: "Cloud Identificator: 2031", which Unit 42 saw with no
+checkmark at all and Microsoft with one. Bare "identificator" is refused:
+about 280 shell and 40 PowerShell files on GitHub use it, as non-native
+English for "identifier", as the Romanian word and as the stem of the
+Italian one, and the comment gate covers the whole paste. "cloud
+identificator" occurs in 25 GitHub files, 23 of them threat intelligence
+or detection rules and 2 an argparse help string, none in a shell
+comment; the token is `\bcloud ?identificator`, so "icloud" and
+"yandexcloudidentificator" are not it. Measured over every fixture with the
+previous and this classifier: the new Unit 42 fixture warns 0 -> 1; the 40
+other lure fixtures 40 -> 40 with identical signals; the 43 legitimate
+lines and the new honest "manifest identificator" line 0 -> 0. Tests
+751 -> 752, both suites green.
+
 ## Deliberately not doing
 
 The paste guard (above) is the one input that is not a file; it watches a user-mode clipboard buffer through documented calls, with no driver, no hook and no process telemetry, so it does not reopen the first decision here. The EDR-shaped extensions of it are refused by name: no keyboard hook to see Win+R, no automation of the Run dialog, no watching what the user then runs.

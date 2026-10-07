@@ -148,6 +148,11 @@ _LURE_COMMENT = re.compile(
     r"(?:^|\s)(?:#|rem\b)[^\n]*?(?:robot|captcha|turnstile|cloudflare|ray id|"
     r"verif(?:y|ication) (?:you|that you|your|i am|i'm|id\b|code\b|hash\b|step\b|token\b|complete|required|success)|"
     r"(?:are|am|a|not) human|human verification|i am not|i'm not|press enter|unusual traffic|security check|"
+    # "Cloud Identificator: 2031" (Unit 42, July 2025; Microsoft, August 2025):
+    # the one reported English tail none of the words above caught. Never
+    # bare "identificator", which is Romanian and Italian and ordinary in
+    # non-native English comments; "cloud" whole, so "icloud" is not it.
+    r"\bcloud ?identificator|"
     + _thai_alternatives(_THAI_LURE_PHRASES) + ")")
 _LURE_MARK = re.compile(r"[\u2705\u2714\u2713\u2611\U0001f512\U0001f6e1]")
 _PADDED_COMMENT = re.compile(r"\S[ \t]{12,}#")
