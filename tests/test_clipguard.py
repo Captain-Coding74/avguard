@@ -827,6 +827,143 @@ class TestTheRealClipboard(unittest.TestCase):
         self.assertLess(per_call, 50.0)
 
 
+@unittest.skipUnless(sys.platform == "win32", "the clipboard is Windows-only")
+class TestWhatASwapLooksLikeToTheTick(unittest.TestCase):
+    """The measurement docs/next-6.md item 6 asks for before a swap guard is
+    built: what a 500 ms poll sees when one write replaces another D ms
+    later. The test writes the clipboard (the module never does); the two
+    texts are BIP-173 test vectors, two valid segwit addresses of one family.
+    Nothing here is asserted beyond the harness working: the numbers are the
+    result, printed for the ROADMAP."""
+
+    FIRST = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+    SECOND = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3"
+    TICK = 0.5
+
+    def setUp(self) -> None:
+        import ctypes
+        import ctypes.wintypes as wt
+        self.ctypes = ctypes
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        user32.OpenClipboard.argtypes = [wt.HWND]
+        user32.OpenClipboard.restype = wt.BOOL
+        user32.EmptyClipboard.restype = wt.BOOL
+        user32.SetClipboardData.argtypes = [wt.UINT, wt.HANDLE]
+        user32.SetClipboardData.restype = wt.HANDLE
+        user32.CloseClipboard.restype = wt.BOOL
+        kernel32.GlobalAlloc.argtypes = [wt.UINT, ctypes.c_size_t]
+        kernel32.GlobalAlloc.restype = wt.HGLOBAL
+        kernel32.GlobalLock.argtypes = [wt.HGLOBAL]
+        kernel32.GlobalLock.restype = wt.LPVOID
+        kernel32.GlobalUnlock.argtypes = [wt.HGLOBAL]
+        kernel32.GlobalUnlock.restype = wt.BOOL
+        self.user32, self.kernel32 = user32, kernel32
+        self.source = clipguard.WindowsClipboard()
+        if not self.source.available:
+            self.skipTest(self.source.unavailable_reason)
+
+    def _put(self, fmt: int, data: bytes) -> None:
+        handle = self.kernel32.GlobalAlloc(0x0002, len(data))           # GMEM_MOVEABLE
+        pointer = self.kernel32.GlobalLock(handle)
+        self.ctypes.memmove(pointer, data, len(data))
+        self.kernel32.GlobalUnlock(handle)
+        self.user32.SetClipboardData(fmt, handle)
+
+    def write(self, text: str, formats: int = 1, empty_only: bool = False) -> bool:
+        import time
+        for _ in range(50):
+            if self.user32.OpenClipboard(None):
+                break
+            time.sleep(0.01)
+        else:
+            return False
+        try:
+            self.user32.EmptyClipboard()
+            if not empty_only:
+                self._put(clipguard.CF_UNICODETEXT, text.encode("utf-16-le") + b"\0\0")
+                if formats >= 2:
+                    self._put(1, text.encode("ascii", "replace") + b"\0")          # CF_TEXT
+                if formats >= 3:
+                    self._put(16, (0x0409).to_bytes(4, "little"))                # CF_LOCALE
+            return True
+        finally:
+            self.user32.CloseClipboard()
+
+    def test_the_sequence_per_write_and_what_a_poll_sees_of_a_swap(self):
+        import random
+        import threading
+        import time
+        seq = self.source.sequence
+        # 1. What one write moves the number by, and whether anything on the
+        #    machine writes again afterwards (clipboard history, a sync agent).
+        steps = []
+        for label, kwargs in (("one format", {}), ("three formats", {"formats": 3}),
+                              ("emptied only", {"empty_only": True})):
+            before = seq()
+            self.assertTrue(self.write(self.FIRST, **kwargs), "the clipboard could not be opened")
+            written = seq()
+            time.sleep(1.0)
+            steps.append((label, written - before, seq() - written))
+        print("\n  clipboard sequence per write: " + "; ".join(
+            f"{label} +{moved} (then +{late} within 1 s)" for label, moved, late in steps))
+        owner = self.source.read().owner
+        print(f"  owner of a write made with OpenClipboard(NULL): {owner!r}")
+
+        # 2. A swap D ms after the copy, under a poll every 500 ms at a random phase.
+        rng = random.Random(20261007)
+        rows = []
+        for delay_ms in (0, 50, 200, 400, 600):
+            seen_first = between = neither = busy = 0
+            trials = 6
+            for _ in range(trials):
+                observed: list[tuple[int, str | None]] = []
+                stop = threading.Event()
+
+                def poll() -> None:
+                    nonlocal busy
+                    last = seq()
+                    observed.append((last, None))
+                    while not stop.wait(self.TICK):
+                        now = seq()
+                        if now == last:
+                            observed.append((now, None))
+                            continue
+                        try:
+                            clip = self.source.read()
+                            observed.append((now, clip.text if clip else None))
+                            last = now
+                        except clipguard.ClipboardBusy:
+                            busy += 1               # the number stays; the next tick retries
+                start = seq()
+                poller = threading.Thread(target=poll, daemon=True)
+                poller.start()
+                time.sleep(rng.uniform(0, self.TICK))
+                self.assertTrue(self.write(self.FIRST))
+                after_first = seq()
+                time.sleep(delay_ms / 1000)
+                self.assertTrue(self.write(self.SECOND))
+                after_second = seq()
+                time.sleep(2.5 * self.TICK)
+                stop.set()
+                poller.join(5)
+                texts = [text for _, text in observed if text]
+                self.assertEqual(texts[-1] if texts else None, self.SECOND, "the harness: the last read is the second write")
+                numbers = [number for number, _ in observed]
+                if self.FIRST in texts:
+                    seen_first += 1
+                elif any(a <= start and b >= after_second for a, b in zip(numbers, numbers[1:])) and \
+                        after_first not in numbers:
+                    between += 1
+                else:
+                    neither += 1
+            rows.append((delay_ms, trials, seen_first, between, neither, busy))
+        for delay_ms, trials, seen_first, between, neither, busy in rows:
+            print(f"  swap {delay_ms:>3} ms after the copy, 500 ms poll: original read {seen_first}/{trials}, "
+                  f"both writes between two ticks {between}/{trials}, neither {neither}/{trials}"
+                  f"{f', {busy} busy read(s)' if busy else ''}")
+
+
 class TestTheWindowIntegration(unittest.TestCase):
     """The GUI side of the guard, on a fake self: the off switch, the Health
     row, the first-run choice, the offer and the enable path. The one widget
