@@ -102,10 +102,15 @@ def _refuse_to_touch_real_data() -> None:
     override = os.getenv("AVGUARD_DATA")
     if not override:
         return
-    if not str(config.DATA_DIR).startswith(str(pathlib.Path(override).resolve())):
+    if not Path(config.DATA_DIR).resolve().is_relative_to(Path(override).expanduser().resolve()):
         raise RuntimeError(
             f"AVGUARD_DATA is set to {override} but config.DATA_DIR is "
             f"{config.DATA_DIR}; the suite would write to the real location")
+
+
+# Defined and never called until round six, so it guarded nothing: it named
+# `pathlib`, which this module does not import, and no run ever noticed.
+_refuse_to_touch_real_data()
 
 
 class TempCase(unittest.TestCase):

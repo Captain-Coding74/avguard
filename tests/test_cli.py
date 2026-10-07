@@ -457,6 +457,53 @@ class TestScheduleCommands(CliCase):
         self.assertEqual(code, 0, output)
 
 
+class TestTheDailyScanCoversEveryWatchedFolder(CliCase):
+    """Round six: "scan the watched folders once a day" scheduled a scan of
+    the first of them only, and kept scanning it after the list changed."""
+
+    def watched(self, *names: str) -> list[Path]:
+        from avguard import config
+        from avguard.scanner import SELFTEST_MARKER
+        folders = []
+        for name in names:
+            folder = self.tmp / name
+            folder.mkdir()
+            (folder / f"{name}.bin").write_bytes(SELFTEST_MARKER)
+            folders.append(folder)
+        config.Config(watch_paths=[str(f) for f in folders]).save()
+        return folders
+
+    def test_scan_watched_reads_the_list_and_scans_each(self):
+        self.watched("first", "second")
+        code, output = self.run_cli("--scan-watched")
+        self.assertEqual(code, 1, output)
+        self.assertIn("first.bin", output)
+        self.assertIn("second.bin", output, "only the first watched folder was scanned")
+
+    def test_scan_watched_with_nothing_there_says_so(self):
+        from avguard import config
+        config.Config(watch_paths=[str(self.tmp / "gone")]).save()
+        code, output = self.run_cli("--scan-watched")
+        self.assertEqual(code, 2, output)
+        self.assertIn("no watched folder exists", output)
+
+    def test_the_task_runs_scan_watched_and_schedule_on_asks_for_it(self):
+        from avguard import scheduling
+        ran: list[list[str]] = []
+        with mock.patch.object(scheduling.sys, "platform", "win32"), \
+                mock.patch.object(scheduling, "_run", side_effect=lambda args: (ran.append(args), (True, ""))[1]):
+            ok, _ = scheduling.enable_scheduled_scan(None)
+        self.assertTrue(ok)
+        command = ran[0][ran[0].index("/TR") + 1]
+        self.assertTrue(command.endswith("--scan-watched"), command)
+        with mock.patch.object(scheduling, "enable_start_with_windows", return_value=(True, "")), \
+                mock.patch.object(scheduling, "enable_scheduled_scan", return_value=(True, "daily")) as daily:
+            code, output = self.run_cli("--schedule", "on")
+        self.assertEqual(code, 0, output)
+        self.assertIsNone(daily.call_args.args[0], "a single folder was fixed into the task")
+        self.assertIn("the watched folders", output)
+
+
 class TestOutputSanity(CliCase):
 
     def test_no_command_output_contains_an_unformatted_placeholder(self):

@@ -57,6 +57,28 @@ class Event:
         return self.at[:19].replace("T", " ")
 
 
+def _event_from(raw) -> Event | None:
+    """An Event from one decoded line, or None when its fields are not the
+    types the History window formats: a record with a number for "at" or
+    null reasons built fine and then raised in the row the dialog drew."""
+    if not isinstance(raw, dict):
+        return None
+    strings = ("kind", "at", "path", "level")
+    if not isinstance(raw.get("kind"), str) or not all(isinstance(raw.get(k, ""), str) for k in strings):
+        return None
+    score = raw.get("score", 0)
+    reasons = raw.get("reasons", [])
+    detail = raw.get("detail", {})
+    if (not isinstance(score, int) or isinstance(score, bool) or not isinstance(reasons, list)
+            or not all(isinstance(r, str) for r in reasons) or not isinstance(detail, dict)):
+        return None
+    try:
+        return Event(**{k: v for k, v in raw.items()
+                        if k in ("kind", "at", "path", "level", "score", "reasons", "detail")})
+    except TypeError:
+        return None
+
+
 class EventStore:
     """Append-only history, rotated by size."""
 
@@ -116,7 +138,10 @@ class EventStore:
         """
         events: list[Event] = []
         try:
-            with open(self.path, "r", encoding="utf-8") as handle:
+            # errors="replace": a line torn inside a multi-byte character (a
+            # Thai path, a hard kill mid-write) failed the whole read before
+            # json saw it, and History never opened again.
+            with open(self.path, "r", encoding="utf-8", errors="replace") as handle:
                 lines = handle.readlines()
         except OSError:
             return []
@@ -127,14 +152,14 @@ class EventStore:
                 continue
             try:
                 raw = json.loads(line)
-            except json.JSONDecodeError:
+            except ValueError:
                 continue          # a torn final line after a hard kill
-            if kinds and raw.get("kind") not in kinds:
+            event = _event_from(raw)
+            if event is None:
+                continue          # not a record this program wrote, or not whole
+            if kinds and event.kind not in kinds:
                 continue
-            try:
-                events.append(Event(**raw))
-            except TypeError:
-                continue
+            events.append(event)
             if len(events) >= limit:
                 break
         return events
@@ -147,7 +172,7 @@ class EventStore:
         """
         totals: dict[str, int] = {}
         try:
-            with open(self.path, "r", encoding="utf-8") as handle:
+            with open(self.path, "r", encoding="utf-8", errors="replace") as handle:
                 for line in handle:
                     marker = '"kind":'
                     at = line.find(marker)

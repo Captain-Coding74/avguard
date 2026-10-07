@@ -57,7 +57,8 @@ Other flags:
 | `--fim-status`, `--fim-schedule status\|on\|off` | the baseline, and a daily unattended check |
 | `--pause` | with `--scan`: keep the result on screen (the right-click entry uses it) |
 | `--install-context-menu`, `--remove-context-menu` | 'Scan with AVGuard' in Explorer's right-click menu, this user only |
-| `--schedule status\|on\|off` | start with Windows, and a daily scan |
+| `--scan-watched` | scan every watched folder, as `config.json` names them when it runs |
+| `--schedule status\|on\|off` | start with Windows, and a daily `--scan-watched` (`--schedule-path DIR` for one folder instead) |
 | `-v` | show clean files too |
 
 `--export-all` matters more than it looks. The quarantine holds the only copy
@@ -119,10 +120,12 @@ unless you pass `--quarantine` or have automatic quarantine on.
 Worth being plain about, because a scanner that implies more than it does is
 the thing this project exists to not be.
 
-With VirusTotal lookups off — the default — the only things that can reach
-MALICIOUS and be moved are the EICAR test file and AVGuard's own self-test
-marker. Everything else the rules and heuristics find is reported as
-SUSPICIOUS and left alone: the process-injection rule, the encoded-PowerShell
+With VirusTotal lookups off — the default — what can reach MALICIOUS and be
+moved is short: the two byte signatures (the EICAR test file and AVGuard's
+own self-test marker), a SHA-256 on the hash blocklist (one you imported, or
+the opt-in MalwareBazaar feed), a rule of your own marked high severity, and a
+rule from a pack you promoted. Everything else the shipped rules and
+heuristics find is reported as SUSPICIOUS and left alone: the process-injection rule, the encoded-PowerShell
 rule, the ransom-note rule, packed executables, odd PE structure, zip bombs,
 archive traversal names. That is deliberate. Heuristics are capped below the
 threshold so no pile of guesses can move a file, which is why 8,843 clean
@@ -260,7 +263,8 @@ itself.
     low rule / unlabelled rule         25
     high entropy                       25
 
-The threshold is `quarantine_threshold` in `data/config.json`. Before this,
+The threshold is `quarantine_threshold` in `config.json` (in
+`%LOCALAPPDATA%\AVGuard`, or wherever `AVGUARD_DATA` points). Before this,
 every rule hit meant MALICIOUS, which meant "move the user's file" — and three
 out of three ordinary CI scripts were being moved.
 
@@ -344,7 +348,7 @@ while the window is open -- is seen by the other without a restart: the
 allowlist notices its file changing, and a cached verdict defers to it.
 
 **One writer at a time.** Both entry points take an exclusive lock on
-`data/avguard.lock`. Two AVGuard processes sharing the quarantine store used to
+`avguard.lock` in the data folder (`%LOCALAPPDATA%\AVGuard`). Two AVGuard processes sharing the quarantine store used to
 destroy each other's records: each loaded the index once and later rewrote it
 whole, so the second to write erased the first's entries — deleting the user's
 originals and orphaning the stored payloads. The lock prevents that, and the
@@ -700,9 +704,9 @@ wrote.
 
 `rules/malware.yara`. Two habits that version 1's ruleset lacked:
 
-Your own rules go in `%LOCALAPPDATA%\AVGuard
-ules`, and they load alongside
-the shipped ones — including a file with the same name. That last part was a
+Your own rules go in `%LOCALAPPDATA%\AVGuard\rules`, and they load alongside
+the shipped ones (each file compiled on its own first: one that does not
+compile is left out and named in Health, and the shipped rules stay loaded) — including a file with the same name. That last part was a
 bug worth naming: rule namespaces were keyed on the filename stem, so a user
 file called `malware.yara` silently replaced the entire shipped ruleset. EICAR
 stopped matching while the log still reported two files compiled.
@@ -739,7 +743,9 @@ Still present, not touched, safe to remove when you have looked at them:
   malware.
 - `app website version/app.html` — a mock UI with no backend
 
-`data/` is the new home for everything the running program writes.
+A `data/` folder in the checkout is an old install's store from before the
+data moved to `%LOCALAPPDATA%\AVGuard`; the first start moves it there (and
+never into a folder `AVGUARD_DATA` names, so the tests cannot take it).
 
 ## License
 

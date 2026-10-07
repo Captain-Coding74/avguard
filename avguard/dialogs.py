@@ -494,8 +494,7 @@ class SettingsDialog(tb.Toplevel):
 
         if self.daily_var.get() != state.scheduled_scan:
             if self.daily_var.get():
-                targets = self.cfg.watch_paths or [str(Path.home() / "Downloads")]
-                ok, detail = scheduling.enable_scheduled_scan(Path(targets[0]))
+                ok, detail = scheduling.enable_scheduled_scan(None)      # every watched folder, as of that day
             else:
                 ok, detail = scheduling.disable_scheduled_scan()
             if not ok:

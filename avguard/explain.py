@@ -61,6 +61,8 @@ _MEANING = {
 }
 CLEAN_BELOW_THE_LINE = "Below the reporting line: what was found did not add up to a report."
 CLEAN_KEPT = "Kept because you chose to: what was found was set aside by your decision."
+DESCRIPTION_LEFT_OUT = ("(its description was left out: it states a confidence figure, "
+                        "which this account does not carry)")
 NOTE_LEFT_OUT = ("(a note from the rule's author was left out: it states a confidence figure, "
                  "which this account does not carry)")
 _VERDICT_KINDS = ("detection", "quarantined", "suspicious", "provenance")
@@ -149,14 +151,14 @@ def tally_of(findings: Sequence[Finding], threshold) -> Tally:
                  threshold=threshold, suspicious_at=SUSPICIOUS_AT, count=len(findings))
 
 
+def _states_a_figure(text: str) -> bool:
+    return bool("%" in text or (re.search(r"\d", text) and re.search(r"confiden|probab", text, re.I)))
+
+
 def _author_notes(notes: Sequence[str]) -> tuple[str, ...]:
     """A rule author's note, unless it states a confidence figure: the one
     number this account promises never to carry, whoever wrote it."""
-    kept = []
-    for note in notes:
-        figure = "%" in note or (re.search(r"\d", note) and re.search(r"confiden|probab", note, re.I))
-        kept.append(NOTE_LEFT_OUT if figure else note)
-    return tuple(kept)
+    return tuple(NOTE_LEFT_OUT if _states_a_figure(note) else note for note in notes)
 
 
 def _source_words(finding: Finding, packs) -> tuple[str, str, tuple[str, ...]]:
@@ -216,7 +218,13 @@ def _row(finding: Finding, packs) -> Row:
     # The confidence filter is for a rule author's prose; a note the scanner
     # itself wrote (a path, a name) is kept as it is.
     notes = _author_notes(finding.notes) if finding.source == "yara" else tuple(finding.notes)
-    return Row(kind, words, int(finding.weight), finding.describe(), notes + extra)
+    said = finding.describe()
+    if finding.source == "yara" and _states_a_figure(said):
+        # The rule's description is the author's prose too: a pack could put
+        # "97% confidence" in the account a line above the sentence saying
+        # the program has no such number.
+        said = f"rule {finding.name} matched {DESCRIPTION_LEFT_OUT}"
+    return Row(kind, words, int(finding.weight), said, notes + extra)
 
 
 def _meaning(level: str, rows: Sequence[Row], state: str) -> str:

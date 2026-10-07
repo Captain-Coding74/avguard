@@ -183,8 +183,11 @@ def inspect(
 
     try:
         archive = zipfile.ZipFile(path)
-    except (zipfile.BadZipFile, OSError, EOFError) as exc:
+    except Exception as exc:
         # A truncated download is the usual cause. Recorded, not accused.
+        # Any exception: zipfile raises UnicodeDecodeError for a name flagged
+        # UTF-8 that is not, and NotImplementedError for a version it does
+        # not know, and either escaped scan() and left the file no verdict.
         report.notes.append(f"could not be read as an archive ({type(exc).__name__})")
         return report
 
@@ -309,7 +312,7 @@ def _inspect_bytes(data: bytes, display: Path, budget: list[int]) -> ArchiveRepo
     report = ArchiveReport(path=display)
     try:
         archive = zipfile.ZipFile(io.BytesIO(data))
-    except (zipfile.BadZipFile, OSError, EOFError):
+    except Exception:                     # see inspect(): any of them, one level down too
         return None
 
     with archive:

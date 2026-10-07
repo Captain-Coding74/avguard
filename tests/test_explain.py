@@ -653,5 +653,26 @@ class TestTheWindow(unittest.TestCase):
         dialog.destroy()
 
 
+
+class TestADescriptionThatStatesAFigure(unittest.TestCase):
+    """Round six: the confidence filter read a rule author's notes but not
+    the rule's description, so a pack could put "97% confidence" into the
+    account a line above the sentence saying it carries no such number."""
+
+    def test_the_description_is_left_out_and_the_rule_still_named(self):
+        loud = [Finding("yara", "Packed_Thing", 50, "97% confidence: packed malware (rule Packed_Thing, medium)",
+                        severity="medium", pack="p")]
+        text = explain.render_text(account_for(loud))
+        self.assertNotIn("97%", text)
+        self.assertIn(f"rule Packed_Thing matched {explain.DESCRIPTION_LEFT_OUT}", text)
+
+    def test_an_ordinary_description_is_kept_and_the_scanner_own_words_are_not_filtered(self):
+        plain = [Finding("yara", "R", 50, "a downloader seen in 2024 lures (rule R, medium)", severity="medium"),
+                 Finding("signature", "S", 100, "matched 100% of signature S", hard=True)]
+        text = explain.render_text(account_for(plain))
+        self.assertIn("a downloader seen in 2024 lures", text)
+        self.assertIn("matched 100% of signature S", text)
+
+
 if __name__ == "__main__":
     unittest.main()

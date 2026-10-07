@@ -36,7 +36,7 @@ from . import fim as fim_module
 from . import forward as forward_module
 from . import shellext
 from .instance import InstanceLock
-from .protection import SelfProtection
+from .protection import SelfProtection, matches_excluded_glob
 from .quarantine import QuarantineError, QuarantineStore, RestoreIncomplete
 from .scanner import Level, Scanner, Verdict, findings_to_dicts
 from .watcher import RealtimeMonitor
@@ -827,10 +827,21 @@ class AVGuardApp(tb.Window):
         positive moves something the user wrote. Quarantine is reversible here,
         but the cheapest way to not lose someone's work is to not touch it.
         """
-        if self.cfg.watch_paths:
-            return [Path(p) for p in self.cfg.watch_paths]
-        downloads = Path.home() / "Downloads"
-        return [downloads] if downloads.is_dir() else []
+        return config.watch_targets(self.cfg)
+
+    def _watch_gaps(self, globs: list[str] | None = None) -> list[str]:
+        """Configured folders real-time protection is not protecting, each
+        with why: not there (a drive not yet mounted at logon), or covered by
+        an exclusion, so nothing in it is scanned. Both read as "watching 1
+        folder(s)", OK, before."""
+        globs = self.cfg.excluded_globs if globs is None else globs
+        gaps = []
+        for target in self._watch_targets():
+            if not target.is_dir():
+                gaps.append(f"{target} does not exist")
+            elif matches_excluded_glob(target / "any-file", globs):
+                gaps.append(f"{target} is excluded, so nothing in it is scanned")
+        return gaps
 
     def _start_realtime(self) -> None:
         """Start watching, and never let a failure here stop the window opening.
@@ -845,8 +856,13 @@ class AVGuardApp(tb.Window):
             # twice, once as "not moved" for a file the other had moved.
             self.status_var.set("Real-time protection runs in the other AVGuard window")
             return
+        targets = self._watch_targets()
+        # Folders not there yet (a USB drive, a share mounted after logon):
+        # the health tick watches each once it appears. Only these: one that
+        # exists and still could not be watched is not retried every tick.
+        self._awaiting_targets = [t for t in targets if not t.is_dir()]
         try:
-            watched = self.monitor.start(self._watch_targets())
+            watched = self.monitor.start(targets)
         except Exception:
             log.exception("real-time protection could not start")
             watched = []
@@ -854,10 +870,16 @@ class AVGuardApp(tb.Window):
         refused = list(getattr(self.monitor, "refused", []))
         if watched:
             self.status_var.set("Real-time protection on")
+            gaps = self._watch_gaps()
             if refused:
                 self._banner(
                     f"Not watching {refused[0]} - it is inside AVGuard's own "
                     "folder, which is never scanned.", "inverse-warning")
+            elif gaps:
+                self._banner(f"Not protecting {gaps[0]}"
+                             + (" - it will be watched when it appears." if "does not exist" in gaps[0]
+                                else ". Remove the exclusion in Settings to protect it."),
+                             "inverse-warning")
         else:
             log.warning("no folder could be watched; real-time protection is off")
             # The switch shows what runs; the user's setting is left alone, so
@@ -873,6 +895,7 @@ class AVGuardApp(tb.Window):
         if self.realtime_var.get():
             self._start_realtime()
         else:
+            self._awaiting_targets = []
             self.monitor.stop()
             self.status_var.set("Real-time protection off")
         try:
@@ -1155,6 +1178,22 @@ class AVGuardApp(tb.Window):
         minimum; restoring the protection is the point.
         """
         try:
+            # A configured folder that was not there when protection started
+            # (a USB drive, a share mounted after logon) is watched once it
+            # appears; it used to be dropped for the session, unsaid.
+            if self.has_lock and self.cfg.realtime_enabled and not self._shutting_down:
+                appeared = [t for t in getattr(self, "_awaiting_targets", []) if t.is_dir()]
+                if appeared:
+                    log.info("now watching %s, which was not there when protection started",
+                             ", ".join(map(str, appeared)))
+                    if self.monitor.running:
+                        self.monitor.stop()
+                    self._start_realtime()
+                    now = [t for t in appeared if t in self.monitor.watched]
+                    if self.monitor.running:
+                        self.realtime_var.set(True)
+                    if now:                  # not one refused as AVGuard's own folder
+                        self._banner(f"Now watching {now[0]}.", "inverse-info")
             if self.realtime_var.get() and self._watch_targets():
                 broken = self.monitor.broken_links()
                 if broken and not self._shutting_down:
@@ -1314,10 +1353,13 @@ class AVGuardApp(tb.Window):
         total_files = len(self.scanner.rule_sources)
         counts = self.scanner.pack_rule_counts
         imported = sum(counts.values())
+        broken = self.scanner.broken_user_rules
+        left_out = (f"; {len(broken)} of your rule files did not compile and were left out "
+                    f"({', '.join(sorted(broken)[:3])}): see the log") if broken else ""
         if not imported:
-            return f"{total_rules:,} rules from {total_files} file(s), all shipped with AVGuard"
+            return f"{total_rules:,} rules from {total_files} file(s), all shipped with AVGuard{left_out}"
         return (f"{total_rules:,} rules from {total_files} file(s): the shipped "
-                f"ruleset plus {imported:,} loaded from {len(counts)} pack(s)")
+                f"ruleset plus {imported:,} loaded from {len(counts)} pack(s){left_out}")
 
     def _describe_packs(self) -> str:
         packs = self.scanner.packs.packs()
@@ -1531,14 +1573,17 @@ class AVGuardApp(tb.Window):
         rules_ok = self.scanner.rules is not None
         broken = self.monitor.broken_links()
         watching = not broken and bool(self.monitor.watched)
+        gaps = self._watch_gaps() if self.has_lock and self.cfg.realtime_enabled else []
         workers = self.monitor.pool.alive_workers
         checks = [
-            ("Detection rules", rules_ok, self._describe_rules() if rules_ok
+            ("Detection rules", rules_ok and not self.scanner.broken_user_rules,
+             self._describe_rules() if rules_ok
              else "FAILED TO COMPILE - most detection is off. See the log."),
             ("Rule packs", self._packs_ok(), self._describe_packs()),
-            ("Real-time protection", watching or not self.has_lock,
+            ("Real-time protection", (watching and not gaps) or not self.has_lock,
              "runs in the other AVGuard window" if not self.has_lock
-             else f"watching {len(self.monitor.watched)} folder(s)" if watching
+             else f"watching {len(self.monitor.watched)} folder(s)"
+             + ("; NOT protecting " + "; ".join(gaps) if gaps else "") if watching
              else ("; ".join(broken) if broken else "not running")),
             ("Scan workers", (not self.monitor.watched) or workers > 0,
              f"{workers} alive" if workers else "idle, nothing to do"),
@@ -1584,6 +1629,16 @@ class AVGuardApp(tb.Window):
         """
         pattern = dialogs.glob_for(folder)
         if pattern in self.cfg.excluded_globs:
+            return
+        newly = [gap for gap in self._watch_gaps([*self.cfg.excluded_globs, pattern])
+                 if gap not in self._watch_gaps()]
+        if newly and Messagebox.yesno(
+                f"{folder} is a folder real-time protection watches. Excluding it means nothing "
+                "that arrives there is scanned again: real-time protection would then protect "
+                "nothing there." + chr(10) + chr(10)
+                + "To stop this one file being flagged, restore it from the Quarantine tab "
+                  "instead; that remembers its exact bytes. Exclude the whole folder anyway?",
+                "Exclude a watched folder?", parent=self) != "Yes":
             return
         try:
             # Live only once saved: it was appended first, and a failed save

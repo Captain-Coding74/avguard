@@ -231,5 +231,28 @@ class TestNothingReachesTheScanPath(ForwardCase):
         self.assertEqual(config.Config().event_forward_url, "")
 
 
+
+class TestTheCommandLineForwardsWhatItRecords(ForwardCase):
+    """Round six: the daily integrity check and the startup snapshot run from
+    the command line, and their events went to History only, while the README
+    said every event is POSTed once a forwarding URL is set."""
+
+    def test_an_event_recorded_by_a_verb_reaches_the_receiver(self):
+        from avguard.__main__ import _event_store
+        receiver = Receiver()
+        self.addCleanup(receiver.stop)
+        cfg = config.Config(event_forward_url=receiver.url)
+        with _event_store(cfg) as events:
+            events.record(Event(kind="fim_changed", path="C:/watched/a.dll", detail={"roots": 1}))
+        with receiver.lock:                 # drained before the verb returned
+            kinds = [body["kind"] for body in receiver.bodies]
+        self.assertEqual(kinds, ["fim_changed"])
+
+    def test_without_a_url_nothing_is_sent_and_history_still_records(self):
+        from avguard.__main__ import _event_store
+        with _event_store(config.Config()) as events:
+            self.assertIsNone(events.forwarder)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

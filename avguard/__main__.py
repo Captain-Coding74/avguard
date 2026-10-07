@@ -7,6 +7,7 @@ which is what makes it testable and scriptable.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import logging
 import sys
@@ -23,7 +24,27 @@ from .quarantine import QuarantineError, QuarantineStore, RestoreIncomplete
 from .scanner import Level, Scanner
 
 
-def _console_scan(target: Path, quarantine_threats: bool, verbose: bool,
+@contextlib.contextmanager
+def _event_store(cfg: config.Config | None = None):
+    """History for a command-line verb, forwarded as the window's is when a
+    forwarding URL is set, and drained before the verb returns. The daily
+    integrity check and startup snapshot run here, and their events went to
+    History only while the README said every event is POSTed."""
+    from . import forward
+    from .events import EventStore
+    url = (cfg or config.Config.load()).event_forward_url
+    forwarder = forward.EventForwarder(url) if url else None
+    try:
+        yield EventStore(forwarder=forwarder)
+    finally:
+        if forwarder is not None:
+            if not forwarder.wait_idle(10):
+                logging.getLogger("avguard.forward").warning(
+                    "%d event(s) not delivered before the command ended", forwarder.pending)
+            forwarder.stop()
+
+
+def _console_scan(target: Path | list[Path], quarantine_threats: bool, verbose: bool,
                   pause: bool = False, explain_each: bool = False, as_json: bool = False) -> int:
     logsetup.configure(level=logging.DEBUG if verbose else logging.INFO)
     if sys.stdout is not None:
@@ -108,7 +129,8 @@ def _console_scan(target: Path, quarantine_threats: bool, verbose: bool,
             for verdict in threats:
                 account(verdict, quarantined=moved.get(verdict.path, False))
 
-    scanner.scan_tree(target, on_verdict=report)
+    for one in (target if isinstance(target, list) else [target]):
+        scanner.scan_tree(one, on_verdict=report)
     cloud.save_cache()
 
     say()
@@ -135,8 +157,10 @@ def _console_scan(target: Path, quarantine_threats: bool, verbose: bool,
             )
             accounts_of_threats({})
             return 2
-        from .events import Event, EventStore
+        from .events import Event
         moved: dict = {}
+        history = contextlib.ExitStack()
+        events = history.enter_context(_event_store(cfg))
         try:
             store.reconcile()
             say()
@@ -151,7 +175,7 @@ def _console_scan(target: Path, quarantine_threats: bool, verbose: bool,
                     moved[verdict.path] = True
                     say(f"quarantined: {verdict.path}")
                     # In History, as a quarantine by the window is: it was not.
-                    EventStore().record(Event(kind="quarantined", path=str(verdict.path),
+                    events.record(Event(kind="quarantined", path=str(verdict.path),
                                               level=verdict.level.value, score=verdict.score,
                                               reasons=list(verdict.reasons),
                                               detail={**detail, "state": explain_module.QUARANTINED}))
@@ -160,12 +184,13 @@ def _console_scan(target: Path, quarantine_threats: bool, verbose: bool,
                     print(f"could not quarantine {verdict.path}: {exc}", file=sys.stderr)
         finally:
             lock.release()
+            history.close()
         accounts_of_threats(moved)
     elif threats:
         say("\nNothing was moved. Pass --quarantine to act on these findings.")
 
     if pause:
-        _pause_for_the_user(target, transcript)
+        _pause_for_the_user(target[0] if isinstance(target, list) else target, transcript)
     return 1 if threats else 0
 
 
@@ -347,7 +372,6 @@ def unknown_text() -> str:
 def _fim_command(args) -> int:
     """Integrity monitoring from a terminal. Reports; never moves a file."""
     from datetime import datetime
-    from .events import EventStore
     # The daily check runs this under pythonw, which has no stderr: what went
     # wrong has to reach the log file, as the window's check does.
     logsetup.configure(level=logging.DEBUG if args.verbose else logging.INFO)
@@ -356,7 +380,8 @@ def _fim_command(args) -> int:
 
     if args.fim_baseline:
         roots = [Path(r) for r in args.fim_baseline]
-        report = store.baseline(roots, events=EventStore())
+        with _event_store(cfg) as events:
+            report = store.baseline(roots, events=events)
         for problem in report.errors:
             print(f"  skipped: {problem}", file=sys.stderr)
         if report.in_use:
@@ -382,7 +407,8 @@ def _fim_command(args) -> int:
         return 0
 
     if args.fim_check:
-        report = store.check(fast=args.fast, events=EventStore())
+        with _event_store(cfg) as events:
+            report = store.check(fast=args.fast, events=events)
         if report.integrity == fim.INTEGRITY_NO_BASELINE:
             print("No baseline. Create one with:  python -m avguard --fim-baseline <folder>",
                   file=sys.stderr)
@@ -543,7 +569,6 @@ def _autoruns_unreadable(store) -> bool:
 def _autoruns_command(args) -> int:
     """What starts with Windows, from a terminal. Records; changes nothing."""
     from datetime import datetime
-    from .events import EventStore
     # The daily task runs this under pythonw, which has no stderr: what went
     # wrong has to reach the log file, as the window's snapshot does.
     logsetup.configure(level=logging.DEBUG if args.verbose else logging.INFO)
@@ -552,7 +577,8 @@ def _autoruns_command(args) -> int:
 
     if args.autoruns_snapshot:
         collected = autoruns.collect()
-        report = store.snapshot(collected, events=EventStore())
+        with _event_store() as events:
+            report = store.snapshot(collected, events=events)
         if args.verbose or report.snapshot is None:
             for kind in autoruns.KINDS:
                 print(f"  {kind:8} {collected.counts.get(kind, 0):5} in {collected.seconds.get(kind, 0) * 1e3:7.0f} ms")
@@ -765,6 +791,9 @@ def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="avguard", description="A small file scanner.")
     parser.add_argument("--scan", metavar="PATH", type=Path,
                         help="scan a file or folder in the console and exit")
+    parser.add_argument("--scan-watched", action="store_true",
+                        help="scan every folder real-time protection watches, as config.json "
+                             "names them (what the daily scheduled scan runs), and exit")
     parser.add_argument("--explain", action="store_true",
                         help="with --scan: an account of each flagged file, each finding named "
                              "a fact or an opinion with its weight, and the arithmetic that decided")
@@ -914,15 +943,16 @@ def _main(argv: list[str] | None = None) -> int:
         if not lock.acquire():
             print(f"Another AVGuard is running (pid {lock.owner_pid or 0}).", file=sys.stderr)
             return 2
-        from .events import Event, EventStore
+        from .events import Event
         held = store.get(args.restore)
 
         def record_restore(target) -> None:
             # History, as the window records it: a restore is the decision
             # that makes these bytes clean everywhere on this PC.
             if held is not None:
-                EventStore().record(Event(kind="restored", path=str(target), reasons=list(held.reasons),
-                                          detail={"sha256": held.sha256, "from": "quarantine"}))
+                with _event_store() as events:
+                    events.record(Event(kind="restored", path=str(target), reasons=list(held.reasons),
+                                        detail={"sha256": held.sha256, "from": "quarantine"}))
         try:
             store.reconcile()
             target = store.restore(args.restore)
@@ -969,7 +999,7 @@ def _main(argv: list[str] | None = None) -> int:
         return 0 if ok else 1
 
     if args.schedule:
-        target = args.schedule_path or (Path.home() / "Downloads")
+        target = args.schedule_path          # None: the watched folders, read when the task runs
         if args.schedule == "status":
             state = scheduling.status()
             print(f"Starts with Windows : {'yes' if state.starts_with_windows else 'no'}")
@@ -981,7 +1011,8 @@ def _main(argv: list[str] | None = None) -> int:
             ok_a, detail_a = scheduling.enable_start_with_windows()
             ok_b, detail_b = scheduling.enable_scheduled_scan(target)
             print(f"Start with Windows : {'yes' if ok_a else 'FAILED - ' + detail_a}")
-            print(f"Daily scan of {target}: {detail_b if ok_b else 'FAILED - ' + detail_b}")
+            print(f"Daily scan of {target or 'the watched folders'}: "
+                  f"{detail_b if ok_b else 'FAILED - ' + detail_b}")
             print("\nThe scheduled scan only reports. It never moves files.")
             return 0 if (ok_a and ok_b) else 1
         ok_a, detail_a = scheduling.disable_start_with_windows()
@@ -994,6 +1025,14 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.packs:
         return _packs_command(args)
+
+    if args.scan_watched:
+        targets = [t for t in config.watch_targets(config.Config.load()) if t.exists()]
+        if not targets:
+            print("no watched folder exists to scan", file=sys.stderr)
+            return 2
+        return _console_scan(targets, args.quarantine, args.verbose, pause=args.pause,
+                             explain_each=args.explain, as_json=args.json)
 
     if args.scan:
         if not args.scan.exists():

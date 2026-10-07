@@ -699,6 +699,22 @@ class TestUserRuleNamespaces(TempCase):
         matched = [m.rule for m in scanner.rules.match(data=b"...zzzQQ...")]
         self.assertIn("Mine", matched)
 
+    def test_a_typo_in_one_of_your_files_leaves_the_shipped_rules_on(self):
+        """Round six: one user file that did not compile aborted the combined
+        compile and switched every shipped rule off for the session."""
+        from avguard.scanner import EICAR
+        (self.user_rules / "extra.yara").write_text(
+            'rule Extra {\n  meta:\n    description = "x"\n    severity = "low"\n'
+            '  strings:\n    $a = { 51 51 51 51 }\n  condition:\n    $a\n}\n', encoding="utf-8")
+        (self.user_rules / "typo.yara").write_text("rule Typo {\n  condition:\n    $nope\n}\n", encoding="utf-8")
+        scanner = self.scanner()
+        self.assertIsNotNone(scanner.rules, "the shipped rules went down with the typo")
+        matched = {m.rule for m in scanner.rules.match(data=EICAR + b" QQQQ")}
+        self.assertTrue({"Eicar_Test_File", "Extra"} <= matched, matched)
+        self.assertEqual(list(scanner.broken_user_rules), ["typo.yara"])
+        again = self.scanner()                     # the compiled ruleset, adopted
+        self.assertEqual(list(again.broken_user_rules), ["typo.yara"])
+
     def test_both_files_are_reported_as_sources(self):
         (self.user_rules / "extra.yara").write_text(
             'rule Extra {\n  meta:\n    description = "x"\n    severity = "low"\n'
@@ -1748,6 +1764,123 @@ class TestLoopbackShares(unittest.TestCase):
                      bs * 2 + "localhost" + bs + "CC$" + bs + "x"):
             with self.subTest(text=text):
                 self.assertEqual(_canonical_spelling(Path(text)), Path(text))
+
+
+class TestTheWatchedFoldersAreTheProtectedOnes(TempCase):
+    """Round six: a watched folder that was not there at logon was dropped
+    for the session, and one covered by an exclusion was watched while
+    nothing in it was scanned; Health said "watching 1 folder(s)", OK, for
+    both. "Exclude this folder" on a detection in Downloads did it silently."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        try:
+            from avguard import gui
+        except ImportError:
+            self.skipTest("GUI dependencies are not installed")
+        from types import SimpleNamespace
+        self.gui = gui
+        self.ns = SimpleNamespace
+        self.here = self.tmp / "here"
+        self.here.mkdir()
+        self.later = self.tmp / "later"
+        self.banners: list[str] = []
+
+    def window(self, **cfg):
+        from avguard import dialogs
+        self.cfg = config.Config(watch_paths=[str(self.here), str(self.later)], **cfg)
+        self.cfg.save(self.tmp / "config.json")
+        fake = self.ns(cfg=self.cfg, has_lock=True, _shutting_down=False,
+                       _banner=lambda text, style="": self.banners.append(text),
+                       status_var=self.ns(set=lambda text: None),
+                       realtime_var=self.ns(get=lambda: True, set=lambda value: None),
+                       cache=self.ns(invalidate=lambda folder: None), after=lambda *a: None)
+        fake._watch_targets = lambda: config.watch_targets(fake.cfg)
+        fake._watch_gaps = lambda globs=None: self.gui.AVGuardApp._watch_gaps(fake, globs)
+        fake._start_realtime = lambda: self.gui.AVGuardApp._start_realtime(fake)
+        fake._check_realtime_health = lambda: None
+        fake.monitor = _FakeMonitor()
+        self.glob_for = dialogs.glob_for
+        return fake
+
+    def test_a_missing_or_excluded_folder_is_named(self):
+        fake = self.window()
+        self.assertEqual(self.gui.AVGuardApp._watch_gaps(fake), [f"{self.later} does not exist"])
+        gaps = self.gui.AVGuardApp._watch_gaps(fake, [self.glob_for(self.here)])
+        self.assertIn(f"{self.here} is excluded, so nothing in it is scanned", gaps)
+
+    def test_a_folder_that_appears_later_is_watched_once(self):
+        fake = self.window()
+        self.gui.AVGuardApp._start_realtime(fake)
+        self.assertEqual(fake.monitor.watched, [self.here])
+        self.assertTrue(any("will be watched when it appears" in b for b in self.banners), self.banners)
+        self.gui.AVGuardApp._check_realtime_health(fake)
+        self.assertEqual(fake.monitor.starts, 1, "restarted with nothing new to watch")
+        self.later.mkdir()
+        self.gui.AVGuardApp._check_realtime_health(fake)
+        self.assertEqual(fake.monitor.watched, [self.here, self.later])
+        self.assertIn(f"Now watching {self.later}.", self.banners)
+        self.gui.AVGuardApp._check_realtime_health(fake)
+        self.assertEqual(fake.monitor.starts, 2, "restarted on every tick")
+
+    def test_a_folder_that_exists_but_cannot_be_watched_is_not_retried_each_tick(self):
+        fake = self.window()
+        fake.monitor.unwatchable = {self.here}
+        self.later.mkdir()
+        self.gui.AVGuardApp._start_realtime(fake)
+        for _ in range(3):
+            self.gui.AVGuardApp._check_realtime_health(fake)
+        self.assertEqual(fake.monitor.starts, 1)
+
+    def test_excluding_a_watched_folder_asks_first(self):
+        fake = self.window()
+        with mock.patch.object(self.gui.Messagebox, "yesno", return_value="No") as asked, \
+                mock.patch.object(config.Config, "save_changes") as saved:
+            self.gui.AVGuardApp._exclude_folder(fake, self.here)
+        self.assertIn("real-time protection watches", asked.call_args.args[0])
+        saved.assert_not_called()
+        other = self.tmp / "elsewhere"
+        other.mkdir()
+        with mock.patch.object(self.gui.Messagebox, "yesno") as asked, \
+                mock.patch.object(config.Config, "save_changes") as saved:
+            self.gui.AVGuardApp._exclude_folder(fake, other)
+        asked.assert_not_called()
+        saved.assert_called_once()
+
+    def test_the_rules_row_names_a_file_left_out(self):
+        scanner = self.ns(rules=[1, 2, 3], rule_sources=[1, 2], pack_rule_counts={},
+                          broken_user_rules={"typo.yara": "undefined string"})
+        line = self.gui.AVGuardApp._describe_rules(self.ns(scanner=scanner))
+        self.assertIn("typo.yara", line)
+        self.assertIn("left out", line)
+
+
+class _FakeMonitor:
+    """What the window asks of RealtimeMonitor, and nothing else."""
+
+    def __init__(self) -> None:
+        self.watched: list[Path] = []
+        self.refused: list[Path] = []
+        self.unwatchable: set[Path] = set()
+        self.starts = 0
+
+    @property
+    def running(self) -> bool:
+        return bool(self.watched)
+
+    def start(self, paths):
+        self.starts += 1
+        self.watched = [p for p in paths if p.is_dir() and p not in self.unwatchable]
+        return list(self.watched)
+
+    def stop(self) -> None:
+        self.watched = []
+
+    def broken_links(self):
+        return [] if self.watched else ["the folder watcher is not running"]
+
+    def recover(self) -> bool:
+        return False
 
 
 if __name__ == "__main__":

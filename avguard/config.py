@@ -378,6 +378,16 @@ class Config:
         return os.getenv("VT_API_KEY") or None
 
 
+def watch_targets(cfg: "Config") -> list[Path]:
+    """The folders real-time protection watches, and the daily scan scans:
+    the user's, or Downloads when they named none. One answer for both, so
+    "the watched folders" means the same folders in the window and the task."""
+    if cfg.watch_paths:
+        return [Path(p) for p in cfg.watch_paths]
+    downloads = Path.home() / "Downloads"
+    return [downloads] if downloads.is_dir() else []
+
+
 def migrate_legacy_data() -> bool:
     """Move a `data/` folder from the program directory to the new home.
 

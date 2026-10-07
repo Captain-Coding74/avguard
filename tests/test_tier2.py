@@ -97,6 +97,99 @@ class TempCase(unittest.TestCase):
         return path
 
 
+class TestAHostileArchiveStillGetsAVerdict(TempCase):
+    """Round six: zipfile raises UnicodeDecodeError for a name flagged UTF-8
+    that is not, and NotImplementedError for a version it does not know;
+    both escaped scan(), and the file got no verdict at all."""
+
+    def crafted(self, how: str, nested: bool = False) -> Path:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:          # stored: the marker is in the bytes
+            archive.writestr("readme.txt", SELFTEST_MARKER)
+            archive.writestr("other.txt", "nothing")
+        data = bytearray(buffer.getvalue())
+        second = data.find(b"PK\x01\x02", data.find(b"PK\x01\x02") + 4)
+        if how == "name":
+            data[second + 9] |= 0x08                           # flag 0x800: the name is UTF-8
+            data[second + 46:second + 46 + len("other.txt")] = b"\xff" * len("other.txt")
+        else:
+            data[second + 6] = 0xFF                            # version needed: 25.5
+        if nested:
+            outer = io.BytesIO()
+            with zipfile.ZipFile(outer, "w", zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("inner.zip", bytes(data))
+                archive.writestr("readme2.txt", SELFTEST_MARKER)
+            data = outer.getvalue()
+        path = self.tmp / f"{how}{'-nested' if nested else ''}.zip"
+        path.write_bytes(bytes(data))
+        return path
+
+    def test_each_shape_is_scanned_not_raised(self):
+        for how in ("name", "version"):
+            for nested in (False, True):
+                with self.subTest(how=how, nested=nested):
+                    target = self.crafted(how, nested)
+                    archives.inspect(target)                    # no exception
+                    self.assertIs(self.scanner().scan(target, use_cache=False).level, Level.MALICIOUS)
+                    found = []
+                    self.scanner().scan_tree(target.parent if False else target, on_verdict=found.append)
+                    self.assertEqual(len(found), 1, "the file got no verdict")
+
+    def test_a_stage_that_raises_costs_its_findings_not_the_verdict(self):
+        scanner = self.scanner()
+        clean = self.tmp / "notes.txt"
+        clean.write_text("nothing at all here", encoding="utf-8")
+        marked = self.tmp / "marked.txt"
+        marked.write_bytes(SELFTEST_MARKER)
+        with mock.patch.object(Scanner, "_archive_findings", side_effect=RuntimeError("parser bug")):
+            nothing = scanner.scan(clean)
+            something = scanner.scan(marked)
+        self.assertIs(nothing.level, Level.ERROR, "an examination that did not finish is not CLEAN")
+        self.assertTrue(any("archive stage" in r for r in nothing.reasons))
+        self.assertIs(something.level, Level.MALICIOUS, "the signature still decides")
+        self.assertIsNone(scanner.cache.get(clean, clean.stat().st_size, clean.stat().st_mtime_ns),
+                          "an unfinished verdict was cached")
+
+
+class TestHistoryAndTheCacheSurviveDamage(TempCase):
+    """Round six: a torn multi-byte tail or one mistyped record stopped
+    History opening for good; one malformed scan-cache entry crashed every
+    console scan after its work and the cache could never be saved again."""
+
+    def test_history_reads_past_what_it_cannot_use(self):
+        from avguard.events import Event, EventStore
+        store = EventStore(self.tmp / "events.jsonl")
+        store.record(Event(kind="detection", path="C:/งาน/ไฟล์.exe", level="malicious", reasons=["x"]))
+        with open(store.path, "ab") as handle:
+            handle.write(json.dumps([1, 2]).encode() + b"\n")
+            handle.write(json.dumps({"kind": "detection", "at": 5}).encode() + b"\n")
+            handle.write(json.dumps({"kind": "detection", "reasons": None}).encode() + b"\n")
+            handle.write('{"kind": "detection", "path": "C:/งาน'.encode("utf-8")[:-2])   # torn mid-character
+        events = store.read()
+        self.assertEqual([e.path for e in events], ["C:/งาน/ไฟล์.exe"])
+        self.assertEqual(len(store.read(kinds={"detection"})), 1)
+        self.assertIsInstance(store.summary()["kinds"], dict)       # opens, does not raise
+
+    def test_a_malformed_cache_entry_is_dropped_and_the_cache_still_saves(self):
+        path = self.tmp / "cache.json"
+        scanner = self.scanner()
+        scanner.rekey_cache()                                     # a cache that may save
+        target = self.tmp / "a.txt"
+        target.write_text("hello", encoding="utf-8")
+        scanner.scan(target)
+        scanner.cache.save()
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw["entries"]["bad-list"] = [1, 2]
+        raw["entries"]["bad-level"] = {"level": "nonsense", "at": 1.0, "reasons": []}
+        raw["entries"]["bad-at"] = {"level": "clean", "at": None, "reasons": []}
+        path.write_text(json.dumps(raw), encoding="utf-8")
+        again = self.scanner()
+        again.rekey_cache()
+        self.assertEqual(len(again.cache), 1)
+        again.cache.save()                                        # prune() over every entry
+        self.assertIs(again.scan(target).level, Level.CLEAN)
+
+
 class TestVirusTotalIsPartOfWhatAVerdictMeans(TempCase):
     """Round six: whether VirusTotal is asked was not in the cache's
     generation, so a file cached CLEAN with lookups off replayed CLEAN for

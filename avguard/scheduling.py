@@ -150,8 +150,14 @@ def scheduled_scan_exists() -> bool:
     return ok
 
 
-def enable_scheduled_scan(target: Path, time_of_day: str = "12:00") -> tuple[bool, str]:
-    """Create a daily per-user scan task.
+def enable_scheduled_scan(target: Path | None = None, time_of_day: str = "12:00") -> tuple[bool, str]:
+    """Create a daily per-user scan task: of `target`, or, with None, of the
+    watched folders as config.json names them on the day it runs.
+
+    "Scan the watched folders once a day" scheduled a scan of the first of
+    them, and kept scanning it after the list changed. --scan-watched reads
+    the list when the task runs, and keeps the command short: /TR holds 261
+    characters, too few for several folders spelled out.
 
     The task only ever *reports*. It deliberately does not pass --quarantine:
     a scan running unattended, with nobody to read the result, is the last
@@ -160,13 +166,13 @@ def enable_scheduled_scan(target: Path, time_of_day: str = "12:00") -> tuple[boo
     if sys.platform != "win32":
         return False, "only supported on Windows"
 
-    command = task_command("--scan", f'"{target}"')
+    command = task_command("--scan-watched") if target is None else task_command("--scan", f'"{target}"')
 
     ok, output = _run(["schtasks", "/Create", "/F", "/SC", "DAILY",
                        "/TN", TASK_NAME, "/TR", command, "/ST", time_of_day])
     if not ok:
         return False, output or "schtasks refused to create the task"
-    log.info("scheduled a daily scan of %s at %s", target, time_of_day)
+    log.info("scheduled a daily scan of %s at %s", target or "the watched folders", time_of_day)
     return True, f"daily at {time_of_day}"
 
 

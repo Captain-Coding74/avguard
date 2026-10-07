@@ -373,6 +373,16 @@ def shannon_entropy(histogram: Sequence[int], total: int) -> float:
     return result
 
 
+def _cache_entry_ok(value) -> bool:
+    if not isinstance(value, dict):
+        return False
+    at = value.get("at", 0)
+    reasons = value.get("reasons", [])
+    return (value.get("level") in {level.value for level in Level}
+            and isinstance(at, (int, float)) and not isinstance(at, bool)
+            and isinstance(reasons, list) and isinstance(value.get("sha256", ""), str))
+
+
 class ScanCache:
     """Remembers verdicts so an unchanged file is not scanned twice.
 
@@ -410,8 +420,8 @@ class ScanCache:
         MALICIOUS would be replayed without ever reopening the file.
         """
         try:
-            raw = json.loads(self._path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            raw = json.loads(self._path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
             self._entries = {}
             return
 
@@ -431,7 +441,14 @@ class ScanCache:
             return
 
         entries = raw.get("entries")
-        self._entries = entries if isinstance(entries, dict) else {}
+        entries = entries if isinstance(entries, dict) else {}
+        # Each entry as put() writes it, or dropped: one that was not a dict
+        # crashed prune() at the end of every scan, so the cache could never
+        # be saved again and every console scan exited 1 after its work.
+        kept = {key: value for key, value in entries.items() if _cache_entry_ok(value)}
+        if len(kept) != len(entries):
+            log.warning("scan cache: %d malformed entr(y/ies) dropped", len(entries) - len(kept))
+        self._entries = kept
 
     def prune(self, now: float | None = None) -> int:
         """Drop entries that are too old, then the oldest if still over the cap.
@@ -565,6 +582,9 @@ class Scanner:
         # is digested at all.
         self._tlsh_refs = self.iocs.tlsh_references()
         self.broken_packs: dict[str, str] = {}
+        # The user's own rule files that did not compile, by name, left out
+        # of the ruleset rather than taking the shipped rules down with them.
+        self.broken_user_rules: dict[str, str] = {}
         # Rules each pack contributed to the loaded ruleset, counted from its
         # compiled object. The pack index's rule_count is what was measured at
         # install; this is what is running now, which is the number Health
@@ -774,13 +794,26 @@ class Scanner:
                       self.rules_path.parent, config.USER_RULES_DIR)
             return False
 
-        # Stage one: the rules this program answers for. If THESE do not
-        # compile, that is the loud failure it has always been.
+        # Stage one: the shipped rules. If THESE do not compile, that is the
+        # loud failure it has always been. Then each of the user's own files
+        # on its own, as packs are: one typo there aborted the combined
+        # compile and switched off every shipped rule for the session.
+        user_dir = config.USER_RULES_DIR.resolve()
+        shipped = [p for p in own if p.resolve().parent != user_dir]
+        user = [p for p in own if p.resolve().parent == user_dir]
         try:
-            yara.compile(filepaths=_namespaces(own))
+            yara.compile(filepaths=_namespaces(shipped or own))
         except yara.Error as exc:
             self._report_rule_failure(f"rules failed to compile: {exc}")
             return False
+        broken_user: dict[str, str] = {}
+        for path in user:
+            try:
+                yara.compile(filepaths=_namespaces([path]))
+            except yara.Error as exc:
+                broken_user[path.name] = str(exc)
+                log.error("your rule file %s does not compile and is left out: %s", path.name, exc)
+        own = [p for p in own if p.name not in broken_user or p not in user]
 
         # Stage two: each pack on its own. One unparsable file -- a truncated
         # download, an upstream edit, a disk error -- used to abort the single
@@ -838,6 +871,7 @@ class Scanner:
         self._ruleset = Ruleset(rules=candidate, untrusted=self._derive_cap(pack_of),
                                 pack_of=pack_of, sources=tuple(sources), pack_state=state)
         self.broken_packs = broken
+        self.broken_user_rules = broken_user
         self.pack_rule_counts = counts
         shipped = [p.name for p in sources if str(p.resolve()) not in self._ruleset.untrusted]
         imported = len(sources) - len(shipped)
@@ -901,6 +935,8 @@ class Scanner:
                                  dict(manifest.get("pack_by_namespace") or {}).items()}
             broken = {str(k): str(v) for k, v in
                       dict(manifest.get("broken_packs") or {}).items()}
+            broken_user = {str(k): str(v) for k, v in
+                           dict(manifest.get("broken_user_rules") or {}).items()}
             counts = {str(k): int(v) for k, v in
                       dict(manifest.get("pack_rule_counts") or {}).items()}
         except (TypeError, ValueError):
@@ -939,6 +975,7 @@ class Scanner:
                                 pack_of=pack_by_namespace, sources=tuple(sources),
                                 pack_state=self._pack_state_now())
         self.broken_packs = broken
+        self.broken_user_rules = broken_user
         self.pack_rule_counts = counts
         log.info("loaded the ruleset compiled last time (%d file(s), all unchanged)",
                  len(sources))
@@ -998,6 +1035,7 @@ class Scanner:
             "sources": [str(path) for path in sources],
             "pack_by_namespace": self._pack_by_namespace,
             "broken_packs": self.broken_packs,
+            "broken_user_rules": self.broken_user_rules,
             "pack_rule_counts": self.pack_rule_counts,
         }
         try:
@@ -1584,12 +1622,22 @@ class Scanner:
 
         # A file over the buffer limit is opened again for YARA, and an
         # archive is opened again to be inspected; either can find it gone.
-        try:
-            findings.extend(self._yara_matches(facts, ruleset))
-            findings.extend(self._pe_findings(facts))
-            findings.extend(self._archive_findings(facts, ruleset))
-        except FileNotFoundError:
-            return Verdict(path, Level.SKIPPED, [VANISHED_DURING])
+        # Each stage on its own: one that raises (a parser meeting a file it
+        # was not built for) costs its own findings, never the others' or
+        # the verdict. A crafted zip used to raise out of here, and the file
+        # got no verdict at all: "Threats: 0", a byte signature in a sibling
+        # member lost with it.
+        failed_stages: list[str] = []
+        for name, stage in (("YARA", lambda: self._yara_matches(facts, ruleset)),
+                            ("PE", lambda: self._pe_findings(facts)),
+                            ("archive", lambda: self._archive_findings(facts, ruleset))):
+            try:
+                findings.extend(stage())
+            except FileNotFoundError:
+                return Verdict(path, Level.SKIPPED, [VANISHED_DURING])
+            except Exception as exc:
+                log.exception("the %s stage failed on %s", name, path)
+                failed_stages.append(f"the {name} stage could not examine this file ({type(exc).__name__})")
 
         # Similarity to a known sample: the nearest reference, if it is near
         # enough. One finding, however many references are close -- ten
@@ -1650,6 +1698,13 @@ class Scanner:
         # and outside the cache, which keeps the conclusion only.
         extra = self._provenance_findings(path, facts.sha256, level)
         reasons = [f.describe() for f in findings]
+        if failed_stages:
+            # Not CLEAN on an examination that did not finish, and not cached:
+            # what was found still decides; nothing found is an error, said.
+            if level is Level.CLEAN:
+                level = Level.ERROR
+            return Verdict(path, level, reasons + failed_stages + [f.describe() for f in extra], facts,
+                           findings + extra, sha256=facts.sha256)
         verdict = Verdict(path, level, reasons + [f.describe() for f in extra], facts, findings + extra,
                           sha256=facts.sha256)
         if use_cache:
