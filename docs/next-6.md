@@ -219,8 +219,9 @@ after, the English twins unchanged.
 Measured and built 2026-10-07; the record is in ROADMAP.md under "The swap
 guard" and "The swap guard, second reading". The answer to the question
 below is "slow ones, and only slow ones": the Windows runner read the
-original address before the swap in 10 of 10 trials at 600 ms, 6 of 10 at
-200 ms, 4 of 6 at 400 ms and 0 of 16 at 0 to 50 ms (runs #67 and #69), and
+original address before the swap in 18 of 18 trials at 600 and 1000 ms,
+8 of 14 at 200 ms, 4 of 6 at 400 ms and 0 of 20 at 0 to 50 ms (runs #67,
+#69 and #70), and
 vendor reports put the event-driven clippers within milliseconds. Built
 anyway, at the owner's request ("do the clipboard-swap guard next"), with
 that limit and the other misses stated where the user reads it. The second

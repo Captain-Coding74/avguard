@@ -1423,8 +1423,14 @@ class TestTheWindowIntegration(unittest.TestCase):
         fake.cfg.paste_guard_enabled = True
         guard.source.available = False
         guard.source.unavailable_reason = "the privacy formats could not be registered"
-        self.assertEqual(self.gui.AVGuardApp._describe_paste_guard(fake),
-                         (True, "the privacy formats could not be registered"))
+        # Off Windows there is no clipboard to read, and that is fine; on
+        # Windows a reader that turned itself off is a guard that reads
+        # nothing while switched on. The platform is set both ways, so the
+        # Linux job checks the Windows answer too (run #70 found it did not).
+        for platform, healthy in (("linux", True), ("win32", False)):
+            with self.subTest(platform=platform), mock.patch.object(self.gui.sys, "platform", platform):
+                self.assertEqual(self.gui.AVGuardApp._describe_paste_guard(fake),
+                                 (healthy, "the privacy formats could not be registered"))
         guard.source.available = True
         guard.tick()
         healthy, text = self.gui.AVGuardApp._describe_paste_guard(fake)

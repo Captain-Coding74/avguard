@@ -1532,7 +1532,13 @@ then B warned; a second `electrum.exe` was trusted; `autohotkey64.exe` and
 `ditto.exe` from any folder were trusted; re-copying the original after a
 swap warned again and named the browser. All six probes give the right
 answer on this commit. `python3.13 -m unittest discover -s tests`: 762 ->
-786, both suites green.
+786. Run #70 then failed on Windows only: the Health-row test asserted the
+off-Windows answer for a reader that turned itself off, and passed on Linux
+because it never set the platform; it now runs both platforms on either
+job. The same run printed the harness's new row: a swap 1000 ms after the
+copy was seen 4 of 4, and the 0, 200 and 600 ms rows repeated run #69
+(0, 2 and 4 of 4). Over runs #67, #69 and #70: 0 of 20 at 0 to 50 ms, 8 of
+14 at 200 ms, 4 of 6 at 400 ms, 18 of 18 at 600 ms or later.
 
 Corrections to the record above. `avguard/wallets.py` (9771c15) was
 written before the measurement and the check after it; the "+5 per write"
