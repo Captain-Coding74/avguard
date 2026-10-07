@@ -1618,6 +1618,72 @@ class TestTheWindowWithoutTheLock(TempCase):
         self.assertEqual(stopped, [1])
 
 
+class TestTheWindowsNetworkSwitches(TempCase):
+    """Round six: the daily blocklist check ran once per launch; turning
+    VirusTotal on never reached a file cached CLEAN; and the client kept a
+    Config the window had replaced."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        try:
+            from avguard import gui
+        except ImportError:
+            self.skipTest("GUI dependencies are not installed")
+        self.gui = gui
+
+    def test_the_feed_check_re_arms_itself(self):
+        from types import SimpleNamespace
+        scheduled, checked = [], []
+        fake = SimpleNamespace(_shutting_down=False, after=lambda ms, fn: scheduled.append(ms),
+                               _update_blocklist_feed=lambda: checked.append(1), _feed_tick=None)
+        self.gui.AVGuardApp._feed_tick(fake)
+        fake._update_blocklist_feed = lambda: 1 / 0                # a failure does not end the chain
+        self.gui.AVGuardApp._feed_tick(fake)
+        self.assertEqual(checked, [1])
+        self.assertEqual(scheduled, [self.gui.FEED_RECHECK_MS] * 2)
+
+    def test_the_virustotal_switch_rekeys_and_hands_the_client_the_config(self):
+        from types import SimpleNamespace
+        cfg = config.Config()
+        cfg.save(config.CONFIG_PATH)
+        rekeyed = []
+        fake = SimpleNamespace(cfg=cfg, cloud_var=SimpleNamespace(get=lambda: True, set=lambda v: None),
+                               cloud=SimpleNamespace(cfg=None),
+                               scanner=SimpleNamespace(rekey_cache=lambda: rekeyed.append(1) or 3, cache="new"),
+                               cache="old")
+        with mock.patch.dict(os.environ, {"VT_API_KEY": "test-key-not-real"}), \
+                mock.patch.object(self.gui, "Messagebox"):
+            self.gui.AVGuardApp._toggle_cloud(fake)
+        self.assertTrue(cfg.cloud_enabled)
+        self.assertEqual(rekeyed, [1], "a file cached CLEAN with lookups off would replay CLEAN")
+        self.assertEqual(fake.cache, "new")
+        self.assertIs(fake.cloud.cfg, cfg)
+
+
+class TestTheCommandLineRecordsWhatItMoves(TempCase):
+    """Round six: --scan --quarantine and --restore changed the store and
+    recorded nothing; History never showed either."""
+
+    def test_a_restore_from_the_command_line_is_in_history(self):
+        import contextlib
+        import io
+        import avguard.__main__ as cli
+        from avguard.events import EventStore
+        directory = config.QUARANTINE_DIR
+        store = QuarantineStore(directory=directory, index_path=config.QUARANTINE_INDEX,
+                                protection=SelfProtection([self.tmp / "prot"]))
+        victim = self.write("restored.docx", b"keep me")
+        record = store.quarantine(victim, ["a reason"])
+        events = EventStore()
+        before = len(events.read(kinds={"restored"}))
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = cli.main(["--restore", record.entry_id])
+        self.assertEqual(code, 0)
+        restored = events.read(kinds={"restored"})
+        self.assertEqual(len(restored) - before, 1)
+        self.assertEqual(restored[0].detail["sha256"], record.sha256)
+
+
 class TestTheLogSurvivesASecondProcess(TempCase):
     """Round six: on Windows the live log cannot be renamed while another
     AVGuard holds it; the standard rollover shifted the backups first, then

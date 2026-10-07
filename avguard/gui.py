@@ -52,6 +52,7 @@ MAX_DRAIN_PER_TICK = 200
 # status check could not see it.
 HEALTH_TICK_MS = 30_000
 FEED_TICK_MS = 5_000          # the daily blocklist check, once the window is up
+FEED_RECHECK_MS = 3_600_000   # then hourly; feed_due() holds it to one request a day
 # The paste guard's poll: one user32 call per tick, the clipboard opened only
 # when its sequence number has moved. On the Tk thread, no worker.
 CLIPBOARD_TICK_MS = 500
@@ -153,7 +154,7 @@ class AVGuardApp(tb.Window):
 
         self.after(UI_TICK_MS, self._pump)
         self.after(HEALTH_TICK_MS, self._check_realtime_health)
-        self.after(FEED_TICK_MS, self._update_blocklist_feed)
+        self.after(FEED_TICK_MS, self._feed_tick)
         self.after(CLIPBOARD_TICK_MS, self._tick_clipboard)
         self._refresh_quarantine()
 
@@ -905,6 +906,14 @@ class AVGuardApp(tb.Window):
         except OSError as exc:
             self.cloud_var.set(self.cfg.cloud_enabled)          # not saved, so not changed
             Messagebox.show_error(f"Could not save: {exc}", "AVGuard", parent=self)
+            return
+        # Whether VirusTotal is asked is part of what a cached verdict means:
+        # without this a file cached CLEAN with lookups off replayed CLEAN.
+        self.cloud.cfg = self.cfg
+        discarded = self.scanner.rekey_cache()
+        self.cache = self.scanner.cache
+        log.info("VirusTotal lookups %s; %d cached verdict(s) discarded",
+                 "on" if enabled else "off", discarded)
 
     # --------------------------------------------------------- quarantine
 
@@ -1076,7 +1085,7 @@ class AVGuardApp(tb.Window):
         self.events.record(Event(
             kind="reference", path=record.original_path,
             reasons=[f"marked as a known sample of {family}"],
-            detail={"digest": result.digest, "family": family, "entry_id": entry_id}))
+            detail={"digest": result.digest, "family": family}))       # what the consent names
         # The scanner reloads its references and re-keys the cache, so a copy
         # cached CLEAN a minute ago is measured against the new row next time.
         self.scanner.adopt_iocs()
@@ -1226,6 +1235,7 @@ class AVGuardApp(tb.Window):
     def _settings_saved(self) -> None:
         """Apply what can be applied live, and say what cannot."""
         self.scanner.cfg = self.cfg
+        self.cloud.cfg = self.cfg
         self._forwarding_changed()
         # Ticking "look inside .zip files" changes what a clean verdict means,
         # so every verdict stored under the old setting has to go.
@@ -1241,6 +1251,7 @@ class AVGuardApp(tb.Window):
             # watch folder another AVGuard process added in the meantime.
             self.cfg = config.Config.load()
             self.scanner.cfg = self.cfg
+            self.cloud.cfg = self.cfg        # it kept the old one: on in the window, off in the client
             self.monitor.stop()
             self._start_realtime()
         self._banner("Settings saved.", "inverse-success")
@@ -1364,6 +1375,19 @@ class AVGuardApp(tb.Window):
         by_source = ", ".join(f"{n:,} from {source}" for source, n in store.sources().items())
         return f"{total:,} hash(es) ({by_source}); {feed}{similarity}"
 
+    def _feed_tick(self) -> None:
+        """Re-armed every hour from `finally`, as the health tick is: the
+        "once a day" download ran once per launch, so a window left in the
+        tray for days fetched the 48-hour export once and then missed every
+        hash published after it."""
+        try:
+            self._update_blocklist_feed()
+        except Exception:
+            log.exception("the blocklist feed check failed")
+        finally:
+            if not self._shutting_down:
+                self.after(FEED_RECHECK_MS, self._feed_tick)
+
     def _update_blocklist_feed(self) -> None:
         """The daily feed check: off the GUI thread, and only when opted in.
 
@@ -1379,6 +1403,9 @@ class AVGuardApp(tb.Window):
                 result = iocs_module.scheduled_update(store, enabled=self.cfg.ioc_feed_enabled)
             except iocs_module.IocError as exc:
                 log.warning("blocklist feed: %s", exc)
+                return
+            except Exception:
+                log.exception("blocklist feed: unexpected failure")
                 return
             if result.status == "updated" and result.imported is not None:
                 log.info("blocklist updated: %s", result.imported.describe())
@@ -1521,8 +1548,10 @@ class AVGuardApp(tb.Window):
             ("Automatic quarantine", True,
              ("on" if self.has_lock else "on, in the other AVGuard window; this one moves nothing")
              if self.cfg.auto_quarantine else "off - detections are reported only"),
-            ("VirusTotal", True,
-             f"on, {self.cloud.spent_today} lookup(s) today" if self.cfg.cloud_enabled
+            ("VirusTotal", not (self.cfg.cloud_enabled and self.cloud.key_rejected),
+             "on, but VirusTotal rejected the API key: set VT_API_KEY and restart AVGuard"
+             if self.cfg.cloud_enabled and self.cloud.key_rejected
+             else f"on, {self.cloud.spent_today} lookup(s) today on this PC" if self.cfg.cloud_enabled
              else "off - no hashes leave this machine"),
             ("Hash blocklist", True, self._describe_iocs()),
             ("Paste guard", *self._describe_paste_guard()),

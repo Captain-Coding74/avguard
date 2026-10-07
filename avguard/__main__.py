@@ -135,6 +135,7 @@ def _console_scan(target: Path, quarantine_threats: bool, verbose: bool,
             )
             accounts_of_threats({})
             return 2
+        from .events import Event, EventStore
         moved: dict = {}
         try:
             store.reconcile()
@@ -144,11 +145,16 @@ def _console_scan(target: Path, quarantine_threats: bool, verbose: bool,
                     # Against the digest it was judged on: a long scan ends
                     # minutes after a file was read, and a file saved since
                     # is not moved on a verdict about its old bytes.
-                    store.quarantine(verdict.path, verdict.reasons,
-                                     evidence=explain_module.evidence_detail(verdict, cfg),
+                    detail = explain_module.evidence_detail(verdict, cfg)
+                    store.quarantine(verdict.path, verdict.reasons, evidence=detail,
                                      expected_sha256=verdict.sha256)
                     moved[verdict.path] = True
                     say(f"quarantined: {verdict.path}")
+                    # In History, as a quarantine by the window is: it was not.
+                    EventStore().record(Event(kind="quarantined", path=str(verdict.path),
+                                              level=verdict.level.value, score=verdict.score,
+                                              reasons=list(verdict.reasons),
+                                              detail={**detail, "state": explain_module.QUARANTINED}))
                 except QuarantineError as exc:
                     moved[verdict.path] = False
                     print(f"could not quarantine {verdict.path}: {exc}", file=sys.stderr)
@@ -908,10 +914,20 @@ def _main(argv: list[str] | None = None) -> int:
         if not lock.acquire():
             print(f"Another AVGuard is running (pid {lock.owner_pid or 0}).", file=sys.stderr)
             return 2
+        from .events import Event, EventStore
+        held = store.get(args.restore)
+
+        def record_restore(target) -> None:
+            # History, as the window records it: a restore is the decision
+            # that makes these bytes clean everywhere on this PC.
+            if held is not None:
+                EventStore().record(Event(kind="restored", path=str(target), reasons=list(held.reasons),
+                                          detail={"sha256": held.sha256, "from": "quarantine"}))
         try:
             store.reconcile()
             target = store.restore(args.restore)
         except RestoreIncomplete as exc:
+            record_restore(exc.target)
             print(f"Restored to {exc.target}")
             print(f"WARNING: {exc}", file=sys.stderr)
             return 0
@@ -920,6 +936,7 @@ def _main(argv: list[str] | None = None) -> int:
             return 1
         finally:
             lock.release()
+        record_restore(target)
         print(f"Restored to {target}")
         return 0
 

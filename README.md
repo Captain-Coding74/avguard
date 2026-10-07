@@ -622,9 +622,12 @@ the file's SHA-256 and the evidence behind the verdict (each finding's
 source, weight, severity and pack, a rule author's note, the counted totals
 and your quarantine threshold); a startup change carries where it is and
 what it is called, its command line with its arguments, old and new, and
-the account a scheduled task runs as; a flagged download's evidence names
-the host it came from, or the archive whose member has its bytes and that
-member's name. The paste guard's events, and the note on a clean file from
+the account a scheduled task runs as, its triggers and run level, and a
+service's start type and DLL; a flagged download's evidence names the host it
+came from, or the archive whose member has its bytes and that member's name; a
+restore or a deletion from the quarantine carries the path, the SHA-256 and the
+verdict it was taken for; a sample you mark as known carries its similarity
+(TLSH) digest and the family name you give it. The paste guard's events, and the note on a clean file from
 a download, are the
 exception: they are written to History and never forwarded, so its "sends
 nothing" holds whatever address is set here. A dead or slow endpoint never

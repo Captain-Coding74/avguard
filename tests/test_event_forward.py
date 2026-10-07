@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -64,8 +65,9 @@ class Receiver:
 
     def __init__(self) -> None:
         self.bodies: list[dict] = []
+        self.headers: list[dict] = []
         self.lock = threading.Lock()
-        bodies, lock = self.bodies, self.lock
+        bodies, headers, lock = self.bodies, self.headers, self.lock
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
@@ -73,6 +75,7 @@ class Receiver:
                 raw = self.rfile.read(length)
                 with lock:
                     bodies.append(json.loads(raw.decode("utf-8")))
+                    headers.append(dict(self.headers))
                 self.send_response(204)
                 self.end_headers()
 
@@ -129,6 +132,24 @@ class TestDelivery(ForwardCase):
                 self.assertEqual(wire[key], disk[key], key)
         self.assertEqual(fwd.sent, 5)
         self.assertEqual((fwd.dropped, fwd.failed), (0, 0))
+
+    def test_the_post_takes_nothing_from_the_environment(self):
+        """Round six: with trust_env left on, requests attaches a ~/.netrc
+        "default" login to the POST: a password for something else, sent to
+        the address the user named for events."""
+        receiver = Receiver()
+        self.addCleanup(receiver.stop)
+        netrc = self.tmp / "netrc"
+        netrc.write_text("default login alice password s3cret-for-my-ftp\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"NETRC": str(netrc)}):
+            fwd = self.forwarder(receiver.url)
+            EventStore(path=self.tmp / "events.jsonl", forwarder=fwd).record(
+                Event(kind="detection", path="C:/x.exe", level="malicious"))
+            self.assertTrue(fwd.wait_idle(10))
+        self.assertFalse(fwd._session.trust_env)
+        with receiver.lock:
+            seen = list(receiver.headers)
+        self.assertFalse(any("Authorization" in h for h in seen), seen)
 
     def test_a_store_without_a_forwarder_is_unchanged(self):
         store = EventStore(path=self.tmp / "events.jsonl")

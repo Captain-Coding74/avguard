@@ -627,6 +627,9 @@ class TestTheQuarantineTabButton(TlshCase):
         recorded = events.read(kinds={"reference"})
         self.assertEqual(len(recorded), 1)
         self.assertEqual(recorded[0].detail["family"], "Fam-Test-File")
+        # Round six: the store's own entry id went with it, which the
+        # forwarding consent does not name.
+        self.assertEqual(set(recorded[0].detail), {"digest", "family"})
         self.assertEqual(recorded[0].path, record.original_path)
 
         with mock.patch.object(gui.Querybox, "get_string", return_value="Fam-Test-File"):

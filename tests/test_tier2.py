@@ -16,6 +16,7 @@ import time
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -96,6 +97,34 @@ class TempCase(unittest.TestCase):
         return path
 
 
+class TestVirusTotalIsPartOfWhatAVerdictMeans(TempCase):
+    """Round six: whether VirusTotal is asked was not in the cache's
+    generation, so a file cached CLEAN with lookups off replayed CLEAN for
+    the cache's 30 days after they were switched on, asking nobody."""
+
+    def test_turning_lookups_on_reaches_a_file_cached_clean(self):
+        asked: list[str] = []
+
+        def lookup(sha256, path):
+            asked.append(path.name)
+            return ["VirusTotal: 41 of 72 engines flagged this file"]
+        cfg = config.Config(cloud_enabled=False)
+        scanner = Scanner(cfg, SelfProtection([self.tmp / "nothing"]), rules_path=RULES,
+                          cache=ScanCache(path=self.tmp / "cache.json"), cloud_lookup=lookup)
+        target = self.tmp / "invoice.exe"
+        target.write_bytes(b"MZ an ordinary little program, nothing in it")
+        self.assertIs(scanner.scan(target).level, Level.CLEAN)
+        before = scanner.detection_generation()
+        cfg.cloud_enabled = True
+        self.assertNotEqual(scanner.detection_generation(), before)
+        scanner.rekey_cache()
+        verdict = scanner.scan(target)
+        self.assertEqual(asked, ["invoice.exe"], "the cached CLEAN was replayed")
+        self.assertIs(verdict.level, Level.MALICIOUS)
+        cfg.cloud_extensions = [*cfg.cloud_extensions, ".txt"]
+        self.assertNotEqual(scanner.detection_generation(), before)
+
+
 # ------------------------------------------------------------------ archives
 
 class TestArchiveInspection(TempCase):
@@ -130,6 +159,70 @@ class TestArchiveInspection(TempCase):
         bomb = [m for m in report.members if m.name == "bomb.bin"][0]
         self.assertIsNone(bomb.data, "the bomb must never be decompressed")
         self.assertIn("bomb", bomb.skipped)
+
+    @staticmethod
+    def forge(path: Path, members) -> Path:
+        """A zip whose headers say what each member is told to say:
+        (name, method, compressed bytes, declared size, crc). What a hostile
+        archive does, and zipfile.writestr never would."""
+        import struct
+        body, central = bytearray(), bytearray()
+        for name, method, data, declared, crc in members:
+            encoded = name.encode()
+            offset = len(body)
+            body += struct.pack("<IHHHHHIIIHH", 0x04034B50, 46, 0, method, 0, 0x21, crc,
+                                len(data), declared, len(encoded), 0) + encoded + data
+            central += struct.pack("<IHHHHHHIIIHHHHHII", 0x02014B50, 46, 46, 0, method, 0, 0x21, crc,
+                                   len(data), declared, len(encoded), 0, 0, 0, 0, 0, offset) + encoded
+        end = struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, len(members), len(members),
+                          len(central), len(body), 0)
+        path.write_bytes(bytes(body) + bytes(central) + end)
+        return path
+
+    def test_a_lying_bzip2_header_is_caught_not_believed(self):
+        """Round six: a member declaring 100 bytes with a bzip2 stream of
+        gigabytes passed the ratio check, and zipfile decompressed it whole:
+        4 GiB of memory, a minute, and CLEAN. Measured here with a smaller
+        stream and a smaller ceiling, the same shape."""
+        import bz2
+        import zlib as _zlib
+        stream = bz2.compress(bytes(4 * 1024 * 1024))
+        target = self.forge(self.tmp / "liar.zip",
+                            [("readme.txt", zipfile.ZIP_BZIP2, stream, 100, _zlib.crc32(bytes(100)))])
+        with mock.patch.object(archives, "MAX_MEMBER_BYTES", 1024 * 1024):
+            started = time.monotonic()
+            report = archives.inspect(target)
+            verdict = self.scanner().scan(target, use_cache=False)
+        member = report.members[0]
+        self.assertLessEqual(len(member.data), 1024 * 1024, "decompressed past the ceiling")
+        self.assertTrue(any("larger than its header claims" in p for p in report.problems), report.problems)
+        self.assertIs(verdict.level, Level.SUSPICIOUS)
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_what_hides_past_a_declared_size_is_inspected(self):
+        """The 'larger than its header claims' check could never fire:
+        zipfile stops at the declared size, so a marker past it was never
+        seen and the archive was CLEAN."""
+        import zlib as _zlib
+        content = b"an ordinary first line of text, and then: " + SELFTEST_MARKER
+        compressor = _zlib.compressobj(9, _zlib.DEFLATED, -15)
+        deflated = compressor.compress(content) + compressor.flush()
+        target = self.forge(self.tmp / "hides.zip",
+                            [("notes.txt", zipfile.ZIP_DEFLATED, deflated, 20, _zlib.crc32(content[:20]))])
+        report = archives.inspect(target)
+        self.assertTrue(any("larger than its header claims" in p for p in report.problems))
+        self.assertIs(self.scanner().scan(target, use_cache=False).level, Level.MALICIOUS)
+
+    def test_honest_bzip2_and_lzma_members_are_read(self):
+        for method in (zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA):
+            with self.subTest(method=method):
+                target = self.tmp / f"honest-{method}.zip"
+                with zipfile.ZipFile(target, "w", compression=method) as archive:
+                    archive.writestr("payload.bin", b"before " + SELFTEST_MARKER + b" after")
+                report = archives.inspect(target)
+                self.assertEqual(report.problems, [])
+                self.assertIn(SELFTEST_MARKER, report.members[0].data)
+                self.assertIs(self.scanner().scan(target, use_cache=False).level, Level.MALICIOUS)
 
     def test_a_bomb_is_reported_but_never_quarantined(self):
         target = self.zip_of({"bomb.bin": b"\x00" * (30 * 1024 * 1024)}, "bomb.zip")

@@ -9,8 +9,13 @@ Nothing is ever extracted to disk. Members are read as bounded streams in
 memory, so a hostile archive cannot write anywhere, cannot fill the disk, and
 cannot survive the scan. Three properties make that cheap:
 
-  * `compress_size` and `file_size` come from the central directory, so a
-    decompression bomb is detectable before a single byte is decompressed
+  * `compress_size` and `file_size` come from the central directory, so an
+    honest decompression bomb is refused before a byte is decompressed. They
+    are claims, not facts: every member is decompressed by `_read_member`,
+    which stops at a ceiling counted in the bytes it actually produces, so a
+    header that lies about its size gets no further than one that does not.
+    (zipfile's own reader bounds its output only for DEFLATE: a bzip2 member
+    declaring 100 bytes was decompressed whole, 4 GiB from a 3 KB download.)
   * `flag_bits & 0x1` marks an encrypted member, so we can say "cannot inspect"
     instead of guessing at a password
   * the entry name is visible up front, so traversal is a fact about metadata
@@ -22,9 +27,13 @@ browsers and mail clients actually produce.
 
 from __future__ import annotations
 
+import bz2
 import io
 import logging
+import lzma
+import struct
 import zipfile
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
@@ -45,6 +54,60 @@ MAX_TOTAL_BYTES = 256 * 1024 * 1024  # total uncompressed budget per archive
 # never decompressed. Ordinary text compresses around 3-5x; a zip of zeros
 # reaches 1000x.
 MAX_COMPRESSION_RATIO = 200
+
+
+class _MemberError(Exception):
+    """A member that could not be read; the message says why."""
+
+
+def _read_member(archive: zipfile.ZipFile, info: zipfile.ZipInfo, limit: int) -> tuple[bytes, bool]:
+    """Up to `limit` bytes of a member, decompressed here with a ceiling on
+    the output, and whether it produced more than its header declared.
+
+    The compressed bytes are read from the member's local header in the
+    archive itself, capped, and handed to a decompressor that is asked for
+    at most `limit` + 1 bytes: what the central directory claims decides
+    nothing about how much is decompressed.
+    """
+    if info.flag_bits & 0x1:
+        # zipfile.open refused these; reading the bytes directly must too.
+        raise _MemberError("encrypted")
+    fp = archive.fp
+    if fp is None:
+        raise _MemberError("archive closed")
+    fp.seek(info.header_offset)
+    header = fp.read(30)
+    if len(header) != 30 or header[:4] != b"PK\x03\x04":
+        raise _MemberError("no local header")
+    name_length, extra_length = struct.unpack("<HH", header[26:30])
+    fp.seek(info.header_offset + 30 + name_length + extra_length)
+    raw = fp.read(min(info.compress_size, limit + 1024 * 1024))
+    method = info.compress_type
+    if method == zipfile.ZIP_STORED:
+        data = raw[:limit + 1]
+        whole = len(raw) == info.compress_size
+    elif method == zipfile.ZIP_DEFLATED:
+        decompressor = zlib.decompressobj(-15)
+        data = decompressor.decompress(raw, limit + 1)
+        whole = decompressor.eof
+    elif method == zipfile.ZIP_BZIP2:
+        decompressor = bz2.BZ2Decompressor()
+        data = decompressor.decompress(raw, max_length=limit + 1)
+        whole = decompressor.eof
+    elif method == zipfile.ZIP_LZMA:
+        if len(raw) < 4:
+            raise _MemberError("truncated LZMA header")
+        size = struct.unpack("<H", raw[2:4])[0]
+        filters = [lzma._decode_filter_properties(lzma.FILTER_LZMA1, raw[4:4 + size])]  # as zipfile does
+        decompressor = lzma.LZMADecompressor(lzma.FORMAT_RAW, filters=filters)
+        data = decompressor.decompress(raw[4 + size:], max_length=limit + 1)
+        whole = decompressor.eof
+    else:
+        raise _MemberError(f"compression method {method} is not supported")
+    lied = len(data) > info.file_size
+    if not lied and whole and len(data) == info.file_size and zlib.crc32(data) != info.CRC:
+        raise _MemberError("CRC mismatch")
+    return data[:limit], lied
 
 
 class ArchiveProblem(str):
@@ -175,21 +238,20 @@ def inspect(
                 continue
 
             try:
-                with archive.open(info) as handle:
-                    # Read one byte past the declared size: a member whose real
-                    # content is longer than its header claims is lying.
-                    data = handle.read(min(info.file_size, MAX_MEMBER_BYTES) + 1)
+                data, lied = _read_member(archive, info, min(MAX_MEMBER_BYTES, budget[0]))
             except Exception as exc:
-                member.skipped = f"unreadable ({type(exc).__name__})"
+                member.skipped = f"unreadable ({exc if isinstance(exc, _MemberError) else type(exc).__name__})"
                 report.members.append(member)
                 continue
 
-            if len(data) > info.file_size:
+            if lied:
+                # A real check now: zipfile stops at the declared size, so the
+                # one-byte-past read this replaced could never see more.
                 report.problems.append(
-                    f"{info.filename!r} is larger than its header claims")
-                data = data[:MAX_MEMBER_BYTES]
+                    f"{info.filename!r} is larger than its header claims "
+                    f"({info.file_size:,} bytes declared)")
 
-            budget[0] -= len(data)
+            budget[0] -= len(data)          # what was produced, not what was claimed
             member.data = data
             report.members.append(member)
 
@@ -284,10 +346,12 @@ def _inspect_bytes(data: bytes, display: Path, budget: list[int]) -> ArchiveRepo
                 report.members.append(member)
                 continue
             try:
-                with archive.open(info) as handle:
-                    payload = handle.read(min(info.file_size, MAX_MEMBER_BYTES) + 1)
+                payload, lied = _read_member(archive, info, min(MAX_MEMBER_BYTES, budget[0]))
             except Exception:
                 continue
+            if lied:
+                report.problems.append(
+                    f"{info.filename!r} is larger than its header claims inside a nested archive")
             budget[0] -= len(payload)
             member.data = payload
             report.members.append(member)

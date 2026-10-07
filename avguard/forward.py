@@ -112,6 +112,7 @@ class EventForwarder:
             if self._session is None:
                 import requests  # here, so a bare install without it still scans
                 self._session = requests.Session()
+                self._session.trust_env = False      # no ~/.netrc login on the POST; see iocs
             response = self._session.post(self.url, json=payload,
                                           timeout=(self.timeout, self.timeout))
             try:

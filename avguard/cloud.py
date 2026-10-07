@@ -103,30 +103,65 @@ class VirusTotalClient:
         self._spent_today = 0
         self._budget_date = date.today().isoformat()
         self._cooldown_until = 0.0
+        # A 401/403 for this process, kept here: it used to write
+        # cloud_enabled=False into the window's Config, which the switch did
+        # not show and the next save persisted, "for this session" or not.
+        self.key_rejected = False
         self._load_cache()
 
     # --------------------------------------------------------------- cache
 
-    def _load_cache(self) -> None:
+    def _read_disk(self) -> dict:
         try:
-            raw = json.loads(self.cache_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            raw = {}
-        self._cache = raw.get("entries", {})
-        self._spent_today = raw.get("spent_today", 0)
-        self._budget_date = raw.get("budget_date", date.today().isoformat())
+            raw = config.read_json_object(self.cache_path) or {}
+        except (OSError, config.UnreadableJSON):
+            return {}
+        entries = raw.get("entries")
+        return {"entries": entries if isinstance(entries, dict) else {},
+                "spent_today": raw.get("spent_today") if isinstance(raw.get("spent_today"), int) else 0,
+                "budget_date": raw.get("budget_date") if isinstance(raw.get("budget_date"), str) else ""}
+
+    def _load_cache(self) -> None:
+        raw = self._read_disk()
+        self._cache = dict(raw["entries"])
+        today = date.today().isoformat()
+        self._spent_today = raw["spent_today"] if raw["budget_date"] == today else 0
+        self._budget_date = today
+
+    def _file_lock(self):
+        from .fim import FileLock          # the integrity stores' OS lock, shared
+        return FileLock(self.cache_path.with_name(self.cache_path.name + ".lock"))
+
+    def _merge_and_write(self, spent: int) -> None:
+        """Under the file lock: this process's results added to the file's
+        (the newer of two answers for one hash wins), and `spent` as the
+        day's count. save_cache used to write this process's view over the
+        file, so the window's exit erased what a right-click scan had paid
+        VirusTotal for."""
+        disk = self._read_disk()
+        merged = dict(disk["entries"])
+        with self._lock:
+            for sha256, entry in self._cache.items():
+                old = merged.get(sha256)
+                if not isinstance(old, dict) or entry.get("fetched_at", 0) >= old.get("fetched_at", 0):
+                    merged[sha256] = entry
+            self._cache = merged
+            self._spent_today = spent
+        config.atomic_write_text(self.cache_path, json.dumps(
+            {"entries": merged, "spent_today": spent, "budget_date": self._budget_date}))
 
     def save_cache(self) -> None:
-        with self._lock:
-            payload = {
-                "entries": dict(self._cache),
-                "spent_today": self._spent_today,
-                "budget_date": self._budget_date,
-            }
+        lock = self._file_lock()
+        held = lock.acquire(2.0)
         try:
-            config.atomic_write_text(self.cache_path, json.dumps(payload))
+            disk = self._read_disk()
+            on_disk = disk["spent_today"] if disk["budget_date"] == self._budget_date else 0
+            self._merge_and_write(max(on_disk, self.spent_today))
         except OSError as exc:
             log.warning("could not save VirusTotal cache: %s", exc)
+        finally:
+            if held:
+                lock.release()
 
     def _cached(self, sha256: str) -> CloudResult | None:
         entry = self._cache.get(sha256)
@@ -155,22 +190,45 @@ class VirusTotalClient:
 
     # -------------------------------------------------------------- budget
 
-    def _budget_available(self) -> bool:
+    def _take_one(self) -> bool:
+        """Charge one lookup to today's budget, which every AVGuard process on
+        this machine shares through the cache file: read, add one, write,
+        under a file lock. False when it is spent. Each process counted its
+        own before, so the window and a right-click scan spent 800 of a
+        budget of 400 against VirusTotal's 500 a day."""
         today = date.today().isoformat()
-        with self._lock:
+        lock = self._file_lock()
+        held = lock.acquire(2.0)
+        try:
+            if not held:
+                return False                 # another process is mid-charge: skip, never overspend
             if today != self._budget_date:
                 self._budget_date = today
-                self._spent_today = 0
-            return self._spent_today < self.cfg.cloud_daily_budget
-
-    def _charge(self) -> None:
-        with self._lock:
-            self._spent_today += 1
+            disk = self._read_disk()
+            spent = max(disk["spent_today"] if disk["budget_date"] == today else 0,
+                        self._spent_today if self._budget_date == today else 0)
+            if spent >= self.cfg.cloud_daily_budget:
+                with self._lock:
+                    self._spent_today = spent
+                return False
+            try:
+                self._merge_and_write(spent + 1)
+            except OSError as exc:
+                log.warning("could not record a VirusTotal lookup: %s", exc)
+                with self._lock:
+                    self._spent_today = spent + 1
+            return True
+        finally:
+            if held:
+                lock.release()
 
     @property
     def spent_today(self) -> int:
+        """Today's lookups by every AVGuard process, as the file has them."""
+        disk = self._read_disk()
         with self._lock:
-            return self._spent_today
+            own = self._spent_today if self._budget_date == date.today().isoformat() else 0
+        return max(own, disk["spent_today"] if disk["budget_date"] == date.today().isoformat() else 0)
 
     # -------------------------------------------------------------- lookup
 
@@ -181,7 +239,7 @@ class VirusTotalClient:
         the cloud stage is advisory, and a file is not treated as clean or
         malicious just because the lookup did not happen.
         """
-        if not self.cfg.cloud_enabled:
+        if not self.cfg.cloud_enabled or self.key_rejected:
             return None
 
         cached = self._cached(sha256)
@@ -196,13 +254,15 @@ class VirusTotalClient:
         if time.monotonic() < self._cooldown_until:
             return None
 
-        if not self._budget_available():
-            log.info("daily VirusTotal budget of %d used; skipping cloud lookups until tomorrow",
-                     self.cfg.cloud_daily_budget)
-            return None
-
         if not self.bucket.try_acquire():
             log.debug("VirusTotal rate limit reached; skipping this lookup")
+            return None
+
+        # Charged before the request, so two processes can never both spend
+        # the last lookup of the day.
+        if not self._take_one():
+            log.info("daily VirusTotal budget of %d used; skipping cloud lookups until tomorrow",
+                     self.cfg.cloud_daily_budget)
             return None
 
         try:
@@ -219,8 +279,6 @@ class VirusTotalClient:
             log.warning("VirusTotal request failed: %s", type(exc).__name__)
             return None
 
-        self._charge()
-
         if response.status_code == 404:
             # Not in the database. That is information: record it so we do not
             # spend another call on the same hash.
@@ -234,8 +292,8 @@ class VirusTotalClient:
             return None
 
         if response.status_code in (401, 403):
-            log.error("VirusTotal rejected the API key; disabling cloud lookups for this session")
-            self.cfg.cloud_enabled = False
+            log.error("VirusTotal rejected the API key; no more lookups until AVGuard restarts")
+            self.key_rejected = True
             return None
 
         if not response.ok:

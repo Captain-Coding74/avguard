@@ -38,17 +38,19 @@ from __future__ import annotations
 
 import io
 import logging
+import lzma
 import re
 import sqlite3
 import threading
 import time
 import zipfile
+import zlib
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
-from . import config
+from . import archives, config
 from . import tlsh as tlsh_module
 
 log = logging.getLogger(__name__)
@@ -527,7 +529,12 @@ class IocStore:
         import requests  # imported here so a bare install without it still scans
 
         url = url or (FEED_FULL_URL if full else FEED_RECENT_URL)
-        session = session or requests.Session()
+        if session is None:
+            session = requests.Session()
+            # Not the environment: trust_env made requests attach a ~/.netrc
+            # "default" login to this request, a password for another service
+            # sent to abuse.ch. The consent says nothing about the PC is sent.
+            session.trust_env = False
         headers = {"User-Agent": USER_AGENT}
         etag = self._get_meta("feed_etag")
         if etag and self._get_meta("feed_url") == url:
@@ -599,9 +606,19 @@ def _first_member(content: bytes) -> bytes:
             member = members[0]
             if member.file_size > FEED_MAX_BYTES:
                 raise FeedError("the zipped download expands past the size limit")
-            return archive.read(member)
-    except zipfile.BadZipFile as exc:
-        raise FeedError(f"the download is not a zip file: {exc}") from exc
+            # The scanner's bounded reader: the header's size is a claim, and
+            # zipfile decompresses a bzip2 member whole whatever it says.
+            data, lied = archives._read_member(archive, member, FEED_MAX_BYTES)
+            if lied:
+                raise FeedError("the zipped download is larger than its header claims")
+            return data
+    except FeedError:
+        raise
+    except (zipfile.BadZipFile, zlib.error, RuntimeError, NotImplementedError, EOFError,
+            ValueError, OSError, archives._MemberError, lzma.LZMAError) as exc:
+        # Corrupt deflate data, an encrypted member, an unknown method: each
+        # escaped as itself, past every `except IocError`, as a traceback.
+        raise FeedError(f"the zipped download cannot be read: {exc}") from exc
 
 
 def scheduled_update(store: IocStore, enabled: bool, session=None,

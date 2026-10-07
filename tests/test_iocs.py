@@ -342,6 +342,49 @@ class TestTheFeedNeverHarmsTheList(IocCase):
         self.assertEqual(self.store.count(), 0)
 
 
+class TestRoundSixFeed(IocCase):
+    """Round six: a damaged zipped feed escaped as zlib.error or
+    RuntimeError, past every `except IocError`, as a traceback; and the
+    request carried a ~/.netrc login for another service."""
+
+    def zipped(self) -> bytes:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("full_sha256.txt", feed_body(200, prefix="z-"))
+        return buffer.getvalue()
+
+    def test_a_damaged_zip_is_a_feed_error_and_changes_nothing(self):
+        good = self.zipped()
+        corrupt = bytearray(good)
+        for index in range(60, 120):
+            corrupt[index] ^= 0xFF                          # inside the deflate stream
+        encrypted = bytearray(good)
+        encrypted[6] |= 0x01                                # local header: encrypted
+        central = good.rfind(b"PK\x01\x02")
+        encrypted[central + 8] |= 0x01                      # and the central directory
+        self.store.import_lines([sha256_of(b"kept")], source="manual")
+        version = self.store.version()
+        for name, body in (("corrupt deflate", bytes(corrupt)), ("encrypted member", bytes(encrypted))):
+            with self.subTest(body=name):
+                with self.assertRaises(FeedError):
+                    self.store.update_from_feed(session=FakeSession(FakeResponse(200, body)), full=True)
+                self.assertEqual((self.store.count(), self.store.version()), (1, version))
+
+    def test_no_credentials_from_the_environment_go_with_the_request(self):
+        built = []
+
+        class Recording(FakeSession):
+            def __init__(self):
+                super().__init__(FakeResponse(304, b""))
+                self.trust_env = True
+                built.append(self)
+        import requests
+        with mock.patch.object(requests, "Session", Recording):
+            self.store.update_from_feed()
+        self.assertEqual(len(built), 1)
+        self.assertFalse(built[0].trust_env, "requests would attach a ~/.netrc login")
+
+
 class TestTheFeedIsOptIn(IocCase):
     def test_nothing_is_fetched_unless_enabled(self):
         session = FakeSession(FakeResponse(200, feed_body(150)))

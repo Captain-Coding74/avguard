@@ -468,9 +468,13 @@ class SettingsDialog(tb.Toplevel):
               "the SHA-256 hash of the file, and the evidence behind the verdict: each "
               "finding's source, weight, severity and pack, a rule author's note, the counted "
               "totals and your quarantine threshold. " + CHR_NL + CHR_NL
-            + "A startup change carries where it is and what it is called, its command line with its arguments, old and new, and the account a scheduled task runs as. For a flagged download, the host it came from, "
-              "or the archive whose member has its bytes and that member's name, go with the "
-              "evidence." + CHR_NL + CHR_NL
+            + "A startup change carries where it is and what it is called, its command line with "
+              "its arguments, old and new, the account a scheduled task runs as, its triggers and "
+              "run level, and a service's start type and DLL. For a flagged download, the host it "
+              "came from, or the archive whose member has its bytes and that member's name, go "
+              "with the evidence. A restore or a deletion from the quarantine carries the file's "
+              "path, its SHA-256 and the verdict it was taken for; a sample you mark as known "
+              "carries its similarity (TLSH) digest and the family name you give it." + CHR_NL + CHR_NL
             + "The paste guard's warnings and the note on a clean file from a download stay on "
               "this machine and are never sent. Nothing is sent while the address is empty.",
             "Forward events?", parent=self) == "Yes"

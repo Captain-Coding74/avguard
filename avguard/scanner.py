@@ -100,7 +100,11 @@ SUSPICIOUS_AT = 50
 # Learned by shipping it: the archive inspector stopped calling large resource
 # packs "hostile", and the machine kept reporting the old verdict because the
 # generation hash only covered the rule file.
-DETECTION_VERSION = 15
+#
+# 16: a zip member that produces more than its header declares is a structural
+# problem (SUSPICIOUS), and what it hides past the declared size is inspected;
+# a lying bzip2 header was read as CLEAN after decompressing gigabytes.
+DETECTION_VERSION = 16
 
 # The ruleset compiled last time, kept between runs. See _adopt_compiled_cache.
 COMPILED_RULES_PATH = config.DATA_DIR / "rules.compiled"
@@ -650,6 +654,11 @@ class Scanner:
         digest.update(f"pe={self.cfg.pe_analysis_enabled}".encode())
         digest.update(f"zip={self.cfg.archive_scanning_enabled}".encode())
         digest.update(f"signed={self.cfg.trust_signed_publishers}".encode())
+        # Whether VirusTotal is asked, and about what: without these a file
+        # cached CLEAN while lookups were off replayed CLEAN for the cache's
+        # 30 days after they were switched on, asking nobody.
+        digest.update(f"cloud={self.cfg.cloud_enabled}|"
+                      f"{sorted(str(e).lower() for e in self.cfg.cloud_extensions)}".encode())
         # The threshold is documented as "evidence needed before a file may be
         # moved", so a change to it changes what a stored verdict means.
         digest.update(f"threshold={self.cfg.quarantine_threshold}".encode())

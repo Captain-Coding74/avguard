@@ -685,11 +685,36 @@ class TestVirusTotalClient(TempCase):
         self.assertIsNone(client.lookup("d" * 64), "must back off after a 429")
         self.assertEqual(session.calls, 1)
 
-    def test_bad_key_disables_cloud_for_the_session(self):
+    def test_bad_key_stops_lookups_without_changing_the_setting(self):
+        """Round six: it wrote cloud_enabled=False into the window's Config,
+        which the switch did not show and the next save persisted."""
         session = FakeSession([FakeResponse(401)])
         client = self.client(session)
         client.lookup("e" * 64)
-        self.assertFalse(self.cfg.cloud_enabled)
+        self.assertTrue(client.key_rejected)
+        self.assertTrue(self.cfg.cloud_enabled, "the user's setting is the user's")
+        client.lookup("f" * 64)
+        self.assertEqual(session.calls, 1, "no further request after a rejection")
+
+    def test_two_processes_share_one_budget_and_one_cache(self):
+        """Round six: each process counted its own lookups against the daily
+        budget, so a window and a right-click scan spent twice it; and the
+        window's exit wrote its cache over the other's results."""
+        self.cfg.cloud_daily_budget = 10
+        window, console = self.client(FakeSession([])), self.client(FakeSession([]))
+        for client in (window, console):
+            client.bucket.tokens = client.bucket.capacity = 1e9
+        for index in range(8):
+            console.lookup(f"{index:064x}")
+        for index in range(8, 16):
+            window.lookup(f"{index:064x}")
+        self.assertEqual(console.session.calls + window.session.calls, 10, "the budget is the machine's")
+        self.assertEqual(window.spent_today, 10)
+        console.save_cache()
+        window.save_cache()
+        reread = self.client(FakeSession([]))
+        self.assertEqual(len([h for h in (f"{i:064x}" for i in range(8)) if reread._cached(h)]), 8,
+                         "the window's save erased what the console scan paid for")
 
     def test_single_detection_is_not_treated_as_a_threat(self):
         session = FakeSession([FakeResponse(200, report(1))])
