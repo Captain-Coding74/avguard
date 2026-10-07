@@ -417,6 +417,7 @@ class ScanCache:
         self._ttl_seconds = ttl_days * 24 * 3600
         self._lock = threading.Lock()
         self._entries: dict[str, dict] = {}
+        self._cleared_at = 0.0
         self._load()
 
     @staticmethod
@@ -486,16 +487,28 @@ class ScanCache:
         return removed
 
     def clear(self) -> None:
-        """Forget every cached verdict, and the path list with it."""
+        """Forget every cached verdict, and the path list with it. The time
+        is kept in the file: a scan that loaded the cache before (a right-
+        click scan, the daily task) saved it back afterwards, and every
+        cleared path returned."""
         with self._lock:
             self._entries = {}
+            self._cleared_at = time.time()
         try:
             config.atomic_write_text(
                 self._path,
                 json.dumps({"schema": self.SCHEMA, "generation": self._generation,
-                            "entries": {}}))
+                            "entries": {}, "cleared_at": self._cleared_at}))
         except OSError as exc:
             log.warning("could not clear the scan cache: %s", exc)
+
+    def _cleared_on_disk(self) -> float:
+        try:
+            raw = json.loads(self._path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            return 0.0
+        value = raw.get("cleared_at", 0) if isinstance(raw, dict) else 0
+        return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0
 
     def __len__(self) -> int:
         with self._lock:
@@ -510,9 +523,14 @@ class ScanCache:
             # cache: reads miss, writes are dropped, nothing is corrupted.
             return
         self.prune()
+        cleared = max(self._cleared_at, self._cleared_on_disk())
         with self._lock:
+            self._cleared_at = cleared
+            # Nothing judged before a clear, wherever it was loaded from.
+            self._entries = {k: v for k, v in self._entries.items() if v.get("at", 0) >= cleared}
             snapshot = dict(self._entries)
-        payload = {"schema": self.SCHEMA, "generation": self._generation, "entries": snapshot}
+        payload = {"schema": self.SCHEMA, "generation": self._generation, "entries": snapshot,
+                   "cleared_at": cleared}
         try:
             config.atomic_write_text(self._path, json.dumps(payload))
         except OSError as exc:

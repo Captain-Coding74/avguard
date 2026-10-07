@@ -20,7 +20,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 _test_data = _os.path.join(_tempfile.gettempdir(), f"avguard-clip-data-{_os.getpid()}")
-_os.environ.setdefault("AVGUARD_DATA", _test_data)
+_os.environ["AVGUARD_DATA"] = _test_data      # assigned: an inherited value may be real data
 if _os.environ["AVGUARD_DATA"] == _test_data:
     import atexit as _atexit
     import shutil as _shutil
@@ -1483,7 +1483,12 @@ class TestTheWindowIntegration(unittest.TestCase):
     def test_the_banner_carries_one_button_on_either_tier_and_the_next_banner_drops_it(self):
         from types import SimpleNamespace
         try:
-            from tests.guiroot import gui_root
+            # One window root per process, imported one way: under
+            # discover, "tests.guiroot" was a second module with a second
+            # root, ttkbootstrap refused it, and this class was skipped in
+            # every full run, on CI too (round seven).
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from guiroot import gui_root
             root = gui_root()
         except Exception as exc:                                   # no display
             self.skipTest(f"no display: {exc}")

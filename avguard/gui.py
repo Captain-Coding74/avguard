@@ -17,6 +17,7 @@ from datetime import datetime
 import queue
 import sys
 import threading
+from dataclasses import asdict
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog
@@ -124,6 +125,7 @@ class AVGuardApp(tb.Window):
         self.lock = InstanceLock()
         self.has_lock = self.lock.acquire()
         self._settle_the_store()
+        self._config_stamp = self._config_file_stamp()
 
         # The paste guard reads the clipboard only while cfg.paste_guard_enabled
         # is set; the tick checks that before touching the source.
@@ -149,10 +151,7 @@ class AVGuardApp(tb.Window):
         self._build_tray()
         self.protocol("WM_DELETE_WINDOW", self._hide)
 
-        self.after(UI_TICK_MS, self._pump)
-        self.after(HEALTH_TICK_MS, self._check_realtime_health)
-        self.after(FEED_TICK_MS, self._feed_tick)
-        self.after(CLIPBOARD_TICK_MS, self._tick_clipboard)
+        self._start_ticks()
         self._refresh_quarantine()
 
         if not self.scanner.rules:
@@ -160,16 +159,7 @@ class AVGuardApp(tb.Window):
                 "YARA rules failed to load - detection is reduced. See the log.",
                 "inverse-danger",
             )
-        if not self.has_lock:
-            # Said, and kept out of the Config: setting cfg.auto_quarantine
-            # here was written to config.json by the next save in this window,
-            # and revoked the user's choice for the window that does hold it.
-            self._banner(
-                f"Another AVGuard is already running (pid {self.lock.owner_pid or 0}). "
-                "This window scans what you ask and reports; the other one moves files, "
-                "watches folders and reads the clipboard.",
-                "inverse-warning",
-            )
+        self._say_who_holds_the_lock()
         if self.cfg.load_problem:
             self._banner(f"Settings: {self.cfg.load_problem}.", "inverse-danger")
         if self.tray is None:
@@ -674,6 +664,27 @@ class AVGuardApp(tb.Window):
         self._banner(f"From a download: {verdict.path.name} {finding.describe()}. Nothing was changed.",
                      "inverse-info")
 
+    def _start_ticks(self) -> None:
+        """Each tick re-arms itself from its own `finally`: the feed check is
+        the hourly _feed_tick, not the one-shot download it calls, which ran
+        once per launch."""
+        self.after(UI_TICK_MS, self._pump)
+        self.after(HEALTH_TICK_MS, self._check_realtime_health)
+        self.after(FEED_TICK_MS, self._feed_tick)
+        self.after(CLIPBOARD_TICK_MS, self._tick_clipboard)
+
+    def _say_who_holds_the_lock(self) -> None:
+        if not self.has_lock:
+            # Said, and kept out of the Config: setting cfg.auto_quarantine
+            # here was written to config.json by the next save in this window,
+            # and revoked the user's choice for the window that does hold it.
+            self._banner(
+                f"Another AVGuard is already running (pid {self.lock.owner_pid or 0}). "
+                "This window scans what you ask and reports; the other one moves files, "
+                "watches folders and reads the clipboard.",
+                "inverse-warning",
+            )
+
     def _settle_the_store(self) -> None:
         """Only the lock holder finishes or undoes a move a killed process
         left half done. A window without the lock leaves it alone: one that
@@ -891,21 +902,27 @@ class AVGuardApp(tb.Window):
             # The switch shows what runs; the user's setting is left alone, so
             # a drive that is not there yet at logon is watched next time.
             self.realtime_var.set(False)
-            detail = (f"{refused[0]} is inside AVGuard's own folder"
-                      if refused else "the folder does not exist")
+            missing = [str(t) for t in targets if not t.is_dir()]
+            detail = (f"{refused[0]} is inside AVGuard's own folder" if refused
+                      else f"{missing[0]} does not exist; it will be watched when it appears" if missing
+                      else "no folder could be watched")
             self._banner(
                 f"Real-time protection is off: {detail}. "
                 "Choose a folder in Settings.", "inverse-warning")
 
     def _toggle_realtime(self) -> None:
-        if self.realtime_var.get():
+        # The user's choice, saved as made: a start that found no folder
+        # turned the switch back off, and that "off" was what was saved, so
+        # the folder was not watched when it appeared, nor at the next logon.
+        wanted = bool(self.realtime_var.get())
+        if wanted:
             self._start_realtime()
         else:
             self._awaiting_targets = []
             self.monitor.stop()
             self.status_var.set("Real-time protection off")
         try:
-            self.cfg.save_changes({"realtime_enabled": bool(self.realtime_var.get())})
+            self.cfg.save_changes({"realtime_enabled": wanted})
         except OSError as exc:
             log.warning("could not remember the real-time switch: %s", exc)
             self._banner(f"Could not save the real-time switch: {exc}. It applies until AVGuard closes.",
@@ -1184,6 +1201,9 @@ class AVGuardApp(tb.Window):
         minimum; restoring the protection is the point.
         """
         try:
+            self._take_the_lock_if_free()
+            if self.has_lock:
+                self._take_settings_from_disk()
             # A configured folder that was not there when protection started
             # (a USB drive, a share mounted after logon) is watched once it
             # appears; it used to be dropped for the session, unsaid.
@@ -1279,6 +1299,10 @@ class AVGuardApp(tb.Window):
 
     def _settings_saved(self) -> None:
         """Apply what can be applied live, and say what cannot."""
+        self._apply_settings()
+        self._banner("Settings saved.", "inverse-success")
+
+    def _apply_settings(self) -> None:
         self.scanner.cfg = self.cfg
         self.cloud.cfg = self.cfg
         self._forwarding_changed()
@@ -1288,18 +1312,71 @@ class AVGuardApp(tb.Window):
         self.cache = self.scanner.cache
         if discarded:
             log.info("settings changed; discarded %d cached verdict(s)", discarded)
-        log.info("settings saved")
+        log.info("settings applied")
         self._update_blocklist_feed()
-        if self.monitor.running:
-            # Re-read from disk before restarting. The in-memory Config was
-            # loaded at startup, so restarting from it would silently revert a
-            # watch folder another AVGuard process added in the meantime.
+        if self.has_lock and self.cfg.realtime_enabled:
+            # Started whether or not it was running: with the only watched
+            # folder missing at logon, the banner said "Choose a folder in
+            # Settings", and saving one there never started protection.
+            # Re-read from disk first: the in-memory Config was loaded at
+            # startup, and restarting from it silently reverted a watch
+            # folder another AVGuard process had added.
             self.cfg = config.Config.load()
             self.scanner.cfg = self.cfg
             self.cloud.cfg = self.cfg        # it kept the old one: on in the window, off in the client
-            self.monitor.stop()
+            if self.monitor.running:
+                self.monitor.stop()
             self._start_realtime()
-        self._banner("Settings saved.", "inverse-success")
+            if self.monitor.running:
+                self.realtime_var.set(True)
+        elif self.monitor.running and not self.cfg.realtime_enabled:
+            self._awaiting_targets = []
+            self.monitor.stop()
+            self.realtime_var.set(False)
+            self.status_var.set("Real-time protection off")
+        self._config_stamp = self._config_file_stamp()
+
+    @staticmethod
+    def _config_file_stamp():
+        try:
+            return config.CONFIG_PATH.stat().st_mtime_ns
+        except OSError:
+            return None
+
+    def _take_settings_from_disk(self) -> None:
+        """The lock holder takes settings another AVGuard window saved. The
+        second window's Settings and switches wrote config.json and its own
+        copy, while this window, the one that watches, moves and reads the
+        clipboard, ran on the copy it loaded at start; the second window's
+        Health then described settings nothing was running."""
+        stamp = self._config_file_stamp()
+        if stamp == getattr(self, "_config_stamp", None):
+            return
+        self._config_stamp = stamp
+        if stamp is None:
+            return
+        fresh = config.Config.load()
+        if asdict(fresh) == asdict(self.cfg):
+            return                              # this window's own save, read back
+        log.info("config.json was changed by another AVGuard; applying it")
+        self.cfg = fresh
+        self._apply_settings()
+        self._banner("Settings saved in another AVGuard window are now in force here.", "inverse-info")
+
+    def _take_the_lock_if_free(self) -> None:
+        """A window started while another held the lock never took it, so
+        when that one closed (or was a short command-line verb), nothing
+        watched, moved or read the clipboard, and every surface here still
+        said another window did."""
+        if self.has_lock or self._shutting_down or not self.lock.acquire():
+            return
+        self.has_lock = True
+        log.info("the other AVGuard has gone; this window holds the lock now")
+        self._settle_the_store()
+        self.cfg = config.Config.load()
+        self._apply_settings()
+        self._refresh_quarantine()
+        self._banner("The other AVGuard has closed: this window now protects this PC.", "inverse-info")
 
     def _show_history(self) -> None:
         dialogs.HistoryDialog(self, self.events, self._history_cleared, on_open=self._explain_event)
@@ -1581,23 +1658,29 @@ class AVGuardApp(tb.Window):
         return all(self.scanner.packs.rule_files_for(p.name)
                    for p in self.scanner.packs.packs())
 
+    def _describe_realtime(self) -> tuple[bool, str]:
+        """The Health row: OK only while every configured folder is watched
+        and scanned (a missing or excluded one read "watching 1 folder(s)",
+        OK, before round six)."""
+        if not self.has_lock:
+            return True, "runs in the other AVGuard window"
+        broken = self.monitor.broken_links()
+        if broken or not self.monitor.watched:
+            return False, "; ".join(broken) if broken else "not running"
+        gaps = self._watch_gaps() if self.cfg.realtime_enabled else []
+        said = f"watching {len(self.monitor.watched)} folder(s)"
+        return not gaps, said + ("; NOT protecting " + "; ".join(gaps) if gaps else "")
+
     def _show_health(self) -> None:
         """Every row is something that has failed silently before."""
         rules_ok = self.scanner.rules is not None
-        broken = self.monitor.broken_links()
-        watching = not broken and bool(self.monitor.watched)
-        gaps = self._watch_gaps() if self.has_lock and self.cfg.realtime_enabled else []
         workers = self.monitor.pool.alive_workers
         checks = [
             ("Detection rules", rules_ok and not self.scanner.broken_user_rules,
              self._describe_rules() if rules_ok
              else "FAILED TO COMPILE - most detection is off. See the log."),
             ("Rule packs", self._packs_ok(), self._describe_packs()),
-            ("Real-time protection", (watching and not gaps) or not self.has_lock,
-             "runs in the other AVGuard window" if not self.has_lock
-             else f"watching {len(self.monitor.watched)} folder(s)"
-             + ("; NOT protecting " + "; ".join(gaps) if gaps else "") if watching
-             else ("; ".join(broken) if broken else "not running")),
+            ("Real-time protection", *self._describe_realtime()),
             ("Scan workers", (not self.monitor.watched) or workers > 0,
              f"{workers} alive" if workers else "idle, nothing to do"),
             ("Quarantine store", self.has_lock,
@@ -1618,8 +1701,10 @@ class AVGuardApp(tb.Window):
             ("Event forwarding", True,
              f"on -> {self.forwarder.url}: {self.forwarder.describe()}"
              if self.forwarder is not None else "off - nothing is sent"),
-            ("Right-click scan", True,
-             "installed for this user" if shellext.installed() else "not installed"),
+            ("Right-click scan", not shellext.stale(),
+             ("installed, but it runs a command from an older AVGuard that does not start it; "
+              "save Settings to write the current one") if shellext.stale()
+             else "installed for this user" if shellext.installed() else "not installed"),
             ("Scan cache", True, f"{len(self.cache)} remembered verdict(s)"),
             ("Quarantine integrity", *self._describe_quarantine_integrity()),
             ("Quarantine review", True, self._describe_quarantine_review()),
@@ -1643,20 +1728,23 @@ class AVGuardApp(tb.Window):
         pattern = dialogs.glob_for(folder)
         if pattern in self.cfg.excluded_globs:
             return
-        newly = [gap for gap in self._watch_gaps([*self.cfg.excluded_globs, pattern])
-                 if gap not in self._watch_gaps()]
-        if newly and Messagebox.yesno(
-                f"{folder} is a folder real-time protection watches. Excluding it means nothing "
-                "that arrives there is scanned again: real-time protection would then protect "
-                "nothing there." + chr(10) + chr(10)
-                + "To stop this one file being flagged, restore it from the Quarantine tab "
-                  "instead; that remembers its exact bytes. Exclude the whole folder anyway?",
+        # The watched folders this exclusion would newly cover, by name: the
+        # folder clicked may only contain one ("Never scan" on a detection
+        # in the home folder covers Downloads).
+        covered = [t for t in self._watch_targets()
+                   if matches_excluded_glob(t / "any-file", [*self.cfg.excluded_globs, pattern])
+                   and not matches_excluded_glob(t / "any-file", self.cfg.excluded_globs)]
+        if covered and Messagebox.yesno(
+                f"Real-time protection watches {', '.join(map(str, covered))}. Excluding {folder} "
+                "means nothing that arrives there is scanned again." + chr(10) + chr(10)
+                + "If a file was moved by mistake, restoring it from the Quarantine tab keeps that "
+                  "one file and leaves the folder protected. Exclude the folder anyway?",
                 "Exclude a watched folder?", parent=self) != "Yes":
             return
         try:
             # Live only once saved: it was appended first, and a failed save
             # left the folder excluded anyway.
-            self.cfg.save_changes({"excluded_globs": [*self.cfg.excluded_globs, pattern]})
+            self.cfg.save_changes({"excluded_globs": config.ListEdit(add=(pattern,))})
         except OSError as exc:
             Messagebox.show_error(f"Could not save: {exc}", "AVGuard", parent=self)
             return

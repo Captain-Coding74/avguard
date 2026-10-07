@@ -24,6 +24,9 @@ from .quarantine import QuarantineError, QuarantineStore, RestoreIncomplete
 from .scanner import Level, Scanner
 
 
+FORWARD_DRAIN_SECONDS = 3.0
+
+
 @contextlib.contextmanager
 def _event_store(cfg: config.Config | None = None):
     """History for a command-line verb, forwarded as the window's is when a
@@ -38,9 +41,16 @@ def _event_store(cfg: config.Config | None = None):
         yield EventStore(forwarder=forwarder)
     finally:
         if forwarder is not None:
-            if not forwarder.wait_idle(10):
+            # A few seconds, not ten plus a join: a receiver that accepted and
+            # answered slowly held --scan --quarantine of 8 files 12 s, and
+            # most events were dropped anyway. What did not go out is said.
+            if not forwarder.wait_idle(FORWARD_DRAIN_SECONDS):
+                lost = forwarder.pending
                 logging.getLogger("avguard.forward").warning(
-                    "%d event(s) not delivered before the command ended", forwarder.pending)
+                    "%d event(s) not delivered before the command ended", lost)
+                if sys.stderr is not None:
+                    print(f"{lost} event(s) were recorded in History but not delivered to "
+                          f"{url} before this command ended.", file=sys.stderr)
             forwarder.stop()
 
 
@@ -84,6 +94,7 @@ def _console_scan(target: Path | list[Path], quarantine_threats: bool, verbose: 
 
     counts = {level: 0 for level in Level}
     threats = []
+    flagged = []
     from . import explain as explain_module
 
     def account(verdict, quarantined: bool = False) -> None:
@@ -106,6 +117,11 @@ def _console_scan(target: Path | list[Path], quarantine_threats: bool, verbose: 
 
     def report(verdict) -> None:
         counts[verdict.level] += 1
+        if verdict.level in (Level.MALICIOUS, Level.SUSPICIOUS):
+            flagged.append(verdict)
+            # In the log whoever reads the console: the daily task has none.
+            logging.getLogger("avguard").warning("scan: %s %s (%s)", verdict.level.value.upper(), verdict.path,
+                                                 "; ".join(verdict.reasons[:2]))
         if verdict.level is Level.MALICIOUS:
             threats.append(verdict)
             if quarantine_threats and (as_json or explain_each):
@@ -142,23 +158,25 @@ def _console_scan(target: Path | list[Path], quarantine_threats: bool, verbose: 
     if counts[Level.ERROR]:
         say(f"Errors   : {counts[Level.ERROR]}")
 
+    moved: dict = {}
     if threats and quarantine_threats:
         # Writing to the quarantine store needs the lock. Another AVGuard
         # holding it would otherwise rewrite the index from a stale snapshot
         # and destroy its records along with the user's originals.
         lock = InstanceLock()
         if not lock.acquire():
-            print(
-                f"\nAnother AVGuard is running (pid {lock.owner_pid or 0}).\n"
-                "Nothing was moved: two processes writing to the quarantine\n"
-                "store at once destroys its records. Close the other one\n"
-                "and run this again.",
-                file=sys.stderr,
-            )
+            refusal = (f"\nAnother AVGuard is running (pid {lock.owner_pid or 0}).\n"
+                       "Nothing was moved: two processes writing to the quarantine\n"
+                       "store at once destroys its records. Close the other one\n"
+                       "and run this again.")
+            if sys.stderr is not None:
+                print(refusal, file=sys.stderr)
+            transcript.append(refusal)
             accounts_of_threats({})
+            if pause:
+                _pause_for_the_user(None if isinstance(target, list) else target, transcript)
             return 2
         from .events import Event
-        moved: dict = {}
         history = contextlib.ExitStack()
         events = history.enter_context(_event_store(cfg))
         try:
@@ -189,12 +207,52 @@ def _console_scan(target: Path | list[Path], quarantine_threats: bool, verbose: 
     elif threats:
         say("\nNothing was moved. Pass --quarantine to act on these findings.")
 
+    if sys.stdout is None and not pause:
+        # No console and nothing shown: the daily scan, under pythonw or the
+        # windowed build. What it found reached only Task Scheduler's "Last
+        # Run Result 0x1"; History, where the window shows it, has it now.
+        _record_console_scan(cfg, flagged, counts, moved)
+
     if pause:
-        _pause_for_the_user(target[0] if isinstance(target, list) else target, transcript)
+        _pause_for_the_user(None if isinstance(target, list) else target, transcript)
     return 1 if threats else 0
 
 
-def _pause_for_the_user(target: Path, transcript: list[str]) -> None:
+def _record_console_scan(cfg, flagged, counts, moved: dict) -> None:
+    from . import explain as explain_module
+    from .events import Event
+    with _event_store(cfg) as events:
+        for verdict in flagged:
+            if moved.get(verdict.path):
+                continue                       # recorded as "quarantined" when it was moved
+            detail = explain_module.evidence_detail(verdict, cfg)
+            kind = "detection" if verdict.level is Level.MALICIOUS else "suspicious"
+            events.record(Event(kind=kind, path=str(verdict.path), level=verdict.level.value,
+                                score=verdict.score, reasons=list(verdict.reasons),
+                                detail={**detail, "state": explain_module.REPORTED}))
+        events.record(Event(kind="scan_finished",
+                            detail={"files": sum(counts.values()), "threats": counts[Level.MALICIOUS],
+                                    "suspicious": counts[Level.SUSPICIOUS], "from": "command line"}))
+
+
+def _watched_to_scan(targets: list[Path]) -> tuple[list[Path], list[Path]]:
+    """The watched folders that exist, each tree once, and those that do
+    not. A folder inside another was scanned twice: "Threats: 2" for one
+    file, and "Nothing was moved" for a file it had moved the first time."""
+    present = [t for t in targets if t.exists()]
+    missing = [t for t in targets if not t.exists()]
+    resolved = [(t, t.resolve()) for t in present]
+    kept = []
+    for target, real in resolved:
+        if any(real != other and real.is_relative_to(other) for _, other in resolved):
+            continue                                   # inside another watched folder
+        if any(real == other for _, other in kept):
+            continue                                   # the same folder twice
+        kept.append((target, real))
+    return [t for t, _ in kept], missing
+
+
+def _pause_for_the_user(target: Path | None, transcript: list[str]) -> None:
     """Keep the result on screen. The right-click menu entry runs with this.
 
     A console window that closes when the scan ends shows nothing. Under
@@ -210,7 +268,8 @@ def _pause_for_the_user(target: Path, transcript: list[str]) -> None:
             return
         root = tkinter.Tk()
         root.withdraw()
-        messagebox.showinfo(f"AVGuard scanned {target.name}", "\n".join(transcript[-40:]))
+        title = f"AVGuard scanned {target.name}" if target is not None else "AVGuard scanned the watched folders"
+        messagebox.showinfo(title, "\n".join(transcript[-40:]))
         root.destroy()
         return
     stdin = getattr(sys, "stdin", None)
@@ -838,7 +897,8 @@ def _main(argv: list[str] | None = None) -> int:
     parser.add_argument("--schedule", choices=["status", "on", "off"],
                         help="start with Windows and run a daily scan")
     parser.add_argument("--schedule-path", metavar="DIR", type=Path,
-                        help="folder for the daily scan (default: Downloads)")
+                        help="one folder for the daily scan (default: every watched folder, "
+                             "read when the task runs, as --scan-watched)")
     parser.add_argument("--packs", nargs="?", const="list", metavar="ACTION",
                         help="rule packs: list (default), add PATH, verify, "
                              "remove NAME, trust NAME, untrust NAME")
@@ -1038,16 +1098,30 @@ def _main(argv: list[str] | None = None) -> int:
         return _packs_command(args)
 
     if args.scan_watched:
-        targets = [t for t in config.watch_targets(config.Config.load()) if t.exists()]
+        targets, missing = _watched_to_scan(config.watch_targets(config.Config.load()))
+        for gone in missing:
+            # Said, and in the log: the daily task has no console.
+            logging.getLogger("avguard").warning("scan-watched: %s does not exist; not scanned", gone)
+            if sys.stderr is not None:
+                print(f"skipped: {gone} does not exist", file=sys.stderr)
         if not targets:
-            print("no watched folder exists to scan", file=sys.stderr)
+            if sys.stderr is not None:
+                print("no watched folder exists to scan", file=sys.stderr)
+            if args.pause:
+                _pause_for_the_user(None, ["No watched folder exists to scan."]
+                                    + [f"skipped: {gone} does not exist" for gone in missing])
             return 2
         return _console_scan(targets, args.quarantine, args.verbose, pause=args.pause,
                              explain_each=args.explain, as_json=args.json)
 
     if args.scan:
         if not args.scan.exists():
-            print(f"no such path: {args.scan}", file=sys.stderr)
+            if sys.stderr is not None:
+                print(f"no such path: {args.scan}", file=sys.stderr)
+            if args.pause:
+                # The right-click entry under the windowed build: the only
+                # place this can be said.
+                _pause_for_the_user(args.scan, [f"No such path: {args.scan}"])
             return 2
         return _console_scan(args.scan, args.quarantine, args.verbose, pause=args.pause,
                              explain_each=args.explain, as_json=args.json)

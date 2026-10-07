@@ -37,7 +37,7 @@ import tempfile as _tempfile
 # Per run, not a fixed path: a shared directory accumulates state between
 # runs, and a stale allowlist entry from one run silently broke the next.
 _test_data = _os.path.join(_tempfile.gettempdir(), f"avguard-test-data-{_os.getpid()}")
-_os.environ.setdefault("AVGUARD_DATA", _test_data)
+_os.environ["AVGUARD_DATA"] = _test_data      # assigned: an inherited value may be real data
 def _remove_tree(path) -> None:
     """rmtree that copes with read-only files.
 
@@ -195,6 +195,23 @@ class TestHistoryAndTheCacheSurviveDamage(TempCase):
         self.assertEqual(len(again.cache), 1)
         again.cache.save()                                        # prune() over every entry
         self.assertIs(again.scan(target).level, Level.CLEAN)
+
+    def test_a_scan_that_loaded_the_cache_before_a_clear_does_not_bring_it_back(self):
+        """Round seven: Clear history wiped the cache, then a right-click
+        scan that had loaded it earlier saved it back, every path with it."""
+        scanner = self.scanner()
+        scanner.rekey_cache()
+        target = self.tmp / "a.txt"
+        target.write_text("hello", encoding="utf-8")
+        scanner.scan(target)
+        scanner.cache.save()
+        console = ScanCache(path=self.tmp / "cache.json", generation=scanner.detection_generation())
+        self.assertEqual(len(console), 1)
+        time.sleep(0.01)
+        scanner.cache.clear()                                    # Clear history, in the window
+        console.save()                                           # the console scan ends
+        again = ScanCache(path=self.tmp / "cache.json", generation=scanner.detection_generation())
+        self.assertEqual(len(again), 0, "the cleared paths came back")
 
     def test_a_scan_cache_with_a_byte_order_mark_or_a_bad_byte(self):
         path = self.tmp / "cache.json"

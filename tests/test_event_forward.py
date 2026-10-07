@@ -29,7 +29,7 @@ import os as _os
 import tempfile as _tempfile
 
 _test_data = _os.path.join(_tempfile.gettempdir(), f"avguard-test-data-{_os.getpid()}")
-_os.environ.setdefault("AVGUARD_DATA", _test_data)
+_os.environ["AVGUARD_DATA"] = _test_data      # assigned: an inherited value may be real data
 
 
 def _remove_tree(path) -> None:
@@ -252,6 +252,9 @@ class TestTheCommandLineForwardsWhatItRecords(ForwardCase):
         from avguard.__main__ import _event_store
         with _event_store(config.Config()) as events:
             self.assertIsNone(events.forwarder)
+            events.record(Event(kind="fim_changed", path="C:/watched/b.dll"))
+        self.assertIn("C:/watched/b.dll", [e.path for e in EventStore().read()],
+                      "the half named 'history still records' asserted nothing (round seven)")
 
 
 if __name__ == "__main__":

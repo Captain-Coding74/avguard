@@ -32,7 +32,7 @@ import os as _os
 import tempfile as _tempfile
 
 _test_data = _os.path.join(_tempfile.gettempdir(), f"avguard-test-data-{_os.getpid()}")
-_os.environ.setdefault("AVGUARD_DATA", _test_data)
+_os.environ["AVGUARD_DATA"] = _test_data      # assigned: an inherited value may be real data
 def _remove_tree(path) -> None:
     """rmtree that copes with read-only files.
 

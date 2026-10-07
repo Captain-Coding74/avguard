@@ -57,7 +57,7 @@ Other flags:
 | `--fim-status`, `--fim-schedule status\|on\|off` | the baseline, and a daily unattended check |
 | `--pause` | with `--scan`: keep the result on screen (the right-click entry uses it) |
 | `--install-context-menu`, `--remove-context-menu` | 'Scan with AVGuard' in Explorer's right-click menu, this user only |
-| `--scan-watched` | scan every watched folder, as `config.json` names them when it runs |
+| `--scan-watched` | scan every watched folder, as `config.json` names them when it runs (each tree once; a missing one is named). With no console, as the daily task runs, what it finds goes into History and the log |
 | `--schedule status\|on\|off` | start with Windows, and a daily `--scan-watched` (`--schedule-path DIR` for one folder instead) |
 | `-v` | show clean files too |
 
@@ -123,7 +123,7 @@ the thing this project exists to not be.
 With VirusTotal lookups off — the default — what can reach MALICIOUS and be
 moved is short: the two byte signatures (the EICAR test file and AVGuard's
 own self-test marker), a SHA-256 on the hash blocklist (one you imported, or
-the opt-in MalwareBazaar feed), a rule of your own marked high severity, and a
+the opt-in MalwareBazaar feed), a rule of your own marked high, critical or test severity, and a
 rule from a pack you promoted. Everything else the shipped rules and
 heuristics find is reported as SUSPICIOUS and left alone: the process-injection rule, the encoded-PowerShell
 rule, the ransom-note rule, packed executables, odd PE structure, zip bombs,
@@ -454,7 +454,8 @@ the person at the machine.
 
 MalwareBazaar publishes these hashes for free. Turning the daily download on
 (Settings, or `--iocs-update` once from a terminal) sends one HTTPS request a
-day to bazaar.abuse.ch carrying the previous download's ETag and nothing about
+day to bazaar.abuse.ch (after a request that got no feed, the next is four
+hours later) carrying the previous download's ETag and nothing about
 this PC or its files. A download that is not the feed — a captive portal, an
 error page, anything with fewer than 100 valid hashes — is refused whole and
 changes nothing. The list is part of the detection generation, so a file
@@ -639,12 +640,16 @@ service's start type and DLL; a flagged download's evidence names the host it
 came from, or the archive whose member has its bytes and that member's name; a
 restore or a deletion from the quarantine carries the path, the SHA-256 and the
 verdict it was taken for; a sample you mark as known carries its similarity
-(TLSH) digest and the family name you give it. The paste guard's events, and the note on a clean file from
+(TLSH) digest and the family name you give it; an integrity change carries the path and its old and new
+SHA-256 and size, and a baseline found tampered with names the folders it dropped; a health event says
+what stopped working, and a scan summary counts the files and the threats. The paste guard's events, and the note on a clean file from
 a download, are the
 exception: they are written to History and never forwarded, so its "sends
 nothing" holds whatever address is set here. A dead or slow endpoint never
 slows a scan: events go onto a bounded queue and a background thread posts
-them, dropping the oldest when the queue is full.
+them, dropping the oldest when the queue is full. A command-line verb gives the
+queue up to 3 seconds when it ends; what has not gone out by then is in History
+and not delivered, and the command says how many.
 
 ## Right-click scan
 
@@ -675,7 +680,9 @@ the per-minute rate, a persistent daily budget stops at 400, and results are
 cached for a week (including "VirusTotal has never seen this hash", which is
 also worth not paying for twice). Only files that nothing local has already
 decided about, and whose extension is in `cloud_extensions`, are looked up at
-all.
+all. A lookup that did not happen (the rate, the day's budget, no key in that
+process's environment, a network error) is not remembered as clean: the file
+is asked about the next time it is scanned.
 
 Three or more engines must agree before a file is called malicious. One or two
 detections out of seventy is normal for installers and unsigned binaries, and

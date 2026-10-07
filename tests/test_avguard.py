@@ -38,7 +38,7 @@ import tempfile as _tempfile
 # Per run, not a fixed path: a shared directory accumulates state between
 # runs, and a stale allowlist entry from one run silently broke the next.
 _test_data = _os.path.join(_tempfile.gettempdir(), f"avguard-test-data-{_os.getpid()}")
-_os.environ.setdefault("AVGUARD_DATA", _test_data)
+_os.environ["AVGUARD_DATA"] = _test_data      # assigned: an inherited value may be real data
 def _remove_tree(path) -> None:
     """rmtree that copes with read-only files.
 
@@ -100,16 +100,21 @@ def _refuse_to_touch_real_data() -> None:
     import os
     from avguard import config
     override = os.getenv("AVGUARD_DATA")
-    if not override:
-        return
-    if not Path(config.DATA_DIR).resolve().is_relative_to(Path(override).expanduser().resolve()):
-        raise RuntimeError(
-            f"AVGUARD_DATA is set to {override} but config.DATA_DIR is "
-            f"{config.DATA_DIR}; the suite would write to the real location")
+    temp = Path(tempfile.gettempdir()).resolve()
+    if not override or not Path(config.DATA_DIR).resolve().is_relative_to(temp):
+        # Not an exception: unittest turns one into a failed import and runs
+        # every other module anyway, into the real data.
+        print(f"refusing to run: AVGUARD_DATA is {override!r} and config.DATA_DIR is {config.DATA_DIR}, "
+              f"outside {temp}; the suite would write into a real AVGuard's data", file=sys.stderr)
+        os._exit(2)
 
 
 # Defined and never called until round six, so it guarded nothing: it named
 # `pathlib`, which this module does not import, and no run ever noticed.
+# Round seven: it compared DATA_DIR with AVGUARD_DATA, which config derives
+# it from, so it held by construction; and every module used setdefault, so
+# an inherited AVGUARD_DATA (a portable install's real folder, or "") was
+# kept. Each module now assigns it, and this checks against the temp folder.
 _refuse_to_touch_real_data()
 
 

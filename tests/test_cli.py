@@ -36,7 +36,7 @@ import tempfile as _tempfile
 # for why: objects built with default paths otherwise reach into the user's
 # real %LOCALAPPDATA%/AVGuard.
 _test_data = _os.path.join(_tempfile.gettempdir(), f"avguard-test-data-{_os.getpid()}")
-_os.environ.setdefault("AVGUARD_DATA", _test_data)
+_os.environ["AVGUARD_DATA"] = _test_data      # assigned: an inherited value may be real data
 def _remove_tree(path) -> None:
     """rmtree that copes with read-only files.
 
@@ -532,6 +532,109 @@ class TestTheDailyScanCoversEveryWatchedFolder(CliCase):
         self.assertEqual(code, 0, output)
         self.assertIsNone(daily.call_args.args[0], "a single folder was fixed into the task")
         self.assertIn("the watched folders", output)
+
+
+class TestRoundSevenTheCommandLine(CliCase):
+    """Round seven: --scan-watched scanned a folder inside another twice
+    and skipped a missing one without a word; the daily scan, with no
+    console, left no record anywhere but Task Scheduler's last result; a
+    slow forwarding receiver held a command 12 s; --help described the old
+    daily scan; the right-click entry under the windowed build showed
+    nothing for a missing path; and nothing tested --iocs-status's gap
+    line, --json with no console, or that the command line's quarantine
+    reaches History."""
+
+    def test_scan_watched_scans_each_tree_once_and_names_what_is_missing(self):
+        from avguard import config
+        from avguard.scanner import SELFTEST_MARKER
+        outer = self.tmp / "home"
+        inner = outer / "Downloads"
+        inner.mkdir(parents=True)
+        (inner / "threat.bin").write_bytes(SELFTEST_MARKER)
+        config.Config(watch_paths=[str(outer), str(inner), str(self.tmp / "usb")]).save()
+        code, output = self.run_cli("--scan-watched")
+        self.assertEqual(code, 1, output)
+        self.assertIn("Threats  : 1", output, "a folder inside another was scanned twice")
+        self.assertIn(f"skipped: {self.tmp / 'usb'} does not exist", output)
+
+    def test_a_scan_with_no_console_leaves_a_record_in_history(self):
+        from avguard.__main__ import _console_scan
+        from avguard.events import EventStore
+        target = self.marker_file()
+        with mock.patch.object(sys, "stdout", None):
+            code = _console_scan(target.parent, False, False)
+        self.assertEqual(code, 1)
+        kinds = [e.kind for e in EventStore().read()]
+        self.assertIn("detection", kinds, "the daily scan's threat reached no record")
+        self.assertIn("scan_finished", kinds)
+
+    def test_json_with_no_console_keeps_the_objects_for_the_summary(self):
+        import avguard.__main__ as cli
+        target = self.marker_file()
+        kept = []
+        with mock.patch.object(sys, "stdout", None), \
+                mock.patch.object(cli, "_pause_for_the_user", side_effect=lambda t, lines: kept.extend(lines)):
+            self.assertEqual(cli._console_scan(target.parent, False, False, pause=True, as_json=True), 1)
+        self.assertTrue(any('"path"' in line for line in kept), "the object was lost with no console")
+
+    def test_the_command_line_quarantine_is_in_history(self):
+        from avguard.events import EventStore
+        target = self.marker_file()
+        code, output = self.run_cli("--scan", str(target.parent), "--quarantine")
+        self.assertEqual(code, 1, output)
+        self.assertIn(str(target), [e.path for e in EventStore().read(kinds={"quarantined"})])
+
+    def test_forwarding_waits_seconds_not_twelve_and_says_what_it_dropped(self):
+        import avguard.__main__ as cli
+        from avguard import config, forward
+        waited = []
+
+        class Slow:
+            pending = 4
+
+            def __init__(self, url, **kwargs):
+                self.url = url
+
+            def wait_idle(self, timeout):
+                waited.append(timeout)
+                return False
+
+            def stop(self):
+                pass
+
+            def submit(self, event):
+                pass
+        err = io.StringIO()
+        with mock.patch.object(forward, "EventForwarder", Slow), contextlib.redirect_stderr(err):
+            with cli._event_store(config.Config(event_forward_url="http://127.0.0.1:9/events")):
+                pass
+        self.assertLessEqual(waited[0], 3.0)
+        self.assertIn("4 event(s) were recorded in History but not delivered", err.getvalue())
+
+    def test_help_describes_the_daily_scan_as_it_is(self):
+        code, output = self.run_cli("--help")
+        self.assertIn("every watched folder", " ".join(output.split()))
+
+    def test_a_missing_path_is_shown_by_the_right_click_entry(self):
+        import avguard.__main__ as cli
+        shown = []
+        with mock.patch.object(cli, "_pause_for_the_user", side_effect=lambda target, lines: shown.append(lines)), \
+                mock.patch.object(sys, "stdout", None):
+            code = cli._main(["--scan", str(self.tmp / "gone.exe"), "--pause"])
+        self.assertEqual(code, 2)
+        self.assertIn("No such path", shown[0][0])
+
+    def test_iocs_status_says_hashes_may_be_missing(self):
+        import time
+        from avguard import iocs
+        store = iocs.IocStore()
+        with store._write_lock, store._conn() as conn:
+            store._set_meta(conn, "feed_checked_at", str(time.time()))
+            store._set_meta(conn, "feed_gap_since", str(time.time() - 4 * 86400))
+        store.close()
+        code, output = self.run_cli("--iocs-status")
+        self.assertEqual(code, 0, output)
+        self.assertIn("may be missing", output)
 
 
 class TestOutputSanity(CliCase):

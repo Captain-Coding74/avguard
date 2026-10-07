@@ -24,7 +24,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 _test_data = _os.path.join(_tempfile.gettempdir(), f"avguard-explain-data-{_os.getpid()}")
-_os.environ.setdefault("AVGUARD_DATA", _test_data)
+_os.environ["AVGUARD_DATA"] = _test_data      # assigned: an inherited value may be real data
 if _os.environ["AVGUARD_DATA"] == _test_data:
     import atexit as _atexit
     import shutil as _shutil
@@ -515,7 +515,12 @@ class TestTheEvidenceTravels(ScannerCase):
 class TestTheWindow(unittest.TestCase):
     def setUp(self) -> None:
         try:
-            from tests.guiroot import gui_root
+            # One window root per process, imported one way: under
+            # discover, "tests.guiroot" was a second module with a second
+            # root, ttkbootstrap refused it, and this class was skipped in
+            # every full run, on CI too (round seven).
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from guiroot import gui_root
             self.root = gui_root()
             from avguard import dialogs, gui
         except Exception as exc:                         # no GUI dependencies or no display
@@ -580,7 +585,7 @@ class TestTheWindow(unittest.TestCase):
         panes.pack()
         var = tk.StringVar()
         banner = tb.Label(holder, textvariable=var)
-        fake = SimpleNamespace(cfg=cfg, events=events, scanner=scanner, _threats_this_scan=0, banner=banner,
+        fake = SimpleNamespace(cfg=cfg, has_lock=True, events=events, scanner=scanner, _threats_this_scan=0, banner=banner,
                                banner_var=var, _panes=panes, tray=None, quarantine=None, cache=None)
         for name in ("_banner", "_offer_account", "_offer_exclusion", "_show_account"):
             setattr(fake, name, getattr(self.gui.AVGuardApp, name).__get__(fake))
@@ -611,7 +616,7 @@ class TestTheWindow(unittest.TestCase):
         var = tk.StringVar()
         banner = tb.Label(holder, textvariable=var)
         shown: list = []
-        fake = SimpleNamespace(cfg=cfg, events=events, scanner=scanner, _threats_this_scan=0, banner=banner,
+        fake = SimpleNamespace(cfg=cfg, has_lock=True, events=events, scanner=scanner, _threats_this_scan=0, banner=banner,
                                banner_var=var, _panes=panes, tray=None, quarantine=store,
                                cache=scanner.cache, _refresh_quarantine=lambda: None,
                                _show_account=lambda a, e=None: shown.append((a, e)))

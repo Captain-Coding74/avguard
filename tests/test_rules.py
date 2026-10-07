@@ -50,7 +50,7 @@ import tempfile as _tempfile
 # Per run, not a fixed path: a shared directory accumulates state between
 # runs, and a stale allowlist entry from one run silently broke the next.
 _test_data = _os.path.join(_tempfile.gettempdir(), f"avguard-test-data-{_os.getpid()}")
-_os.environ.setdefault("AVGUARD_DATA", _test_data)
+_os.environ["AVGUARD_DATA"] = _test_data      # assigned: an inherited value may be real data
 def _remove_tree(path) -> None:
     """rmtree that copes with read-only files.
 

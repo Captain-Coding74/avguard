@@ -39,6 +39,12 @@ class SettingsDialog(tb.Toplevel):
                  ioc_store=None, on_references_changed=None) -> None:
         super().__init__(title="Settings", transient=parent, resizable=(False, False))
         self.cfg = cfg
+        # What this dialog shows, so Save sends only what the user changed.
+        self._opened = {key: (list(value) if isinstance(value, list) else value)
+                        for key, value in ((key, getattr(cfg, key)) for key in (
+                            "auto_quarantine", "archive_scanning_enabled", "pe_analysis_enabled",
+                            "paste_guard_enabled", "ioc_feed_enabled", "watch_paths",
+                            "excluded_globs", "event_forward_url"))}
         self._on_saved = on_saved
         self._on_packs_changed = on_packs_changed
         self._on_allowlist_changed = on_allowlist_changed
@@ -452,7 +458,7 @@ class SettingsDialog(tb.Toplevel):
 
     def _apply_context_menu(self) -> list[str]:
         wanted = self.context_menu_var.get()
-        if wanted == shellext.installed():
+        if wanted == shellext.installed() and not (wanted and shellext.stale()):
             return []
         ok, detail = shellext.install() if wanted else shellext.uninstall()
         return [] if ok else [f"Right-click scan: {detail}"]
@@ -474,7 +480,10 @@ class SettingsDialog(tb.Toplevel):
               "came from, or the archive whose member has its bytes and that member's name, go "
               "with the evidence. A restore or a deletion from the quarantine carries the file's "
               "path, its SHA-256 and the verdict it was taken for; a sample you mark as known "
-              "carries its similarity (TLSH) digest and the family name you give it." + CHR_NL + CHR_NL
+              "carries its similarity (TLSH) digest and the family name you give it. An integrity "
+              "change carries the file's path and its old and new SHA-256 and size, and a baseline "
+              "found tampered with names the folders it dropped. A health event says what stopped "
+              "working, and a scan summary counts the files and the threats." + CHR_NL + CHR_NL
             + "The paste guard's warnings and the note on a clean file from a download stay on "
               "this machine and are never sent. Nothing is sent while the address is empty.",
             "Forward events?", parent=self) == "Yes"
@@ -492,7 +501,8 @@ class SettingsDialog(tb.Toplevel):
             if not ok:
                 problems.append(f"start with Windows: {detail}")
 
-        if self.daily_var.get() != state.scheduled_scan:
+        stale = self.daily_var.get() and state.scheduled_scan and scheduling.runs_an_old_command(scheduling.TASK_NAME)
+        if self.daily_var.get() != state.scheduled_scan or stale:
             if self.daily_var.get():
                 ok, detail = scheduling.enable_scheduled_scan(None)      # every watched folder, as of that day
             else:
@@ -506,7 +516,7 @@ class SettingsDialog(tb.Toplevel):
         # they are there: written in place before, a failed save left every
         # switch live (Cancel, and the clipboard was read and files moved
         # anyway), and the next unrelated save persisted them.
-        changes = {
+        shown = {
             "auto_quarantine": bool(self.auto_var.get()),
             "archive_scanning_enabled": bool(self.archives_var.get()),
             "pe_analysis_enabled": bool(self.pe_var.get()),
@@ -515,12 +525,28 @@ class SettingsDialog(tb.Toplevel):
             "watch_paths": [str(p) for p in self.watch_list.get(0, END)],
             "excluded_globs": [str(p) for p in self.excl_list.get(0, END)],
         }
+        # Only what the user changed in this dialog, and a list as what was
+        # added and taken away: every shown value went, from the copy this
+        # window loaded at start, and undid another window's changes.
+        opened = getattr(self, "_opened", None) or {key: getattr(self.cfg, key) for key in shown}
+        changes: dict = {}
+        for key, value in shown.items():
+            if value == opened[key]:
+                continue
+            if isinstance(value, list):
+                changes[key] = config.ListEdit(add=tuple(v for v in value if v not in opened[key]),
+                                               remove=tuple(v for v in opened[key] if v not in value))
+            else:
+                changes[key] = value
         if self._consent_to_forwarding():
-            changes["event_forward_url"] = self.forward_var.get().strip()
+            url = self.forward_var.get().strip()
+            if url != getattr(self, "_opened", {}).get("event_forward_url", self.cfg.event_forward_url):
+                changes["event_forward_url"] = url
         else:
             self.forward_var.set(self.cfg.event_forward_url)
         try:
-            self.cfg.save_changes(changes)
+            if changes:
+                self.cfg.save_changes(changes)
         except OSError as exc:
             Messagebox.show_error(f"Could not save settings: {exc}. Nothing was changed.",
                                   "AVGuard", parent=self)

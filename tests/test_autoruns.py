@@ -20,7 +20,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 _test_data = _os.path.join(_tempfile.gettempdir(), f"avguard-autoruns-data-{_os.getpid()}")
-_os.environ.setdefault("AVGUARD_DATA", _test_data)
+_os.environ["AVGUARD_DATA"] = _test_data      # assigned: an inherited value may be real data
 if _os.environ["AVGUARD_DATA"] == _test_data:
     import atexit as _atexit
     import shutil as _shutil

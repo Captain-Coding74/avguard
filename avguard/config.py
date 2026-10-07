@@ -253,6 +253,22 @@ def keep_aside(path: Path, why: str, move: bool) -> Path:
     return aside
 
 
+@dataclass(frozen=True)
+class ListEdit:
+    """A change to a list setting, applied to the list as it is on disk:
+    what to add and what to take away. A whole list computed from a copy
+    loaded at start wrote back that copy, so two windows' "Never scan"
+    clicks kept only the last, and a Settings save that changed one switch
+    put back folders the other window had removed."""
+
+    add: tuple[str, ...] = ()
+    remove: tuple[str, ...] = ()
+
+    def apply(self, current: list[str]) -> list[str]:
+        kept = [item for item in current if item not in self.remove]
+        return kept + [item for item in self.add if item not in kept]
+
+
 def _kind(default) -> str:
     if isinstance(default, bool):
         return "true or false"
@@ -383,7 +399,7 @@ class Config:
     event_forward_url: str = ""
 
     @classmethod
-    def load(cls, path: Path = CONFIG_PATH) -> "Config":
+    def load(cls, path: Path | None = None) -> "Config":
         """Read config.json, falling back to defaults for anything missing.
 
         A file that cannot be read gives the defaults, is logged, and is
@@ -397,6 +413,7 @@ class Config:
         and paste-guard switches on without their consent dialogs.
         """
         log = logging.getLogger(__name__)
+        path = path or CONFIG_PATH              # read when called, so the location can be moved
         try:
             raw = read_json_object(path) or {}
         except (OSError, UnreadableJSON) as exc:
@@ -431,11 +448,12 @@ class Config:
                 + ("that value" if len(rejected) == 1 else "those values") + " in it as written")
         return loaded
 
-    def save(self, path: Path = CONFIG_PATH) -> None:
+    def save(self, path: Path | None = None) -> None:
+        path = path or CONFIG_PATH
         set_aside_if_unreadable(path)
         atomic_write_text(path, json.dumps(asdict(self), indent=2))
 
-    def save_changes(self, changes: dict, path: Path = CONFIG_PATH) -> None:
+    def save_changes(self, changes: dict, path: Path | None = None) -> None:
         """Write only `changes`, onto the file as it is on disk now, and take
         them into this object only once that has worked.
 
@@ -445,9 +463,14 @@ class Config:
         clipboard was read and files moved regardless. Raises OSError, with
         this object untouched.
         """
+        path = path or CONFIG_PATH
         names = {f.name for f in fields(Config)}
         for key, value in changes.items():
-            if key not in names or not _fits(value, getattr(Config(), key)):
+            if isinstance(value, ListEdit):
+                if key not in names or not isinstance(getattr(Config(), key), list) \
+                        or not _fits([*value.add, *value.remove], []):
+                    raise TypeError(f"{key} is not a list setting to edit with {value!r}")
+            elif key not in names or not _fits(value, getattr(Config(), key)):
                 raise TypeError(f"{key} = {value!r} is not a setting of its type")
         try:
             on_disk = read_json_object(path)
@@ -462,11 +485,18 @@ class Config:
             written = {**asdict(Config.load(path)), **{
                 key: value for key, value in on_disk.items()
                 if key not in names or not _fits(value, getattr(Config(), key))}}
-        written.update(changes)
+        for key, value in changes.items():
+            if isinstance(value, ListEdit):
+                current = written.get(key)
+                if not _fits(current, []):
+                    current = getattr(self, key)
+                written[key] = value.apply(list(current))
+            else:
+                written[key] = value
         set_aside_if_unreadable(path)
         atomic_write_text(path, json.dumps(written, indent=2))
-        for key, value in changes.items():
-            setattr(self, key, value)
+        for key in changes:
+            setattr(self, key, list(written[key]) if isinstance(changes[key], ListEdit) else changes[key])
 
     @property
     def vt_api_key(self) -> str | None:

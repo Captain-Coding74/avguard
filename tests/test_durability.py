@@ -55,7 +55,7 @@ import os as _os
 import tempfile as _tempfile
 
 _test_data = _os.path.join(_tempfile.gettempdir(), f"avguard-test-data-{_os.getpid()}")
-_os.environ.setdefault("AVGUARD_DATA", _test_data)
+_os.environ["AVGUARD_DATA"] = _test_data      # assigned: an inherited value may be real data
 def _remove_tree(path) -> None:
     """rmtree that copes with read-only files.
 
@@ -1873,6 +1873,8 @@ class TestTheWatchedFoldersAreTheProtectedOnes(TempCase):
         fake._watch_gaps = lambda globs=None: self.gui.AVGuardApp._watch_gaps(fake, globs)
         fake._start_realtime = lambda: self.gui.AVGuardApp._start_realtime(fake)
         fake._check_realtime_health = lambda: None
+        fake._take_the_lock_if_free = lambda: None
+        fake._take_settings_from_disk = lambda: None
         fake.monitor = _FakeMonitor()
         self.glob_for = dialogs.glob_for
         return fake
@@ -1911,7 +1913,13 @@ class TestTheWatchedFoldersAreTheProtectedOnes(TempCase):
         with mock.patch.object(self.gui.Messagebox, "yesno", return_value="No") as asked, \
                 mock.patch.object(config.Config, "save_changes") as saved:
             self.gui.AVGuardApp._exclude_folder(fake, self.here)
-        self.assertIn("real-time protection watches", asked.call_args.args[0])
+        self.assertIn(f"Real-time protection watches {self.here}", asked.call_args.args[0])
+        saved.assert_not_called()
+        parent = self.tmp                                   # contains the watched folder
+        with mock.patch.object(self.gui.Messagebox, "yesno", return_value="No") as asked, \
+                mock.patch.object(config.Config, "save_changes") as saved:
+            self.gui.AVGuardApp._exclude_folder(fake, parent)
+        self.assertIn(f"watches {self.here}", asked.call_args.args[0], "the parent was called the watched folder")
         saved.assert_not_called()
         other = self.tmp / "elsewhere"
         other.mkdir()
@@ -2136,6 +2144,261 @@ class TestRoundSevenKeptFilesAreReadStrictly(TempCase):
             {"acme": {"name": "acme", "trusted": True, "rule_count": 1}}).encode())
         again = PackStore(directory=packs.directory, index_path=packs.index_path)
         self.assertEqual([p.name for p in again.packs()], ["acme"], "a BOM read as no packs")
+
+
+class TestRoundSevenTwoWindows(TempCase):
+    """Round seven: a window started without the lock never took it, so
+    when the other closed nothing protected and every surface still said
+    the other window did; Settings saved in the second window never reached
+    the one that runs; Settings and "Never scan" wrote every shown value
+    from the copy their window loaded at start, undoing the other window's
+    changes; the real-time switch saved "off" when a start found no
+    folder; and Settings never started protection that was not running."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        try:
+            from avguard import gui
+        except ImportError:
+            self.skipTest("GUI dependencies are not installed")
+        from types import SimpleNamespace
+        self.gui, self.ns = gui, SimpleNamespace
+        self.path = self.tmp / "config.json"
+        config.Config(watch_paths=[str(self.tmp)], auto_quarantine=True).save(self.path)
+        patcher = mock.patch.object(config, "CONFIG_PATH", self.path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_two_windows_never_scan_clicks_keep_both(self):
+        first, second = config.Config.load(self.path), config.Config.load(self.path)
+        first.save_changes({"excluded_globs": config.ListEdit(add=("D:/Games/**",))}, self.path)
+        second.save_changes({"excluded_globs": config.ListEdit(add=("D:/VMs/**",))}, self.path)
+        kept = config.Config.load(self.path).excluded_globs
+        self.assertIn("D:/Games/**", kept, "the first window's exclusion was written over")
+        self.assertIn("D:/VMs/**", kept)
+        self.assertEqual(second.excluded_globs, kept, "the window took a list other than the one saved")
+
+    def test_settings_saves_only_what_was_changed_there(self):
+        from avguard import dialogs
+        mine = config.Config.load(self.path)                       # this window, at start
+        config.Config.load(self.path).save_changes({"auto_quarantine": False,
+                                                     "watch_paths": [str(self.tmp), "D:/Work"]}, self.path)
+        get = lambda value: self.ns(get=lambda: value)           # noqa: E731
+        opened = {key: getattr(mine, key) for key in (
+            "auto_quarantine", "archive_scanning_enabled", "pe_analysis_enabled", "paste_guard_enabled",
+            "ioc_feed_enabled", "watch_paths", "excluded_globs", "event_forward_url")}
+        fake = self.ns(cfg=mine, _opened=opened, auto_var=get(mine.auto_quarantine), archives_var=get(True),
+                       pe_var=get(False), paste_var=get(mine.paste_guard_enabled), ioc_feed_var=get(False),
+                       forward_var=self.ns(get=lambda: "", set=lambda value: None),
+                       watch_list=self.ns(get=lambda *a: tuple(mine.watch_paths) + ("E:/Photos",)),
+                       excl_list=self.ns(get=lambda *a: tuple(mine.excluded_globs)),
+                       _consent_to_forwarding=lambda: True, _apply_scheduling=lambda: [],
+                       _apply_context_menu=lambda: [], destroy=lambda: None, _on_saved=lambda: None)
+        dialogs.SettingsDialog._save(fake)
+        on_disk = config.Config.load(self.path)
+        self.assertFalse(on_disk.auto_quarantine, "the other window's 'off' was reverted")
+        self.assertEqual(on_disk.watch_paths, [str(self.tmp), "D:/Work", "E:/Photos"])
+        self.assertFalse(on_disk.pe_analysis_enabled)
+
+    def window(self, has_lock: bool, acquire: bool = False):
+        calls = []
+        cfg = config.Config.load(self.path)
+        fake = self.ns(cfg=cfg, has_lock=has_lock, _shutting_down=False,
+                       lock=self.ns(acquire=lambda: acquire),
+                       _settle_the_store=lambda: calls.append("settle"),
+                       _apply_settings=lambda: calls.append("apply"),
+                       _refresh_quarantine=lambda: calls.append("refresh"),
+                       _banner=lambda text, style="": calls.append(text))
+        fake._config_file_stamp = self.gui.AVGuardApp._config_file_stamp
+        return fake, calls
+
+    def test_a_window_takes_the_lock_when_the_other_has_gone(self):
+        fake, calls = self.window(has_lock=False, acquire=False)
+        self.gui.AVGuardApp._take_the_lock_if_free(fake)
+        self.assertEqual((fake.has_lock, calls), (False, []))
+        fake.lock = self.ns(acquire=lambda: True)
+        self.gui.AVGuardApp._take_the_lock_if_free(fake)
+        self.assertTrue(fake.has_lock)
+        self.assertEqual(calls[:3], ["settle", "apply", "refresh"])
+        self.assertIn("now protects", calls[-1])
+
+    def test_the_holder_takes_settings_another_window_saved(self):
+        fake, calls = self.window(has_lock=True)
+        fake._config_stamp = fake._config_file_stamp()
+        self.gui.AVGuardApp._take_settings_from_disk(fake)
+        self.assertEqual(calls, [], "nothing changed, and something was applied")
+        time.sleep(0.01)
+        config.Config.load(self.path).save_changes({"auto_quarantine": False}, self.path)
+        os.utime(self.path, ns=(time.time_ns() + 10**9, time.time_ns() + 10**9))
+        self.gui.AVGuardApp._take_settings_from_disk(fake)
+        self.assertFalse(fake.cfg.auto_quarantine, "the holder kept moving files")
+        self.assertEqual(calls[0], "apply")
+
+    def test_the_switch_saves_what_the_user_chose(self):
+        cfg = config.Config.load(self.path)
+        cfg.save_changes({"realtime_enabled": False}, self.path)
+        switch = self.ns(value=True)
+        fake = self.ns(cfg=cfg, realtime_var=self.ns(get=lambda: switch.value,
+                                                     set=lambda v: setattr(switch, "value", v)),
+                       _start_realtime=lambda: setattr(switch, "value", False),     # no folder found
+                       _banner=lambda *a: None)
+        self.gui.AVGuardApp._toggle_realtime(fake)
+        self.assertTrue(config.Config.load(self.path).realtime_enabled, "a failed start was saved as 'off'")
+
+    def test_settings_start_protection_that_was_not_running(self):
+        started = []
+        cfg = config.Config.load(self.path)
+        fake = self.ns(cfg=cfg, has_lock=True, scanner=self.ns(cfg=None, rekey_cache=lambda: 0, cache=None),
+                       cloud=self.ns(cfg=None), _forwarding_changed=lambda: None,
+                       _update_blocklist_feed=lambda: None,
+                       monitor=self.ns(running=False, stop=lambda: None),
+                       _start_realtime=lambda: started.append(1),
+                       realtime_var=self.ns(set=lambda v: None), status_var=self.ns(set=lambda v: None),
+                       _config_file_stamp=lambda: 0)
+        self.gui.AVGuardApp._apply_settings(fake)
+        self.assertEqual(started, [1], "a folder chosen in Settings was never watched")
+        self.assertIs(fake.cloud.cfg, fake.cfg, "the VirusTotal client kept the Config it started with")
+
+
+class TestRoundSevenTheWindowSaysWhatRuns(TempCase):
+    """Round seven, the window's code no test reached: the Health rows, the
+    ticks it starts, the second window's banner, the switches after a
+    failed save, first run, a restore with a warning, shutdown."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        try:
+            from avguard import gui
+        except ImportError:
+            self.skipTest("GUI dependencies are not installed")
+        from types import SimpleNamespace
+        self.gui, self.ns = gui, SimpleNamespace
+
+    def test_the_realtime_row_is_red_for_a_folder_it_does_not_protect(self):
+        fake = self.ns(has_lock=True, cfg=config.Config(realtime_enabled=True),
+                       monitor=self.ns(broken_links=lambda: [], watched=[self.tmp]),
+                       _watch_gaps=lambda: [f"{self.tmp / 'later'} does not exist"])
+        ok, text = self.gui.AVGuardApp._describe_realtime(fake)
+        self.assertFalse(ok)
+        self.assertIn("NOT protecting", text)
+        fake._watch_gaps = lambda: []
+        self.assertEqual(self.gui.AVGuardApp._describe_realtime(fake), (True, "watching 1 folder(s)"))
+        fake.has_lock = False
+        self.assertEqual(self.gui.AVGuardApp._describe_realtime(fake), (True, "runs in the other AVGuard window"))
+
+    def test_the_feed_check_started_is_the_hourly_tick(self):
+        armed = []
+        fake = self.ns(after=lambda ms, fn: armed.append(fn), _pump=1, _check_realtime_health=2,
+                       _feed_tick="tick", _update_blocklist_feed="one-shot", _tick_clipboard=3)
+        self.gui.AVGuardApp._start_ticks(fake)
+        self.assertIn("tick", armed)
+        self.assertNotIn("one-shot", armed)
+
+    def test_the_second_windows_banner_leaves_the_setting_alone(self):
+        cfg = config.Config(auto_quarantine=True)
+        said = []
+        fake = self.ns(has_lock=False, cfg=cfg, lock=self.ns(owner_pid=42),
+                       _banner=lambda text, style="": said.append(text))
+        self.gui.AVGuardApp._say_who_holds_the_lock(fake)
+        self.assertTrue(cfg.auto_quarantine)
+        self.assertIn("pid 42", said[0])
+
+    def test_the_paste_guard_row_in_the_second_window(self):
+        fake = self.ns(cfg=config.Config(paste_guard_enabled=True), has_lock=False)
+        self.assertEqual(self.gui.AVGuardApp._describe_paste_guard(fake)[0], True)
+        self.assertIn("other AVGuard window", self.gui.AVGuardApp._describe_paste_guard(fake)[1])
+
+    def test_the_virustotal_switch_shows_what_was_saved(self):
+        switch = self.ns(value=True)
+        cfg = config.Config(cloud_enabled=False)
+        fake = self.ns(cfg=cfg, cloud_var=self.ns(get=lambda: switch.value,
+                                                  set=lambda v: setattr(switch, "value", v)))
+        with mock.patch.dict(os.environ, {"VT_API_KEY": "test-key-not-real"}), \
+                mock.patch.object(self.gui, "Messagebox"), \
+                mock.patch.object(config.Config, "save_changes", side_effect=OSError("disk full")):
+            self.gui.AVGuardApp._toggle_cloud(fake)
+        self.assertFalse(switch.value, "the switch said on for a setting that was not saved")
+
+    def test_first_run_choices_run_this_session_when_they_cannot_be_saved(self):
+        cfg = config.Config(auto_quarantine=False, realtime_enabled=False)
+        fake = self.ns(cfg=cfg, _start_realtime=lambda: None)
+        with mock.patch.object(config.Config, "save_changes", side_effect=OSError("read-only")):
+            self.gui.AVGuardApp._apply_first_run(fake, True, True)
+        self.assertEqual((cfg.auto_quarantine, cfg.paste_guard_enabled, cfg.onboarding_completed),
+                         (True, True, True))
+
+    def test_a_restore_with_a_warning_still_reaches_history(self):
+        from avguard.events import EventStore
+        from avguard.quarantine import RestoreIncomplete
+        events = EventStore(self.tmp / "events.jsonl")
+        record = self.ns(original_name="a.docx", original_path=str(self.tmp / "a.docx"), reasons=["r"],
+                         sha256="ab" * 32, entry_id="x")
+        store = self.ns(get=lambda entry_id: record,
+                        restore=mock.Mock(side_effect=RestoreIncomplete(self.tmp / "a.docx", "the allowlist is read-only")))
+        fake = self.ns(quarantine=store, events=events, has_lock=True, _allowlist_changed=lambda: None,
+                       _refresh_quarantine=lambda: None, _without_the_lock=lambda what: False)
+        fake._record_restore = self.gui.AVGuardApp._record_restore.__get__(fake)
+        with mock.patch.object(self.gui, "Messagebox") as box:
+            box.yesno.return_value = "Yes"
+            self.gui.AVGuardApp._restore_entry(fake, "x")
+        self.assertEqual([e.kind for e in events.read()], ["restored"])
+
+    def test_shutdown_writes_no_config(self):
+        stopped = []
+        fake = self.ns(_shutting_down=False, _cancel=self.ns(set=lambda: None),
+                       monitor=self.ns(stop=lambda: stopped.append("monitor")), _scan_thread=None,
+                       integrity=self.ns(stop=lambda timeout: None), startup=self.ns(stop=lambda timeout: None),
+                       cache=self.ns(save=lambda: None), cloud=self.ns(save_cache=lambda: None),
+                       forwarder=None, tray=None, lock=self.ns(release=lambda: None),
+                       quit=lambda: None, destroy=lambda: None, cfg=config.Config())
+        with mock.patch.object(config.Config, "save") as whole, \
+                mock.patch.object(config.Config, "save_changes") as changed:
+            self.gui.AVGuardApp.shutdown(fake)
+        whole.assert_not_called()                 # shutdown swallows what raises: counted, not raised
+        changed.assert_not_called()
+        self.assertEqual(stopped, ["monitor"])
+
+    def test_the_forwarding_consent_names_what_an_integrity_event_carries(self):
+        from avguard import dialogs
+        fake = self.ns(forward_var=self.ns(get=lambda: "http://127.0.0.1:9/events"), cfg=config.Config())
+        with mock.patch.object(dialogs, "Messagebox") as box:
+            box.yesno.return_value = "No"
+            dialogs.SettingsDialog._consent_to_forwarding(fake)
+        said = box.yesno.call_args.args[0]
+        self.assertIn("old and new SHA-256 and size", said, "--fim-check POSTs them, unnamed")
+        self.assertIn("scan summary", said)
+
+    def test_settings_schedule_every_watched_folder(self):
+        from avguard import dialogs, scheduling
+        get = lambda value: self.ns(get=lambda: value)          # noqa: E731
+        fake = self.ns(startup_var=get(False), daily_var=get(True),
+                       cfg=config.Config(watch_paths=["D:/One", "D:/Two"]))
+        with mock.patch.object(scheduling, "status", return_value=scheduling.ScheduleStatus()), \
+                mock.patch.object(scheduling, "enable_scheduled_scan", return_value=(True, "daily")) as daily:
+            self.assertEqual(dialogs.SettingsDialog._apply_scheduling(fake), [])
+        self.assertIsNone(daily.call_args.args[0], "only the first watched folder was scheduled")
+
+    def test_the_only_watched_folder_missing_at_start_is_watched_when_it_appears(self):
+        later = self.tmp / "usb"
+        cfg = config.Config(watch_paths=[str(later)], realtime_enabled=True)
+        monitor = _FakeMonitor()
+        said = []
+        fake = self.ns(cfg=cfg, has_lock=True, _shutting_down=False, monitor=monitor,
+                       _banner=lambda text, style="": said.append(text),
+                       status_var=self.ns(set=lambda text: None),
+                       realtime_var=self.ns(get=lambda: False, set=lambda value: None),
+                       after=lambda *a: None, _check_realtime_health=lambda: None,
+                       _take_the_lock_if_free=lambda: None, _take_settings_from_disk=lambda: None)
+        fake._watch_targets = lambda: config.watch_targets(fake.cfg)
+        fake._watch_gaps = lambda globs=None: self.gui.AVGuardApp._watch_gaps(fake, globs)
+        fake._start_realtime = lambda: self.gui.AVGuardApp._start_realtime(fake)
+        self.gui.AVGuardApp._start_realtime(fake)
+        self.assertEqual(monitor.watched, [])
+        self.assertIn(str(later), said[-1], "the banner did not name the missing folder")
+        self.assertTrue(cfg.realtime_enabled, "the user's setting was switched off")
+        later.mkdir()
+        self.gui.AVGuardApp._check_realtime_health(fake)
+        self.assertEqual(monitor.watched, [later])
 
 
 class _FakeMonitor:

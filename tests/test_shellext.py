@@ -25,7 +25,7 @@ import os as _os
 import tempfile as _tempfile
 
 _test_data = _os.path.join(_tempfile.gettempdir(), f"avguard-test-data-{_os.getpid()}")
-_os.environ.setdefault("AVGUARD_DATA", _test_data)
+_os.environ["AVGUARD_DATA"] = _test_data      # assigned: an inherited value may be real data
 
 
 def _remove_tree(path) -> None:
@@ -295,6 +295,58 @@ class TestTheCommandLine(unittest.TestCase):
         self.assertEqual(len(shown), 1)
         self.assertIn("Threats  : 1", shown[0][1])
         self.assertIn("threat.bin", shown[0][1])
+
+
+class TestRoundSevenRegistrationsThatRunNothing(unittest.TestCase):
+    """Round seven: a verb or a task registered before its command was
+    fixed kept "-m avguard", Health said "installed", and Settings never
+    rewrote it; --schedule off read schtasks's English to decide that
+    nothing was scheduled; and nothing tested the scheduled tasks' command
+    for a source install."""
+
+    def test_an_old_right_click_command_is_seen_and_rewritten(self):
+        reg = FakeRegistry()
+        self.assertTrue(shellext.install(reg)[0])
+        self.assertFalse(shellext.stale(reg))
+        command = HKCU_STAR + BS + "command"
+        reg.SetValueEx(FakeKey(reg, command), "", 0, reg.REG_SZ, '"pythonw.exe" -m avguard --scan "%1" --pause')
+        self.assertTrue(shellext.stale(reg))
+        self.assertTrue(shellext.install(reg)[0])
+        self.assertFalse(shellext.stale(reg))
+
+    def test_an_old_task_command_is_seen(self):
+        from avguard import scheduling
+        xml = ("<Task><Actions><Exec><Command>C:\\Python\\pythonw.exe</Command>"
+               "<Arguments>-m avguard --scan &quot;C:\\Users\\u\\Downloads&quot;</Arguments></Exec></Actions></Task>")
+        with mock.patch.object(scheduling, "_run", return_value=(True, xml)):
+            self.assertTrue(scheduling.runs_an_old_command(scheduling.TASK_NAME))
+        fresh = xml.replace("-m avguard --scan &quot;C:\\Users\\u\\Downloads&quot;", "&quot;C:\\a\\run.py&quot; --scan-watched")
+        with mock.patch.object(scheduling, "_run", return_value=(True, fresh)):
+            self.assertFalse(scheduling.runs_an_old_command(scheduling.TASK_NAME))
+
+    def test_schedule_off_with_nothing_scheduled_in_any_language(self):
+        from avguard import scheduling
+        replies = {"/Query": (False, "FEHLER: Das System kann die angegebene Datei nicht finden."),
+                   "/Delete": (False, "FEHLER: Das System kann die angegebene Datei nicht finden.")}
+        with mock.patch.object(scheduling.sys, "platform", "win32"), \
+                mock.patch.object(scheduling, "_run", side_effect=lambda args: replies[args[1]]):
+            for disable in (scheduling.disable_scheduled_scan, scheduling.disable_scheduled_fim_check,
+                            scheduling.disable_scheduled_autoruns_snapshot):
+                with self.subTest(disable=disable.__name__):
+                    ok, _ = disable()
+                    self.assertTrue(ok, "nothing scheduled read as a failure in German")
+        replies["/Query"] = (True, "")
+        with mock.patch.object(scheduling.sys, "platform", "win32"), \
+                mock.patch.object(scheduling, "_run", side_effect=lambda args: replies[args[1]]):
+            self.assertFalse(scheduling.disable_scheduled_scan()[0], "a task that is there was not removed")
+
+    def test_the_task_command_for_a_source_install_runs_run_py(self):
+        from avguard import scheduling
+        with mock.patch.object(scheduling.sys, "frozen", False, create=True):
+            runner, own = scheduling._launcher()
+        self.assertIn("run.py", own)
+        self.assertNotIn("-m avguard", own)
+        self.assertTrue(scheduling.task_command("--scan-watched").endswith("--scan-watched"))
 
 
 if __name__ == "__main__":

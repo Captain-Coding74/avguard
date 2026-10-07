@@ -18,6 +18,7 @@ neither is turned on by anything except the user asking for it.
 
 from __future__ import annotations
 
+import html
 import logging
 import os
 import subprocess
@@ -145,6 +146,44 @@ def disable_start_with_windows() -> tuple[bool, str]:
 
 # --------------------------------------------------------------- scheduled scan
 
+def _delete_task(name: str, what: str) -> tuple[bool, str]:
+    """Remove a task, and say so; a task that is not there is removed.
+    Asked with /Query first, whose exit code does not depend on the display
+    language: a failed /Delete counted as "not there" only when its message
+    held the English words "cannot find", so on a German or French Windows
+    with nothing scheduled, --schedule off said NOT removed and exited 1."""
+    if sys.platform != "win32":
+        return True, "nothing is scheduled off Windows"
+    exists, _ = _run(["schtasks", "/Query", "/TN", name])
+    if not exists:
+        return True, "not scheduled"
+    ok, output = _run(["schtasks", "/Delete", "/F", "/TN", name])
+    if not ok:
+        return False, output or "schtasks refused to remove it"
+    log.info("removed %s", what)
+    return True, "removed"
+
+
+def registered_command(name: str) -> str | None:
+    """What a registered task runs, command and arguments, or None."""
+    ok, output = _run(["schtasks", "/Query", "/TN", name, "/XML"])
+    if not ok:
+        return None
+    import re
+    found = [html.unescape(m) for m in re.findall(r"<(?:Command|Arguments)>(.*?)</(?:Command|Arguments)>",
+                                                    output, re.DOTALL)]
+    return " ".join(found) if found else None
+
+
+def runs_an_old_command(name: str) -> bool:
+    """A task registered before its command was fixed: "-m avguard", which
+    needs the checkout as the working directory (Task Scheduler starts in
+    System32) and which the packaged AVGuard.exe rejects. New registrations
+    were right; old ones kept running nothing, and said nothing."""
+    command = registered_command(name)
+    return command is not None and "-m avguard" in command
+
+
 def scheduled_scan_exists() -> bool:
     ok, _ = _run(["schtasks", "/Query", "/TN", TASK_NAME])
     return ok
@@ -177,13 +216,7 @@ def enable_scheduled_scan(target: Path | None = None, time_of_day: str = "12:00"
 
 
 def disable_scheduled_scan() -> tuple[bool, str]:
-    if sys.platform != "win32":
-        return True, "nothing is scheduled off Windows"
-    ok, output = _run(["schtasks", "/Delete", "/F", "/TN", TASK_NAME])
-    if not ok and "cannot find" not in output.lower():
-        return False, output
-    log.info("removed the scheduled scan")
-    return True, "removed"
+    return _delete_task(TASK_NAME, "the scheduled scan")
 
 
 FIM_TASK_NAME = "AVGuard FIM check"
@@ -209,13 +242,7 @@ def enable_scheduled_fim_check(time_of_day: str = "12:30") -> tuple[bool, str]:
 
 
 def disable_scheduled_fim_check() -> tuple[bool, str]:
-    if sys.platform != "win32":
-        return True, "nothing is scheduled off Windows"
-    ok, output = _run(["schtasks", "/Delete", "/F", "/TN", FIM_TASK_NAME])
-    if not ok and "cannot find" not in output.lower():
-        return False, output
-    log.info("removed the scheduled integrity check")
-    return True, "removed"
+    return _delete_task(FIM_TASK_NAME, "the scheduled integrity check")
 
 
 AUTORUNS_TASK_NAME = "AVGuard startup snapshot"
@@ -241,13 +268,7 @@ def enable_scheduled_autoruns_snapshot(time_of_day: str = "12:45") -> tuple[bool
 
 
 def disable_scheduled_autoruns_snapshot() -> tuple[bool, str]:
-    if sys.platform != "win32":
-        return True, "nothing is scheduled off Windows"
-    ok, output = _run(["schtasks", "/Delete", "/F", "/TN", AUTORUNS_TASK_NAME])
-    if not ok and "cannot find" not in output.lower():
-        return False, output
-    log.info("removed the scheduled startup snapshot")
-    return True, "removed"
+    return _delete_task(AUTORUNS_TASK_NAME, "the scheduled startup snapshot")
 
 
 def status() -> ScheduleStatus:

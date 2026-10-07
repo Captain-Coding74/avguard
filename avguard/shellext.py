@@ -118,13 +118,25 @@ def uninstall(registry=None) -> tuple[bool, str]:
     return True, "removed"
 
 
-def installed(registry=None) -> bool:
+def registered_command(registry=None) -> str | None:
     reg = registry if registry is not None else _default_registry()
     if reg is None:
-        return False
+        return None
     try:
         with reg.OpenKey(reg.HKEY_CURRENT_USER, KEY_PATHS[0] + "\\command", 0, reg.KEY_READ) as key:
             value, _ = reg.QueryValueEx(key, "")
     except OSError:
-        return False
-    return bool(value)
+        return None
+    return str(value) if value else None
+
+
+def installed(registry=None) -> bool:
+    return registered_command(registry) is not None
+
+
+def stale(registry=None) -> bool:
+    """Installed, with a command other than the one this AVGuard writes: a
+    verb registered before it was fixed ran "-m avguard" from the folder
+    clicked in, and Health said "installed" while it started nothing."""
+    command = registered_command(registry)
+    return command is not None and command != command_string()
