@@ -461,6 +461,14 @@ changes nothing. The list is part of the detection generation, so a file
 cached CLEAN before an import is judged again, and a running AVGuard notices
 an import made from a terminal within seconds.
 
+The daily download is MalwareBazaar's recent export, which holds the last 48
+hours. A PC that does not reach the feed for longer than that (switched off
+for a long weekend) never receives the hashes published in between: the next
+export no longer has them. Health and `--iocs-status` then say from when
+hashes may be missing, until `--iocs-update --iocs-full` fetches the full
+export once. That is not done automatically, because it is a much larger
+download than the one you agreed to.
+
 ## Similarity to a known sample
 
 A SHA-256 matches identical bytes and nothing else. Changing one byte

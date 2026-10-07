@@ -1561,6 +1561,60 @@ reproduced here and noted: a history format offered by delayed rendering
 makes the read wait on its owner's code, and the hung-owner check only
 catches an owner hung for 5 s or more.
 
+**Round six, 2026-10-07.** A whole-codebase audit with nine lenses
+(quarantine, the signed stores, the scan pipeline, the network, the shell
+and command line, the window, the README's claims, the tests and hostile
+input). Each lens ran its own reproduction scripts against a copy of
+70f9c41. 44 findings were fixed in six commits (355add5, abe217a, 57fc0eb,
+8c1aaa9, fc7a65d and the commit that adds this paragraph); they are rows
+61-104 of [docs/open-issues.md](docs/open-issues.md). Every one was
+reproduced again by hand before it was fixed. Every test added for it was
+run against the commit before the fix: 17, 14, 12, 12, 16 and 3 methods
+fail there and pass here. The audit's skeptics and its tests lens did not
+finish (a usage limit), so those failing tests are the second opinion. An
+audit for vacuous and mutant-surviving tests is the open item it leaves.
+
+What was measured:
+
+| | Before | After |
+|---|---|---|
+| Lockless reconcile, 500 quarantines under a looping second process | 33 and 22 files lost | 0 and 0 |
+| Flushing payload and restore (500 quarantines) | 3.6-4.7 s | 5.1-5.4 s (~1 ms a file) |
+| FIM lock held, re-baseline of 20,000 files | 1.77 s | 0.23 s |
+| FIM lock held, first baseline | 0.48 s | 0.07 s |
+| FIM lock held, accepting a 1 GiB file | 1.01 s | 0.02 s |
+| bomb1g_x1.zip (3 KB, bzip2 member declaring 100 bytes) | CLEAN, 12.9 s, 2,097 MB | SUSPICIOUS, 0.2 s, 115 MB |
+| bomb4g_x1.zip | CLEAN, 57.7 s, 8,233 MB | SUSPICIOUS, 0.2 s, 106 MB |
+| bomb1g_x8.zip | CLEAN, 53.3 s, 2,089 MB | SUSPICIOUS, 1.9 s, 329 MB |
+| budget.zip (20 lying members) | 212 s, inspection alone | 1.8 s, whole scan |
+| liar.zip (marker past a declared size) | CLEAN | MALICIOUS |
+| A zip with a non-UTF-8 name, or "version needed" 25.5 | traceback, Threats 0, exit 0 | MALICIOUS, exit 1 |
+| A typo in one user rule file | 0 rules loaded | 5 loaded, the file named |
+
+Tests 786 -> 806 -> 819 -> 831 -> 842 -> 859 -> 862, each commit green
+under `python3.13 -m unittest discover -s tests` and under Xvfb with the
+GUI dependencies. One correction: abe217a's message says 820, but the suite
+it committed counts 819.
+
+What it changed in how this project works. A file AVGuard reads is no
+longer trusted as written. A BOM, a quoted `"false"`, a character torn in
+half, a mistyped record, a zip header that lies, a signature file holding a
+byte that is not text: each was read as empty, as true, as a crash or as
+clean, and some were then saved over. Now each is read strictly, the
+program says what it could not read, and it sets the file aside before
+writing anything over it. One bad record no longer takes the others down
+with it. The other half: "in use", "missing", "excluded" and "partly
+removed" are states now, each with its own words and its own exit code.
+Before, they read as "no changes", "watching", "OK" and exit 0.
+DETECTION_VERSION went 15 -> 16 for the bounded unzip, which changes what an
+archive verdict means. VirusTotal's switch and extensions joined the cache
+generation for the same reason.
+
+Not done. The daily feed is the 48-hour export, and a PC that misses more
+than that loses those hashes for good. Health and `--iocs-status` now say so
+and name `--iocs-full`, but nothing downloads the full export by itself:
+it is a far larger request than the one the user agreed to.
+
 ## Deliberately not doing
 
 The paste guard (above) is the one input that is not a file; it watches a user-mode clipboard buffer through documented calls, with no driver, no hook and no process telemetry, so it does not reopen the first decision here. The EDR-shaped extensions of it are refused by name: no keyboard hook to see Win+R, no automation of the Run dialog, no watching what the user then runs.

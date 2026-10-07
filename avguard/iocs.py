@@ -65,6 +65,10 @@ FEED_FULL_URL = "https://bazaar.abuse.ch/export/txt/sha256/full/"
 # feed, and a download that is not the feed must not touch the list.
 FEED_MIN_VALID_LINES = 100
 FEED_INTERVAL_SECONDS = 24 * 3600
+# What the recent export holds. A download more than this after the last
+# contact has missed what was published in between, for good: the recent
+# export no longer carries it, and only the full export does.
+FEED_WINDOW_SECONDS = 48 * 3600
 FEED_MAX_BYTES = 256 * 1024 * 1024
 CONNECT_TIMEOUT = 5
 READ_TIMEOUT = 60
@@ -175,6 +179,9 @@ class FeedResult:
     status: str                       # "updated" | "unchanged" | "not due" | "disabled"
     url: str = ""
     imported: ImportResult | None = None
+    # When this download found the feed not reached for longer than the
+    # recent export covers: the time of the contact before it, else 0.
+    missed_since: float = 0.0
 
 
 def parse_hashes(lines: Iterable[str]) -> tuple[list[bytes], int, int]:
@@ -503,9 +510,10 @@ class IocStore:
                 "updated_at": self._get_meta("feed_updated_at"),
                 "etag": self._get_meta("feed_etag"),
                 "url": self._get_meta("feed_url"),
+                "gap_since": self._get_meta("feed_gap_since"),
             }
         except sqlite3.Error:
-            return {"checked_at": "", "updated_at": "", "etag": "", "url": ""}
+            return {"checked_at": "", "updated_at": "", "etag": "", "url": "", "gap_since": ""}
 
     def feed_due(self, now: float | None = None) -> bool:
         """At most once a day, whatever the caller's enthusiasm."""
@@ -564,6 +572,17 @@ class IocStore:
                 f"line(s); that is not the feed (a captive portal or an error page, "
                 f"most likely). The blocklist is unchanged.")
 
+        # The last contact, a 304 included: what was published since then is
+        # what this download has to hold. The recent export holds 48 hours.
+        try:
+            previous = float(self._get_meta("feed_checked_at", "0") or 0)
+        except ValueError:
+            previous = 0.0
+        now = time.time()
+        everything = full or url == FEED_FULL_URL
+        missed = previous if (not everything and previous and now - previous > FEED_WINDOW_SECONDS) else 0.0
+        gap_since = "" if everything else (self._get_meta("feed_gap_since") or (str(missed) if missed else ""))
+
         result = self.import_digests(digests, FEED_SOURCE)
         result.lines = seen
         result.rejected = rejected
@@ -572,10 +591,17 @@ class IocStore:
             with conn:
                 self._set_meta(conn, "feed_etag", response.headers.get("ETag", "") or "")
                 self._set_meta(conn, "feed_url", url)
-                self._set_meta(conn, "feed_updated_at", str(time.time()))
-                self._set_meta(conn, "feed_checked_at", str(time.time()))
+                self._set_meta(conn, "feed_updated_at", str(now))
+                self._set_meta(conn, "feed_checked_at", str(now))
+                # Kept until a full export fills it: the oldest contact a gap
+                # followed. A window closed for a week was silent about it.
+                self._set_meta(conn, "feed_gap_since", gap_since)
         log.info("blocklist feed %s: %s", url, result.describe())
-        return FeedResult(status="updated", url=url, imported=result)
+        if missed:
+            log.warning("blocklist feed: the feed was last reached %.0f hours ago and the recent export "
+                        "holds 48, so hashes published in between are missing; "
+                        "avguard --iocs-update --iocs-full fetches everything", (now - missed) / 3600)
+        return FeedResult(status="updated", url=url, imported=result, missed_since=missed)
 
     def _record_check(self, url: str) -> None:
         with self._write_lock:

@@ -1409,6 +1409,13 @@ class AVGuardApp(tb.Window):
                 feed = "daily feed on, not fetched yet"
         else:
             feed = "daily feed off - nothing is fetched"
+        if state.get("gap_since"):
+            try:
+                since = datetime.fromtimestamp(float(state["gap_since"])).strftime("%Y-%m-%d %H:%M")
+            except (ValueError, OSError):
+                since = "an earlier download"
+            feed += (f"; hashes published after {since} may be missing (more than the 48 hours the "
+                     "daily export holds went by): avguard --iocs-update --iocs-full fetches them")
         references = store.tlsh_count()
         similarity = (f"; {references:,} TLSH reference(s) for similarity"
                       if references else "")

@@ -82,8 +82,79 @@ Ranked by the same rule as everything else in this project:
 | 58 | The index stamp missed a same-size rewrite in the same tick (4 of 200) | `tests/test_rulepacks.py` |
 | 59 | The dot-path skip dropped `.github` and `.gitignore` from the self-match set | `tests/test_rulepacks.py` |
 | 60 | A restore whose decision was not recorded was reported as a failed restore | `tests/test_durability.py` |
+| 61 | **A store built without the lock reconciled the index and deleted a quarantine in progress (33 and 22 of 500 files lost under stress, 0 after); reconcile deleted the only copy whenever any file sat at the old path** | `tests/test_durability.py` |
+| 62 | **An index, allowlist, pack index or config with a BOM, a non-UTF-8 byte or a non-object was read as empty and then saved over: every held file's nonce, every kept decision** | `tests/test_durability.py` |
+| 63 | **The payload, and the restored file, were never flushed before the unlink that made each the only copy** | `tests/test_durability.py` |
+| 64 | **`--scan --quarantine` and the window moved whatever was at the path when the move ran, not the bytes the verdict was reached on** | `tests/test_durability.py`, `tests/test_cli.py` |
+| 65 | Export wrote damaged payloads as "the original, unmodified files"; `--export-all` exited 0 with one of three not written | `tests/test_durability.py`, `tests/test_cli.py` |
+| 66 | A second window could restore and delete; the lock holder then wrote the removed record back | `tests/test_durability.py` |
+| 67 | The retention review the README and ROADMAP described did not exist | `tests/test_durability.py` |
+| 68 | A name near 255 characters could be neither restored nor exported; a payload another program held undid a finished restore; the relative-destination check ran after `resolve()` and never fired | `tests/test_durability.py` |
+| 69 | **Baselining any folder, or accepting any change, re-signed a doctored, unsigned or copied-in baseline, so the tamper was never reported** | `tests/test_fim.py` |
+| 70 | A check locked out for 5 s said "No changes", exit 0; the tab's Accept said "Accepted N change(s)" and cleared rows it had not accepted | `tests/test_fim.py` |
+| 71 | A kind read empty once and then not at all swallowed the next new startup entry; after a failed listing the tab called every task NEW | `tests/test_autoruns.py` |
+| 72 | Two overlapping startup snapshots recorded a false "modified outside AVGuard" (15 of 30 pairs): the signature was checked before the lock | `tests/test_autoruns.py` |
+| 73 | A subfolder baselined beside its parent was walked twice by every check: one new file, two ADDED rows and two events | `tests/test_fim.py` |
+| 74 | A non-text byte in `baseline.hmac` or `snapshots.hmac` stopped the window opening and killed the daily tasks before they recorded anything | `tests/test_fim.py`, `tests/test_autoruns.py` |
+| 75 | Under the packaged `AVGuard.exe` the three daily tasks ran `-m avguard`, which its parser rejects: they never ran | `tests/test_fim.py` |
+| 76 | **`config.json` was trusted as found: `"false"` in quotes turned automatic quarantine on while Settings showed it off; a BOM or a trailing comma read as "no config", and first run then saved defaults over the user's folders** | `tests/test_durability.py` |
+| 77 | **A second window wrote `auto_quarantine=false` into the user's config and ran a second watcher: every detection recorded twice, once as "not moved"** | `tests/test_durability.py` |
+| 78 | **Any CLI verb with `AVGUARD_DATA` set moved an old install's `data/` into it, so the test suite and the smoke check deleted the only copy of its quarantine** | `tests/test_durability.py` |
+| 79 | When Settings could not save, the switches the user changed were already live; Cancel left the clipboard being read and files being moved | `tests/test_durability.py` |
+| 80 | The Explorer verb and the daily tasks ran `-m avguard`, which needs the checkout as the working directory; Explorer starts in the clicked folder, Task Scheduler in System32 | `tests/test_shellext.py` |
+| 81 | Under the windowed build or pythonw every `--scan` died at its first printed line: the right-click entry showed nothing, the daily scan reported nothing | `tests/test_shellext.py` |
+| 82 | Clear history said it removed the scan cache's paths too; it removed only `events.jsonl` | `tests/test_durability.py` |
+| 83 | `--schedule off` said "Partly removed - see the log", exited 0 and logged nothing | `tests/test_durability.py` |
+| 84 | Two processes sharing `avguard.log` on Windows: past 1 MB every record was lost and two of three backups deleted | `tests/test_durability.py` |
+| 85 | With no tray icon, closing withdrew the window beyond reach, still holding the lock | `tests/test_durability.py` |
+| 86 | A lying zip header (bzip2 declaring 100 bytes) defeated every bomb guard: 3 KB, CLEAN in 57.7 s at 8.2 GB; now SUSPICIOUS in 0.2 s at 106 MB. The "larger than its header claims" check could never fire | `tests/test_tier2.py` |
+| 87 | Whether VirusTotal is asked was not in the cache generation: a file cached CLEAN with lookups off replayed CLEAN for 30 days after they were switched on | `tests/test_tier2.py` |
+| 88 | The VirusTotal client kept the Config the window had replaced, and a rejected key wrote `cloud_enabled=False` into it | `tests/test_durability.py`, `tests/test_avguard.py` |
+| 89 | The daily budget of 400 lookups was per process (window plus right-click scans: 800), and the window's exit erased the console's cache | `tests/test_avguard.py` |
+| 90 | The "once a day" blocklist download ran once per launch, never again in a window left open | `tests/test_durability.py` |
+| 91 | The feed request and the event POST attached a `~/.netrc` "default" login for another service | `tests/test_iocs.py`, `tests/test_event_forward.py` |
+| 92 | Restores and deletions were never recorded, though the README said a restore is POSTed; forwarding sent more than its consent named (a TLSH digest and family, a startup item's triggers, run level and DLL) | `tests/test_durability.py` |
+| 93 | A damaged or encrypted zipped feed escaped as `zlib.error` or `RuntimeError`, past every `except IocError` | `tests/test_iocs.py` |
+| 94 | A zip with one malformed central-directory entry made `scan()` raise: no verdict for the archive, "Threats: 0", exit 0, a signature in a sibling member lost with it | `tests/test_tier2.py` |
+| 95 | A typo in one of the user's rule files switched off every shipped rule for the session (0 rules loaded, 5 after) | `tests/test_durability.py` |
+| 96 | One malformed `scan_cache.json` entry crashed every console scan after its work (exit 1), and the cache could never be saved again | `tests/test_tier2.py` |
+| 97 | A line torn mid-character, or one mistyped record, in `events.jsonl` stopped History opening for good | `tests/test_tier2.py` |
+| 98 | A confidence figure in a rule's description reached the account, which promises never to carry one | `tests/test_explain.py` |
+| 99 | The daily integrity check, the startup snapshot and CLI restores were never forwarded, though the README and the consent said every event goes | `tests/test_event_forward.py` |
+| 100 | "Scan the watched folders once a day" scheduled a scan of the first watched folder only, and kept scanning it after the list changed | `tests/test_cli.py` |
+| 101 | A watched folder missing at logon was dropped for the session while Health said OK; "Never scan" beside a detection could exclude the watched folder itself, silently | `tests/test_durability.py` |
+| 102 | The daily export holds 48 hours; a PC that missed more lost those hashes for good while Health said "last checked" today | `tests/test_iocs.py` |
+| 103 | README: "only EICAR and the marker can reach MALICIOUS" was false; the user rules folder was printed with a line break in place of `\r` | read, corrected |
+| 104 | `tests/test_avguard.py`'s real-data guard was defined and never called, and named an unimported `pathlib` | it runs at import now |
 
 ### Notes worth keeping
+
+**Round six (61-104).** Nine lenses over the whole codebase, each
+running its own reproduction scripts against a copy of 70f9c41: quarantine,
+stores, pipeline, network, shell, window, claims, tests and hostile input.
+Every finding was reproduced again by hand before it was fixed, and its test
+was run against the code before the fix and seen to fail there: 17, 14, 12,
+12, 16 and 3 methods across the six commits. The tests lens and most of the
+skeptics did not finish (the run hit a usage limit), so this round's second
+opinion is the failing test, not an independent refuter. The one lens that
+did not report is the obvious next audit: vacuous and mutant-surviving
+tests. Row 104 is one of those, found by lint.
+
+What the round was mostly about: a file the program reads being trusted as
+written. A BOM, a quoted `"false"`, a torn character, a mistyped record, a
+zip header that lies, a signature file holding a non-text byte. Each one was
+read as empty, as true, as a crash, or as clean, and some were then saved
+over. The rule now: read it strictly, say what could not be read, set it
+aside before anything is written over it, and never let one bad record take
+down the others. The second theme was "says so" (60 before this). A lock
+timeout said "No changes", a missing folder said "watching", a partial
+removal exited 0. Each is a state now, with its own words and exit code.
+
+Measured, before and after: lockless reconcile 33 and 22 of 500 files lost,
+then 0 and 0; flushing about 1 ms per quarantined file; FIM lock hold on a
+20,000-file re-baseline 1.77 s to 0.23 s, on a 1 GiB accept 1.01 s to
+0.02 s; the zip bombs 12.9-57.7 s at 2-8 GB CLEAN, then 0.2-1.9 s at 106-329
+MB SUSPICIOUS.
 
 **Round four's sync was designed wrong (53, 54).** Reviewed the way rounds
 two and three were. It rebuilt the cap set from the files on disk while the

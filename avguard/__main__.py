@@ -529,6 +529,13 @@ def _iocs_command(args) -> int:
         except (ValueError, OSError):
             when = state["checked_at"]
         print(f"Feed last checked: {when}  ({state['url'] or iocs.FEED_RECENT_URL})")
+        if state.get("gap_since"):
+            try:
+                since = datetime.fromtimestamp(float(state["gap_since"])).strftime("%Y-%m-%d %H:%M")
+            except (ValueError, OSError):
+                since = state["gap_since"]
+            print(f"Hashes published after {since} may be missing: more than the 48 hours the "
+                  "daily export holds went by. --iocs-update --iocs-full fetches everything.")
     else:
         print("Feed: never fetched. Turn it on in Settings, or run --iocs-update once.")
     return 0

@@ -370,6 +370,51 @@ class TestRoundSixFeed(IocCase):
                     self.store.update_from_feed(session=FakeSession(FakeResponse(200, body)), full=True)
                 self.assertEqual((self.store.count(), self.store.version()), (1, version))
 
+    def test_a_gap_longer_than_the_export_is_said_until_a_full_download(self):
+        """The recent export holds 48 hours. A window closed for three days
+        fetched it, called the blocklist current, and the hashes published in
+        between were never on it; Health said "last checked" today."""
+        import time
+        recent = lambda: FakeSession(FakeResponse(200, feed_body(150)))      # noqa: E731
+        self.store.update_from_feed(session=recent())
+        self.assertEqual(self.store.feed_state()["gap_since"], "", "a first download is not a gap")
+        with self.store._write_lock, self.store._conn() as conn:
+            self.store._set_meta(conn, "feed_checked_at", str(time.time() - 72 * 3600))
+        long_ago = float(self.store.feed_state()["checked_at"])
+        result = self.store.update_from_feed(session=recent())
+        self.assertAlmostEqual(result.missed_since, long_ago, places=3)
+        self.assertEqual(float(self.store.feed_state()["gap_since"]), result.missed_since)
+        again = self.store.update_from_feed(session=recent())                 # a day later, on time
+        self.assertEqual(again.missed_since, 0.0)
+        self.assertNotEqual(self.store.feed_state()["gap_since"], "", "an on-time download does not fill it")
+        self.store.update_from_feed(session=FakeSession(FakeResponse(200, self.zipped())), full=True)
+        self.assertEqual(self.store.feed_state()["gap_since"], "", "the full export holds everything")
+
+    def test_health_names_the_gap(self):
+        try:
+            from avguard import gui
+        except ImportError:
+            self.skipTest("GUI dependencies are not installed")
+        from types import SimpleNamespace
+        import time
+        self.store.update_from_feed(session=FakeSession(FakeResponse(200, feed_body(150))))
+        fake = SimpleNamespace(scanner=SimpleNamespace(iocs=self.store), cfg=config.Config(ioc_feed_enabled=True))
+        self.assertNotIn("may be missing", gui.AVGuardApp._describe_iocs(fake))
+        with self.store._write_lock, self.store._conn() as conn:
+            self.store._set_meta(conn, "feed_checked_at", str(time.time() - 96 * 3600))
+        self.store.update_from_feed(session=FakeSession(FakeResponse(200, feed_body(150))))
+        line = gui.AVGuardApp._describe_iocs(fake)
+        self.assertIn("may be missing", line)
+        self.assertIn("--iocs-full", line)
+
+    def test_a_contact_within_the_window_is_no_gap(self):
+        import time
+        self.store.update_from_feed(session=FakeSession(FakeResponse(200, feed_body(150))))
+        with self.store._write_lock, self.store._conn() as conn:
+            self.store._set_meta(conn, "feed_checked_at", str(time.time() - 47 * 3600))
+        result = self.store.update_from_feed(session=FakeSession(FakeResponse(200, feed_body(150))))
+        self.assertEqual((result.missed_since, self.store.feed_state()["gap_since"]), (0.0, ""))
+
     def test_no_credentials_from_the_environment_go_with_the_request(self):
         built = []
 
