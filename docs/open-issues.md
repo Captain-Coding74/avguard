@@ -126,8 +126,57 @@ Ranked by the same rule as everything else in this project:
 | 102 | The daily export holds 48 hours; a PC that missed more lost those hashes for good while Health said "last checked" today | `tests/test_iocs.py` |
 | 103 | README: "only EICAR and the marker can reach MALICIOUS" was false; the user rules folder was printed with a line break in place of `\r` | read, corrected |
 | 104 | `tests/test_avguard.py`'s real-data guard was defined and never called, and named an unimported `pathlib` | it runs at import now |
+| 105 | **Quarantine checked the digest when it read a file, then unlinked whatever had the name seconds later: an editor's save by rename in between was destroyed (5 of 5 CLI runs)** | `tests/test_durability.py` |
+| 106 | **A restore checked that nothing had the name before a multi-second unmask, then replaced the file the user saved there** | `tests/test_durability.py` |
+| 107 | **The evidence beside the quarantine index, and the clipboard's "never warn again" list, read a BOM as empty and were written over** | `tests/test_durability.py` |
+| 108 | **A mistyped config value was a log line; the next unrelated save wrote the default over it (the user's folders, exclusions)** | `tests/test_durability.py` |
+| 109 | **A window started without the lock never took it: when the holder closed, nothing protected, and every surface said the other window did** | `tests/test_durability.py` |
+| 110 | **Settings and "Never scan" wrote every shown value from their window's start-time copy; Settings saved in the second window never reached the first** | `tests/test_durability.py` |
+| 111 | Two set-asides in the same second kept only the second | `tests/test_durability.py` |
+| 112 | The three "failed index write" tests broke the read, not the write: the handler they are named for was untested | `tests/test_durability.py` |
+| 113 | A FIM accept with an unreadable file said "Accepted 2" and cleared both rows; `--fim-accept` exited 0 | `tests/test_fim.py` |
+| 114 | A locked-out Check cleared the rows being reviewed; "web web/assets" in one call, or a symlinked spelling, was two trees | `tests/test_fim.py` |
+| 115 | A startup kind that failed for 30 days was a "first read" again and its new task unreported; a snapshot that timed out verified without the lock (false tamper, exit 3) | `tests/test_autoruns.py` |
+| 116 | **What one archive down was found to be (a lying header, a bomb, a traversal name) was thrown away** | `tests/test_tier2.py` |
+| 117 | **Row 94's crafted zips with DEFLATED members were CLEAN, cached, "Threats: 0"; unzip extracted the marker** | `tests/test_tier2.py` |
+| 118 | **A member declaring more than 32 MB, or a bomb's expansion, was skipped unread: a header could hide what unzip extracts** | `tests/test_tier2.py` |
+| 119 | **The VirusTotal budget never reset in a window past midnight (a regression from row 89)** | `tests/test_avguard.py` |
+| 120 | **A lookup asked for and not answered was cached CLEAN for 30 days** | `tests/test_tier2.py` |
+| 121 | A damaged `vt_cache.json` raised KeyError: every `--scan` exited 1 and the window did not start (a regression) | `tests/test_avguard.py` |
+| 122 | A user rule matching text in the shipped rule file refused the whole load; a malformed cache entry was replayed and dropped the threat in the window | `tests/test_durability.py`, `tests/test_tier2.py` |
+| 123 | A path with a lone surrogate raised out of History, so the next threat was not quarantined; a zip64 feed escaped as OverflowError | `tests/test_tier2.py`, `tests/test_iocs.py` |
+| 124 | A failed feed request was retried hourly (README: once a day) | `tests/test_iocs.py` |
+| 125 | The confidence filter dropped ordinary descriptions (%APPDATA%, a %20 member name, a digit in the rule's name) and missed "97 percent" and the JSON reasons | `tests/test_explain.py` |
+| 126 | Two of round six's own tests could not fail (a CLEAN never cached; a compiled ruleset never adopted) | `tests/test_tier2.py`, `tests/test_durability.py` |
+| 127 | `--scan-watched` scanned a folder inside another twice and skipped a missing one unsaid | `tests/test_cli.py` |
+| 128 | The daily scan, with no console, left no record; a slow receiver held a verb 12 s | `tests/test_cli.py` |
+| 129 | Turning real-time on with the folder missing saved "off"; Settings never started protection that was not running | `tests/test_durability.py` |
+| 130 | `--schedule off` read schtasks's English; registrations from before row 80 kept "-m avguard" and Health said installed | `tests/test_shellext.py` |
+| 131 | Clear history's cache wipe was undone by any scan that had loaded the cache before it | `tests/test_tier2.py` |
+| 132 | The forwarding consent did not name integrity events, health events or scan summaries | `tests/test_durability.py` |
+| 133 | `test_explain.TestTheWindow` (5) and a clipguard test were skipped in every full run, CI included: two window roots | `tests/test_explain.py` |
+| 134 | The real-data guard could not fire (setdefault kept an inherited AVGUARD_DATA) | `tests/test_avguard.py` |
+| 135 | Window code no test reached: Health's real-time row, the ticks, first run, the VirusTotal switch, restore with a warning, shutdown | `tests/test_durability.py` |
+| 136 | Small gaps: the directory fsync, a damaged store's handle, the log's backoff, `_fits` for floats and text, the launcher test that could not fail on Windows, the compressed-read cap | `tests/test_durability.py`, `tests/test_tier3.py`, `tests/test_tier2.py` |
+| 137 | README: a rule of your own marked critical or test is hard too; 8c1aaa9's count (831, not 832) | read, corrected |
 
 ### Notes worth keeping
+
+**Round seven (105-137).** Round six's tests lens and most of its
+skeptics died on a usage limit, so it was run again: three lenses mutating
+the round-six code and three attacking its fixes, each in its own copy of
+701de96, with a skeptic for the worst of each. 119 findings, every one
+reproduced here before it was fixed, every reported mutant applied to the
+new code and seen killed by a test: 85 mutants, all killed, 7 of them only
+after the first draft of their test was fixed. The two rank-1 bugs were in
+the moment between deciding and acting: a digest checked at read and a path
+unlinked seconds later, an absence checked before the unmask and a file
+replaced after it. Both now check at the act. The other lesson is about
+tests: six of the window's tests were skipped in every full run by a
+duplicated import, three named for a guard broke the read instead of the
+write, two of round six's own could not fail, and the guard meant to keep the
+suite out of real data held by construction. A test is not evidence until
+something it covers has been broken and it has failed.
 
 **Round six (61-104).** Nine lenses over the whole codebase, each
 running its own reproduction scripts against a copy of 70f9c41: quarantine,

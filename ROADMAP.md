@@ -1593,8 +1593,9 @@ What was measured:
 
 Tests 786 -> 806 -> 819 -> 831 -> 842 -> 859 -> 862, each commit green
 under `python3.13 -m unittest discover -s tests` and under Xvfb with the
-GUI dependencies. One correction: abe217a's message says 820, but the suite
-it committed counts 819.
+GUI dependencies. Two corrections: abe217a's message says 820, but the suite
+it committed counts 819; and 8c1aaa9's says 832 -> 842, but 57fc0eb before it
+committed 831 (both counted again at those commits).
 
 What it changed in how this project works. A file AVGuard reads is no
 longer trusted as written. A BOM, a quoted `"false"`, a character torn in
@@ -1614,6 +1615,86 @@ Not done. The daily feed is the 48-hour export, and a PC that misses more
 than that loses those hashes for good. Health and `--iocs-status` now say so
 and name `--iocs-full`, but nothing downloads the full export by itself:
 it is a far larger request than the one the user agreed to.
+
+**Round seven, 2026-10-07.** Round six's tests lens and most of its
+skeptics died on a usage limit, so they were run again on 701de96. Three
+lenses mutated the round-six code (quarantine and the stores; the scan
+pipeline, VirusTotal and the feed; the window, the command line and
+scheduling). Three attacked its fixes. Each worked in its own copy, with
+one skeptic for the worst findings of each. There were 119 findings, rows
+105-137 of [docs/open-issues.md](docs/open-issues.md). Each was reproduced
+here before it was fixed. Five commits: d9813aa, b4e6167, 2db8a7d, 46c9444
+and the one that adds this paragraph.
+
+The two rank-1 findings sat between a check and the act it guarded.
+`quarantine()` compared the digest when it read the file, and then
+unlinked whatever had the name seconds later. Masking 64 MB took 4.3 s,
+so an editor's save by rename in that gap was destroyed (5 of 5 CLI runs
+in the audit). `restore()` checked that nothing had the name before the
+unmask, then replaced the file the user had saved there. Both now check at
+the act. The file is stat'ed again just before the unlink. The restore is
+finished by a hard link, or `os.rename` on Windows, which refuses an
+existing name.
+
+Tests were measured by breaking the code. Every mutant the audit reported
+was applied again to the new code, along with each fix's own: one exact
+text replacement at a time, in a fresh copy of the tree, then that area's
+test modules (GUI ones under Xvfb). The harness is a short script outside
+the repository. The mutations are the audit's {file, old, new} triples.
+
+| Batch | Mutants | Killed | Killed only after the test was fixed |
+|---|---|---|---|
+| quarantine (A) | 8 | 8 | 0 |
+| signed stores (B) | 8 | 8 | 0 |
+| scan pipeline (C) | 27 | 27 | 3 |
+| window and command line (D) | 30 | 30 | 4 |
+| the last gaps (E) | 12 | 12 | 0 |
+
+Seven survived the first draft of their test. Each was the test's fault:
+- a refusal checked for any reason, not the reason it was written for;
+- a client built after the count it should have read from disk;
+- a phrase that also held a confidence word;
+- a mock that raised inside a method that swallows exceptions;
+- an error swallowed by the scan worker;
+- a missing assertion on which Config the VirusTotal client holds;
+- a mutation of my own that left the sentence it meant to remove.
+
+Measured, before and after:
+
+| | Before | After |
+|---|---|---|
+| A save by rename during a quarantine (audit, CLI, 16 MB) | the new draft destroyed, 5 of 5 | refused, the draft kept |
+| A save under the name during a restore | written over, exit 0 | refused, the held copy kept |
+| Masking 8 MB / 64 MB | 0.51 s / 4.33 s | 0.26 s / 1.77 s, the same bytes |
+| Crafted zip, DEFLATED members (row 94's shapes) | CLEAN, cached | MALICIOUS |
+| A 45-byte member claiming 33 MB | CLEAN | MALICIOUS |
+| A lying or traversal zip inside another | CLEAN | SUSPICIOUS |
+| A user rule matching the shipped rule file | 0 rules loaded | shipped rules on, that file named |
+| bomb1g_x1 / bomb4g_x1 / bomb1g_x8 / budget.zip | 0.2 / 0.4 / 2.5 / 2.0 s | 0.2 / 0.5 / 2.3 / 1.8 s |
+| An honest 1 GiB deflate bomb | 0.0 s, 47 MB, refused unread | 0.2 s, 114 MB, read to 32 MB |
+| `--scan --quarantine` of 8, with a slow receiver | 12.4 s (the audit) | at most 3 s more |
+| Tests skipped under Xvfb | 43 | 36 (six window tests, and the launcher test that now runs everywhere) |
+
+DETECTION_VERSION 16 -> 17 for the archive changes. What used to be
+skipped as declared too large, or refused as a declared bomb, is now read
+up to the ceiling. The ceiling counts the bytes the decompressor produces,
+not what the header claims.
+
+Things that are new in how this works:
+- `config.ListEdit`: a list setting is changed by what was added and what
+  was taken away, applied to the list on disk.
+- The window that holds the lock applies a `config.json` changed by
+  another window. A window without the lock takes it once it is free.
+- A scan with no console writes what it found to History.
+- `reasons_for()` says when VirusTotal was not asked. A CLEAN reached that
+  way is not cached.
+- The real-data guard checks the system temp folder. It stops the run
+  (`os._exit(2)`), because an exception only fails one module while the
+  others go on into the real data.
+
+Tests 862 -> 879 -> 893 -> 915 -> 945 -> 955. Each commit was green under
+`python3.13 -m unittest discover -s tests` and under Xvfb with the GUI
+dependencies, and on CI.
 
 ## Deliberately not doing
 

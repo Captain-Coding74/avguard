@@ -335,6 +335,18 @@ class TestRoundSevenArchives(TempCase):
                 # allocator; past the ceiling would be 32 MiB more.
                 self.assertLess(peak, 16 * 1024 * 1024, "decompressed past the ceiling")
 
+    def test_no_more_compressed_bytes_are_read_than_the_ceiling_needs(self):
+        path = self.tmp / "big-stored.zip"
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as archive:
+            archive.writestr("big.bin", os.urandom(3 * 1024 * 1024))
+        with zipfile.ZipFile(path) as archive:
+            info = archive.infolist()[0]
+            sizes = []
+            real = archive.fp.read
+            archive.fp.read = lambda n=-1: (sizes.append(n), real(n))[1]
+            archives._read_member(archive, info, 1000)
+        self.assertLessEqual(max(sizes), 1000 + 1024 * 1024, "the whole member was read for a 1000-byte look")
+
     def test_the_budget_is_charged_with_what_was_produced(self):
         import bz2
         import zlib as _zlib

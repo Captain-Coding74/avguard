@@ -2401,6 +2401,122 @@ class TestRoundSevenTheWindowSaysWhatRuns(TempCase):
         self.assertEqual(monitor.watched, [later])
 
 
+class TestRoundSevenTheLastGaps(TempCase):
+    """Round seven's tests lens, the rank-3 and rank-4 rest: guards that
+    were right and that nothing would have noticed going."""
+
+    def test_a_float_setting_refuses_a_bool_and_text_refuses_a_number(self):
+        path = self.tmp / "config.json"
+        path.write_text(json.dumps({"debounce_seconds": True, "event_forward_url": 3}), encoding="utf-8")
+        loaded = config.Config.load(path)
+        self.assertEqual((loaded.debounce_seconds, loaded.event_forward_url),
+                         (config.Config().debounce_seconds, ""))
+
+    @unittest.skipUnless(os.name == "posix", "a directory is flushed on POSIX only")
+    def test_the_rename_is_flushed_with_its_directory(self):
+        flushed = []
+        real = os.fsync
+        with mock.patch.object(os, "fsync", side_effect=lambda fd: (flushed.append(fd), real(fd))[1]):
+            config.atomic_write_bytes(self.tmp / "payload.quar", b"held")
+        self.assertEqual(len(flushed), 2, "the file, then the directory holding its new name")
+
+    def test_a_store_that_is_not_a_database_is_not_left_open(self):
+        from avguard import autoruns, fim
+        for name, build in (("fim", lambda: fim.FimStore(directory=self.tmp / "fim")),
+                            ("autoruns", lambda: autoruns.AutorunsStore(self.tmp / "autoruns"))):
+            with self.subTest(store=name):
+                store = build()
+                store.db_path.parent.mkdir(parents=True, exist_ok=True)
+                store.db_path.write_bytes(b"not a database at all " * 100)
+                opened = []
+                real = __import__("sqlite3").connect
+
+                def tracking(*args, **kwargs):
+                    conn = real(*args, **kwargs)
+                    wrapper = mock.MagicMock(wraps=conn)
+                    opened.append(wrapper)
+                    return wrapper
+                with mock.patch("sqlite3.connect", side_effect=tracking):
+                    with self.assertRaises(Exception):
+                        store._connect()
+                self.assertTrue(opened and opened[-1].close.called, "the handle stayed open")
+
+    def test_a_log_that_cannot_rotate_waits_before_trying_again(self):
+        from avguard import logsetup
+        handler = logsetup.SharedRotatingFileHandler(self.tmp / "avguard.log", maxBytes=10, backupCount=2,
+                                                     encoding="utf-8")
+        self.addCleanup(handler.close)
+        tries = []
+        with mock.patch.object(logsetup.os, "replace", side_effect=lambda *a: (tries.append(a), (_ for _ in ()).throw(PermissionError(32, "in use")))[1]):
+            for index in range(5):
+                handler.emit(logging.LogRecord("avguard", logging.INFO, __file__, 1, "record %d" % index * 5, None, None))
+        self.assertEqual(len(tries), 1, "every record past the limit retried the rename")
+
+    def test_the_review_is_not_offered_when_nothing_is_old(self):
+        try:
+            from avguard import gui
+        except ImportError:
+            self.skipTest("GUI dependencies are not installed")
+        from types import SimpleNamespace
+        said = []
+        fake = SimpleNamespace(_banner_is_loud=lambda: False, _held_for_review=lambda: [],
+                               _banner=lambda *a: said.append(a), _describe_quarantine_review=lambda: "review")
+        gui.AVGuardApp._offer_quarantine_review(fake)
+        self.assertEqual(said, [])
+
+    def test_the_feed_tick_stops_with_the_window(self):
+        try:
+            from avguard import gui
+        except ImportError:
+            self.skipTest("GUI dependencies are not installed")
+        from types import SimpleNamespace
+        armed = []
+        fake = SimpleNamespace(_shutting_down=True, _update_blocklist_feed=lambda: None,
+                               after=lambda ms, fn: armed.append(fn), _feed_tick=None)
+        gui.AVGuardApp._feed_tick(fake)
+        self.assertEqual(armed, [], "re-armed after shutdown")
+
+    def test_deleting_an_entry_already_gone_says_so(self):
+        try:
+            from avguard import gui
+        except ImportError:
+            self.skipTest("GUI dependencies are not installed")
+        from types import SimpleNamespace
+        refreshed = []
+        fake = SimpleNamespace(_selected_id=lambda: "gone", _without_the_lock=lambda what: False,
+                               quarantine=SimpleNamespace(get=lambda entry_id: None,
+                                                          delete=mock.Mock(side_effect=AssertionError("deleted"))),
+                               _refresh_quarantine=lambda: refreshed.append(1))
+        with mock.patch.object(gui, "Messagebox") as box:
+            gui.AVGuardApp._delete_selected(fake)
+        self.assertIn("already gone", box.show_info.call_args.args[0])
+        self.assertEqual(refreshed, [1])
+
+    def test_a_feed_worker_that_meets_something_unexpected_logs_it(self):
+        try:
+            from avguard import gui
+        except ImportError:
+            self.skipTest("GUI dependencies are not installed")
+        import threading
+        from types import SimpleNamespace
+        threads = []
+        fake = SimpleNamespace(cfg=config.Config(ioc_feed_enabled=True),
+                               scanner=SimpleNamespace(iocs=SimpleNamespace(feed_due=lambda: True)),
+                               post=lambda *a: None)
+        real_thread = threading.Thread
+
+        def keep(*args, **kwargs):
+            thread = real_thread(*args, **kwargs)
+            threads.append(thread)
+            return thread
+        with mock.patch.object(gui.iocs_module, "scheduled_update", side_effect=KeyError("surprise")), \
+                mock.patch.object(gui.threading, "Thread", side_effect=keep), \
+                self.assertLogs("avguard.gui", level="ERROR") as logged:
+            gui.AVGuardApp._update_blocklist_feed(fake)
+            threads[0].join(5)
+        self.assertIn("unexpected failure", "\n".join(logged.output))
+
+
 class _FakeMonitor:
     """What the window asks of RealtimeMonitor, and nothing else."""
 

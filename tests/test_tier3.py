@@ -11,6 +11,7 @@ import os
 import shutil
 import sys
 import tempfile
+from unittest import mock
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -383,10 +384,17 @@ class TestScheduling(unittest.TestCase):
         self.assertIn("Startup", path.parts)
         self.assertNotIn("ProgramData", path.parts, "must be per-user, not machine-wide")
 
-    @unittest.skipUnless(IS_WINDOWS, "Windows-only")
     def test_the_launcher_avoids_a_console_window(self):
-        runner, _ = scheduling._launcher()
-        self.assertTrue(runner.lower().endswith(("pythonw.exe", ".exe")))
+        """It asserted the runner ends in ".exe", which python.exe, the
+        console it exists to forbid, does too (round seven)."""
+        folder = Path(tempfile.mkdtemp(prefix="avguard-launcher-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(folder, ignore_errors=True))
+        (folder / "python.exe").write_bytes(b"")
+        (folder / "pythonw.exe").write_bytes(b"")
+        with mock.patch.object(scheduling.sys, "executable", str(folder / "python.exe")), \
+                mock.patch.object(scheduling.sys, "frozen", False, create=True):
+            runner, _ = scheduling._launcher()
+        self.assertEqual(Path(runner).name, "pythonw.exe")
 
     @unittest.skipUnless(IS_WINDOWS, "Windows-only")
     def test_enable_then_disable_leaves_nothing_behind(self):

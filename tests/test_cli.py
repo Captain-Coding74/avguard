@@ -611,6 +611,35 @@ class TestRoundSevenTheCommandLine(CliCase):
         self.assertLessEqual(waited[0], 3.0)
         self.assertIn("4 event(s) were recorded in History but not delivered", err.getvalue())
 
+    def test_the_daily_checks_forward_with_the_users_settings(self):
+        """The helper was tested; its call sites were not: a verb that built
+        its own Config() would record to History and never POST."""
+        from avguard import autoruns, config, fim, forward
+        config.Config(event_forward_url="http://127.0.0.1:9/events").save()
+        built = []
+
+        class Capture:
+            pending = 0
+
+            def __init__(self, url, **kwargs):
+                built.append(url)
+
+            def submit(self, event):
+                pass
+
+            def wait_idle(self, timeout):
+                return True
+
+            def stop(self):
+                pass
+        with mock.patch.object(forward, "EventForwarder", Capture), \
+                mock.patch.object(autoruns, "collect", return_value=autoruns.Collected()), \
+                mock.patch.object(autoruns.AutorunsStore, "snapshot", return_value=autoruns.SnapshotReport()), \
+                mock.patch.object(fim.FimStore, "check", return_value=fim.CheckReport()):
+            self.run_cli("--autoruns-snapshot")
+            self.run_cli("--fim-check")
+        self.assertEqual(built, ["http://127.0.0.1:9/events"] * 2)
+
     def test_help_describes_the_daily_scan_as_it_is(self):
         code, output = self.run_cli("--help")
         self.assertIn("every watched folder", " ".join(output.split()))
