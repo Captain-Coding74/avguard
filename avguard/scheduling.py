@@ -67,7 +67,7 @@ def _launcher() -> tuple[str, str]:
     interpreter = Path(sys.executable)
     windowless = interpreter.with_name("pythonw.exe")
     runner = windowless if windowless.exists() else interpreter
-    return str(runner), f'-m avguard'
+    return str(runner), '-m avguard'
 
 
 def _run(args: list[str]) -> tuple[bool, str]:

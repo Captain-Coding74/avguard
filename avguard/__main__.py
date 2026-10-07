@@ -130,11 +130,16 @@ def _console_scan(target: Path, quarantine_threats: bool, verbose: bool,
             return 2
         moved: dict = {}
         try:
+            store.reconcile()
             say()
             for verdict in threats:
                 try:
+                    # Against the digest it was judged on: a long scan ends
+                    # minutes after a file was read, and a file saved since
+                    # is not moved on a verdict about its old bytes.
                     store.quarantine(verdict.path, verdict.reasons,
-                                     evidence=explain_module.evidence_detail(verdict, cfg))
+                                     evidence=explain_module.evidence_detail(verdict, cfg),
+                                     expected_sha256=verdict.sha256)
                     moved[verdict.path] = True
                     say(f"quarantined: {verdict.path}")
                 except QuarantineError as exc:
@@ -859,13 +864,17 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.export_all:
         store = QuarantineStore(protection=SelfProtection())
-        written = store.export_all(args.export_all)
-        print(f"Wrote {len(written)} file(s) to {args.export_all}")
-        for path in written:
+        report = store.export_all(args.export_all)
+        held = len(report.written) + len(report.failed)
+        print(f"Wrote {len(report.written)} of {held} file(s) to {args.export_all}")
+        for path in report.written:
             print(f"  {path.name}")
-        if written:
-            print("\nThese are the original, unmodified files. Handle them carefully.")
-        return 0
+        if report.written:
+            print("\nThese are the original, unmodified files (each checked against its digest). "
+                  "Handle them carefully.")
+        for name, why in report.failed:
+            print(f"not written: {name}: {why}", file=sys.stderr)
+        return 1 if report.failed else 0
 
     if args.restore:
         store = QuarantineStore(protection=SelfProtection())
@@ -874,6 +883,7 @@ def _main(argv: list[str] | None = None) -> int:
             print(f"Another AVGuard is running (pid {lock.owner_pid or 0}).", file=sys.stderr)
             return 2
         try:
+            store.reconcile()
             target = store.restore(args.restore)
         except RestoreIncomplete as exc:
             print(f"Restored to {exc.target}")

@@ -683,7 +683,7 @@ version 1's `if malicious_count > 0` would have quarantined them.
 | `archive_scanning_enabled` | `true` | Look inside .zip files |
 | `pe_analysis_enabled` | `true` | Structural checks on executables |
 | `trust_signed_publishers` | `true` | Let a valid signature set heuristics aside |
-| `quarantine_review_days` | `90` | Age at which held files are offered for review |
+| `quarantine_review_days` | `90` | Age at which held files are offered for review (a Health row and a quiet banner at start; nothing is ever deleted for its age; 0 turns the offer off) |
 
 Most of these have a **Settings** window now; the rest stay in the file
 because a wrong value would fail quietly.

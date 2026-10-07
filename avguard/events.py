@@ -19,7 +19,6 @@ import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
 
 from . import config
 

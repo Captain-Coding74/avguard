@@ -91,19 +91,14 @@ class Allowlist:
     def _load(self) -> None:
         self._stamp = self._disk_stamp()
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            # ValueError covers JSONDecodeError and UnicodeDecodeError both.
-            # Only the first was caught, so a file saved as ANSI with a Thai
-            # name in it still crashed every entry point.
-            self._entries = {}
-            return
-        if not isinstance(raw, dict):
-            # A JSON array, number or string here raised AttributeError out of
-            # Scanner.__init__ -- so out of the GUI constructor and every CLI
-            # verb. Under pythonw the user saw nothing, and the cure was
-            # hand-editing a file in AppData. A bad file is an empty list.
-            log.warning("allowlist at %s is not a JSON object; ignoring it", self.path)
+            raw = config.read_json_object(self.path) or {}
+        except (OSError, config.UnreadableJSON) as exc:
+            # A file saved as ANSI with a Thai name in it, a JSON array, a
+            # byte-order mark: each crashed every entry point once, then read
+            # as an empty list -- and the next decision was saved over all the
+            # others. It reads as empty still, and _save sets it aside before
+            # writing, so the decisions in it are kept for the user.
+            log.warning("allowlist at %s cannot be read (%s); ignoring it", self.path, exc)
             self._entries = {}
             return
         entries: dict[str, AllowEntry] = {}
@@ -120,6 +115,7 @@ class Allowlist:
     def _save(self) -> bool:
         payload = {k: asdict(v) for k, v in self._entries.items()}
         try:
+            config.set_aside_if_unreadable(self.path)
             config.atomic_write_text(self.path, json.dumps(payload, indent=2))
         except OSError as exc:
             log.warning("could not save the allowlist: %s", exc)

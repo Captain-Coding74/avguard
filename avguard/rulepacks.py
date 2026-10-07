@@ -201,12 +201,10 @@ class PackStore:
     def _load(self) -> None:
         self._stamp = self._disk_stamp()
         try:
-            raw = json.loads(self.index_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            self._packs = {}
-            return
-        if not isinstance(raw, dict):
-            log.warning("pack index at %s is not a JSON object; ignoring it", self.index_path)
+            raw = config.read_json_object(self.index_path) or {}
+        except (OSError, config.UnreadableJSON) as exc:
+            # Read as no packs; _save sets the file aside before writing.
+            log.warning("pack index at %s cannot be read (%s); ignoring it", self.index_path, exc)
             self._packs = {}
             return
         packs: dict[str, RulePack] = {}
@@ -222,6 +220,7 @@ class PackStore:
 
     def _save(self) -> None:
         payload = {k: asdict(v) for k, v in self._packs.items()}
+        config.set_aside_if_unreadable(self.index_path)
         config.atomic_write_text(self.index_path, json.dumps(payload, indent=2))
         self._stamp = self._disk_stamp()
 

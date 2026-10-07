@@ -275,7 +275,7 @@ class TestQuarantineRetention(TempCase):
         store = self.store()
         for i in range(3):
             store.quarantine(self.write(f"t{i}.exe", f"payload {i}".encode()), [])
-        written = store.export_all(self.tmp / "out")
+        written = store.export_all(self.tmp / "out").written
         self.assertEqual(len(written), 3)
         self.assertEqual(sorted(p.read_bytes() for p in written),
                          [b"payload 0", b"payload 1", b"payload 2"])
@@ -289,11 +289,12 @@ class TestQuarantineRetention(TempCase):
     def test_export_all_sanitises_the_original_name(self):
         store = self.store()
         record = store.quarantine(self.write("CON.txt", b"x"), [])
-        written = store.export_all(self.tmp / "out")
+        written = store.export_all(self.tmp / "out").written
         self.assertTrue(written[0].name.startswith(record.entry_id[:8]))
 
     def test_export_all_on_an_empty_store_is_fine(self):
-        self.assertEqual(self.store().export_all(self.tmp / "out"), [])
+        report = self.store().export_all(self.tmp / "out")
+        self.assertEqual((report.written, report.failed), ([], []))
 
     def test_nothing_is_stale_when_retention_is_disabled(self):
         store = self.store()

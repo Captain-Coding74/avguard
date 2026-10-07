@@ -20,7 +20,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, Sequence
+from typing import Callable, Iterator, Sequence
 
 from . import allowlist as allowlist_module, provenance
 from . import iocs as iocs_module

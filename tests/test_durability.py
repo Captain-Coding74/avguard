@@ -25,6 +25,7 @@ Run with:  python -m unittest discover -s tests
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import shutil
@@ -32,7 +33,9 @@ import sys
 import tempfile
 import unittest
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -201,6 +204,7 @@ class TestQuarantineDurability(TempCase):
         record = self._plant_pending(store, directory, victim, b"USER DATA")
 
         reopened = self.store(directory)
+        reopened.reconcile()                 # what the lock holder does at start
         self.assertTrue(victim.exists(), "the file was taken during recovery")
         self.assertIsNone(reopened.get(record.entry_id), "a phantom record survived")
         self.assertFalse((directory / f"{record.entry_id}.quar").exists())
@@ -213,10 +217,169 @@ class TestQuarantineDurability(TempCase):
         record = self._plant_pending(store, directory, already_moved, b"MOVED DATA")
 
         reopened = self.store(directory)
+        reopened.reconcile()
         kept = reopened.get(record.entry_id)
         self.assertIsNotNone(kept, "a completed move was thrown away")
         self.assertFalse(kept.pending)
         self.assertEqual(reopened.restore(record.entry_id).read_bytes(), b"MOVED DATA")
+
+    # ---- round six (docs/open-issues.md, rows 61 on) ----
+
+    def test_a_store_built_without_the_lock_leaves_a_move_in_progress_alone(self):
+        """A right-click scan, --list-quarantine or a second window builds a
+        store. Built while the lock holder sat between its pending save and
+        its unlink, it deleted the payload; the holder then unlinked the
+        original. 28 to 50 files of 500 were lost that way under load."""
+        directory = self.tmp / "store"
+        holder = self.store(directory)
+        victim = self.write("report.docx", b"THE ONLY COPY")
+        record = self._plant_pending(holder, directory, victim, b"THE ONLY COPY")
+        self.store(directory)                                   # the lockless reader
+        self.assertTrue((directory / f"{record.entry_id}.quar").exists(), "the payload was deleted")
+        self.assertIn(record.entry_id, json.loads((directory / "index.json").read_text()))
+
+    def test_reconcile_leaves_a_different_file_at_the_old_path(self):
+        """Killed after the unlink; the same name was downloaded again. The
+        old rule (anything at the path means the move never happened)
+        deleted the only copy of what was taken."""
+        directory = self.tmp / "store"
+        store = self.store(directory)
+        path = self.tmp / "draft.docx"
+        record = self._plant_pending(store, directory, path, b"WHAT WAS TAKEN")
+        path.write_bytes(b"a new draft, saved since")
+        reopened = self.store(directory)
+        reopened.reconcile()
+        self.assertEqual(path.read_bytes(), b"a new draft, saved since")
+        kept = reopened.get(record.entry_id)
+        self.assertIsNotNone(kept, "the only copy of what was taken was deleted")
+        self.assertFalse(kept.pending)
+        self.assertTrue((directory / f"{record.entry_id}.quar").exists())
+
+    def test_a_record_another_process_removed_is_not_written_back(self):
+        directory = self.tmp / "store"
+        holder, second = self.store(directory), self.store(directory)
+        taken = holder.quarantine(self.write("x.docx", b"x"), [])
+        second.restore(taken.entry_id)
+        holder.quarantine(self.write("y.exe", b"y"), [])
+        on_disk = json.loads((directory / "index.json").read_text())
+        self.assertNotIn(taken.entry_id, on_disk, "a restored file came back as held, with no payload")
+        self.assertEqual(len(holder), 1)
+
+    def test_an_index_with_a_byte_order_mark_is_read(self):
+        directory = self.tmp / "store"
+        store = self.store(directory)
+        record = store.quarantine(self.write("thesis.docx", b"thesis"), [])
+        index = directory / "index.json"
+        index.write_bytes(b"\xef\xbb\xbf" + index.read_bytes())       # Notepad's "UTF-8"
+        reopened = self.store(directory)
+        self.assertIsNotNone(reopened.get(record.entry_id), "a BOM read as an empty index")
+        reopened.quarantine(self.write("next.exe", b"n"), [])
+        self.assertEqual(reopened.restore(record.entry_id).read_bytes(), b"thesis")
+
+    def test_an_unreadable_index_is_set_aside_not_written_over(self):
+        for name, damage in (("not utf-8", b'{"a": {"original_name": "\xe0\xb9\x84\xe0"}}'),
+                             ("an array", b'[{"entry_id": "x"}]'), ("not json", b"{nope")):
+            with self.subTest(damage=name):
+                directory = self.tmp / f"store-{name.replace(' ', '-')}"
+                directory.mkdir()
+                (directory / "index.json").write_bytes(damage)
+                store = self.store(directory)                   # no crash on start
+                self.assertEqual(len(store), 0)
+                self.assertIn("cannot be read", store.index_problem)
+                store.quarantine(self.write(f"{name}.exe", b"new"), [])
+                kept = list(directory.glob("index.json.unreadable-*"))
+                self.assertEqual([p.read_bytes() for p in kept], [damage], "the bytes were written over")
+                self.assertIn("kept as", store.index_problem)
+
+    def test_the_payload_and_the_restored_file_are_flushed_first(self):
+        """The journal makes a rename and an unlink durable, not the data:
+        unflushed, a power cut after the unlink could leave a payload of
+        zeros and no original."""
+        if not Path("/proc/self/fd").is_dir():
+            self.skipTest("needs /proc to name a file descriptor")
+        steps = []
+        real_fsync, real_unlink = os.fsync, Path.unlink
+
+        def fsync(fd):
+            steps.append(("fsync", os.readlink(f"/proc/self/fd/{fd}")))
+            return real_fsync(fd)
+
+        def unlink(path, missing_ok=False):
+            steps.append(("unlink", str(path)))
+            return real_unlink(path, missing_ok=missing_ok)
+        store = self.store()
+        victim = self.write("only_copy.docx", b"the user's bytes")
+        with mock.patch("os.fsync", fsync), mock.patch.object(Path, "unlink", unlink):
+            record = store.quarantine(victim, [])
+            store.restore(record.entry_id)
+        unlink_original = steps.index(("unlink", str(victim.resolve())))
+        self.assertTrue(any(kind == "fsync" and "/store/.avg-" in what for kind, what in steps[:unlink_original]),
+                        f"no payload fsync before the original went: {steps}")
+        unlink_payload = next(i for i, (kind, what) in enumerate(steps) if kind == "unlink" and what.endswith(".quar"))
+        self.assertTrue(any(kind == "fsync" and what.startswith(str(victim.parent.resolve()) + "/.avg-")
+                            for kind, what in steps[unlink_original:unlink_payload]),
+                        f"no fsync of the restored file before the payload went: {steps}")
+
+    def test_a_file_changed_since_its_scan_is_not_moved(self):
+        store = self.store()
+        victim = self.write("notes.txt", b"what was scanned")
+        judged = hashlib.sha256(b"what was scanned").hexdigest()
+        victim.write_bytes(b"my notes, the forum paste removed")
+        with self.assertRaises(QuarantineError) as caught:
+            store.quarantine(victim, ["r"], expected_sha256=judged)
+        self.assertIn("changed after it was scanned", str(caught.exception))
+        self.assertTrue(victim.exists())
+        self.assertEqual(len(store), 0)
+        self.assertIsNotNone(store.quarantine(victim, ["r"], expected_sha256=hashlib.sha256(
+            b"my notes, the forum paste removed").hexdigest()))
+
+    def test_a_damaged_payload_is_not_exported_as_the_original(self):
+        directory = self.tmp / "store"
+        store = self.store(directory)
+        good = store.quarantine(self.write("fine.pdf", b"fine"), [])
+        bad = store.quarantine(self.write("contract.pdf", b"contract " * 300), [])
+        payload = directory / f"{bad.entry_id}.quar"
+        payload.write_bytes(payload.read_bytes()[: bad.size // 2])
+        with self.assertRaises(QuarantineError):
+            store.payload(bad.entry_id)
+        report = store.export_all(self.tmp / "out")
+        self.assertEqual([p.read_bytes() for p in report.written], [b"fine"])
+        self.assertEqual([name for name, _ in report.failed], ["contract.pdf"])
+        self.assertIn("integrity", report.failed[0][1])
+        self.assertIsNotNone(good)
+
+    def test_a_long_name_can_be_restored_and_exported(self):
+        directory = self.tmp / "store"
+        store = self.store(directory)
+        name = "x" * 245 + ".pdf"                                   # 249, legal on NTFS and ext4
+        record = store.quarantine(self.write(name, b"long"), [])
+        report = store.export_all(self.tmp / "out")
+        self.assertEqual(report.failed, [])
+        self.assertTrue(report.written[0].name.endswith(".pdf"))
+        self.assertLessEqual(len(report.written[0].name.encode()), 255)
+        self.assertEqual(store.restore(record.entry_id).read_bytes(), b"long")
+
+    def test_a_payload_that_cannot_be_removed_does_not_undo_the_restore(self):
+        directory = self.tmp / "store"
+        store = self.store(directory)
+        record = store.quarantine(self.write("kept.docx", b"kept"), ["r"])
+        real_unlink = Path.unlink
+
+        def unlink(path, missing_ok=False):
+            if str(path).endswith(".quar"):
+                raise PermissionError(32, "being used by another process")
+            return real_unlink(path, missing_ok=missing_ok)
+        with mock.patch.object(Path, "unlink", unlink):
+            target = store.restore(record.entry_id)
+        self.assertEqual(target.read_bytes(), b"kept")
+        self.assertIsNone(store.get(record.entry_id), "the record stayed listed")
+        self.assertIsNotNone(store.allowlist.allows(record.sha256), "the decision was not recorded")
+        self.assertEqual(len(store.orphaned_payloads()), 1, "the leftover is reported, not hidden")
+
+    def test_a_relative_destination_is_refused(self):
+        with self.assertRaises(QuarantineError) as caught:
+            self.store()._validate_destination(Path("relative") / "x.exe")
+        self.assertIn("relative", str(caught.exception))
 
     def test_a_normal_quarantine_leaves_nothing_pending(self):
         store = self.store()
@@ -1175,6 +1338,145 @@ class TestAllowlistFilesAndSaves(TempCase):
             for _ in range(200):
                 allow.allows("b" * 64)
         self.assertLessEqual(stamp.call_count, 2, "a stat on every lookup")
+
+
+class TestTheWindowsQuarantineActions(TempCase):
+    """Round six, the window's side: a second window could restore and
+    delete while its Health row said it could not move files; restores and
+    deletes reached neither History nor the forwarder though the README
+    said a restore is POSTed; Export everything called damaged payloads
+    "the original, unmodified files"; and the retention review the README
+    described did not exist."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        try:
+            from avguard import gui
+        except ImportError:
+            self.skipTest("GUI dependencies are not installed")
+        from types import SimpleNamespace
+        from avguard.allowlist import Allowlist
+        from avguard.events import EventStore
+        self.gui = gui
+        directory = self.tmp / "store"
+        self.store = QuarantineStore(directory=directory, index_path=directory / "index.json",
+                                     protection=SelfProtection([self.tmp / "prot"]),
+                                     allowlist=Allowlist(path=self.tmp / "allow.json"))
+        self.events = EventStore(self.tmp / "events.jsonl")
+        self.banners = []
+        fake = SimpleNamespace(quarantine=self.store, events=self.events, has_lock=True,
+                               lock=SimpleNamespace(owner_pid=4242), cfg=config.Config(),
+                               _refresh_quarantine=lambda: None, _allowlist_changed=lambda: None,
+                               _banner=lambda text, style="": self.banners.append((text, style)),
+                               _banner_is_loud=lambda: False)
+        for name in ("_without_the_lock", "_record_restore", "_held_for_review",
+                     "_describe_quarantine_review"):
+            setattr(fake, name, getattr(gui.AVGuardApp, name).__get__(fake))
+        self.fake = fake
+
+    def held(self, name: str, data: bytes):
+        path = self.tmp / name
+        path.write_bytes(data)
+        return self.store.quarantine(path, ["a reason"])
+
+    def test_a_window_without_the_lock_cannot_restore_or_delete(self):
+        record = self.held("a.docx", b"a")
+        self.fake.has_lock = False
+        self.fake._selected_id = lambda: record.entry_id
+        with mock.patch.object(self.gui, "Messagebox") as box:
+            self.gui.AVGuardApp._restore_entry(self.fake, record.entry_id)
+            self.gui.AVGuardApp._delete_selected(self.fake)
+        self.assertEqual(box.show_info.call_count, 2)
+        self.assertIn("pid 4242", box.show_info.call_args.args[0])
+        box.yesno.assert_not_called()
+        self.assertIsNotNone(self.store.get(record.entry_id), "a second window changed the store")
+        self.assertFalse((self.tmp / "a.docx").exists())
+
+    def test_a_restore_and_a_delete_reach_history_with_what_the_consent_names(self):
+        kept, gone = self.held("kept.docx", b"kept"), self.held("gone.exe", b"gone")
+        self.fake._selected_id = lambda: gone.entry_id
+        with mock.patch.object(self.gui.Messagebox, "yesno", return_value="Yes"):
+            self.gui.AVGuardApp._restore_entry(self.fake, kept.entry_id)
+            self.gui.AVGuardApp._delete_selected(self.fake)
+        restored, deleted = self.events.read(kinds={"restored"}), self.events.read(kinds={"deleted"})
+        self.assertEqual([e.path for e in restored], [str(self.tmp / "kept.docx")])
+        self.assertEqual([e.path for e in deleted], [gone.original_path])
+        self.assertEqual(restored[0].detail, {"sha256": kept.sha256, "from": "quarantine"})
+        self.assertNotIn("entry_id", deleted[0].detail, "the consent does not name the store's ids")
+
+    def test_export_everything_says_what_it_could_not_write(self):
+        self.held("fine.pdf", b"fine")
+        bad = self.held("contract.pdf", b"contract " * 50)
+        payload = self.store._payload_path(bad.entry_id)
+        payload.write_bytes(payload.read_bytes()[:10])
+        with mock.patch.object(self.gui.filedialog, "askdirectory", return_value=str(self.tmp / "out")), \
+                mock.patch.object(self.gui, "Messagebox") as box:
+            self.gui.AVGuardApp._export_all(self.fake)
+        box.show_info.assert_not_called()
+        text = box.show_warning.call_args.args[0]
+        self.assertIn("Wrote 1 of 2 file(s)", text)
+        self.assertIn("contract.pdf: integrity check failed", text)
+
+    def test_the_review_is_offered_and_nothing_is_deleted(self):
+        record = self.held("old.exe", b"old")
+        old = (datetime.now(timezone.utc) - timedelta(days=200)).isoformat(timespec="seconds")
+        self.store._records[record.entry_id].quarantined_at = old
+        self.store._save()
+        self.held("new.exe", b"new")
+        self.assertIn("1 file(s) held longer than 90 days", self.fake._describe_quarantine_review())
+        self.gui.AVGuardApp._offer_quarantine_review(self.fake)
+        self.assertEqual(len(self.banners), 1)
+        self.assertEqual(len(self.store), 2, "nothing is deleted for its age")
+        self.fake.cfg.quarantine_review_days = 0
+        self.assertIn("off", self.fake._describe_quarantine_review())
+
+
+class TestASettingsFileThatCannotBeReadIsKept(TempCase):
+    """Round six: allowlist.json, packs.json and config.json read a file
+    they could not parse as empty, and the next save wrote over it. A
+    byte-order mark (Notepad's old "UTF-8", PowerShell 5.1's Set-Content
+    -Encoding UTF8) was enough: three kept decisions became one."""
+
+    BOM = b"\xef\xbb\xbf"
+
+    def test_a_byte_order_mark_is_read(self):
+        from avguard.allowlist import Allowlist
+        path = self.tmp / "allow.json"
+        first = Allowlist(path=path)
+        for digest in ("a" * 64, "b" * 64, "c" * 64):
+            first.add(digest, f"{digest[0]}.exe")
+        path.write_bytes(self.BOM + path.read_bytes())
+        second = Allowlist(path=path)
+        self.assertEqual(len(second), 3, "a BOM read as an empty allowlist")
+        second.add("d" * 64, "next-restore.exe")
+        self.assertEqual(len(json.loads(path.read_text(encoding="utf-8-sig"))), 4)
+
+        settings = self.tmp / "config.json"
+        settings.write_bytes(self.BOM + json.dumps({"auto_quarantine": True, "worker_threads": 3}).encode())
+        loaded = config.Config.load(settings)
+        self.assertEqual((loaded.auto_quarantine, loaded.worker_threads), (True, 3))
+
+    def test_what_cannot_be_read_is_set_aside_before_a_save(self):
+        from avguard.allowlist import Allowlist
+        damage = b'{"\xe0\xb9": {"sha256": "x"}}'
+        for name, write in (
+                ("allowlist", lambda p: Allowlist(path=p).add("d" * 64, "next.exe")),
+                ("config", lambda p: config.Config.load(p).save(p)),
+                ("packs", lambda p: PackStore(directory=self.tmp / "packs", index_path=p)._save())):
+            for label, bad in (("not utf-8", damage), ("an array", b"[1, 2]"), ("not json", b"{nope")):
+                with self.subTest(file=name, damage=label):
+                    path = self.tmp / name / f"{label.replace(' ', '-')}.json"
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(bad)
+                    write(path)                                  # no crash, and then:
+                    kept = list(path.parent.glob(path.name + ".unreadable-*"))
+                    self.assertEqual([p.read_bytes() for p in kept], [bad], "written over")
+                    self.assertIsInstance(json.loads(path.read_text(encoding="utf-8")), dict)
+
+    def test_a_config_that_is_not_an_object_does_not_stop_the_program(self):
+        settings = self.tmp / "config.json"
+        settings.write_text("[]", encoding="utf-8")
+        self.assertEqual(config.Config.load(settings), config.Config())
 
 
 class TestLoopbackShares(unittest.TestCase):

@@ -24,6 +24,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -202,7 +203,36 @@ class TestQuarantineCommands(CliCase):
         self.run_cli("--scan", str(self.marker_file().parent), "--quarantine")
         code, output = self.run_cli("--export-all", str(self.tmp / "rescued"))
         self.assertEqual(code, 0, output)
-        self.assertIn("Wrote 1 file", output)
+        self.assertIn("Wrote 1 of 1 file", output)
+
+    def test_export_all_exits_one_and_names_a_damaged_file(self):
+        """Round six: a damaged payload was written out, counted, and called
+        'the original, unmodified files'; exit 0."""
+        self.run_cli("--scan", str(self.marker_file().parent), "--quarantine")
+        payload = next((self.tmp / "data" / "quarantine").glob("*.quar"))
+        payload.write_bytes(payload.read_bytes()[:-1])
+        code, output = self.run_cli("--export-all", str(self.tmp / "rescued"))
+        self.assertEqual(code, 1, output)
+        self.assertIn("Wrote 0 of 1 file(s)", output)
+        self.assertIn("not written: threat.bin: integrity check failed", output)
+        self.assertNotIn("unmodified", output)
+
+    def test_a_file_changed_during_the_scan_is_not_moved(self):
+        """Round six: --scan --quarantine moved whatever was at the path when
+        a long scan ended, on a verdict about other bytes."""
+        from avguard import scanner as scanner_module
+        target = self.marker_file()
+        real = scanner_module.Scanner.scan_tree
+
+        def scan_then_edit(scanner_self, *args, **kwargs):
+            result = real(scanner_self, *args, **kwargs)
+            target.write_bytes(b"my notes, the forum paste removed")
+            return result
+        with mock.patch.object(scanner_module.Scanner, "scan_tree", scan_then_edit):
+            code, output = self.run_cli("--scan", str(target.parent), "--quarantine")
+        self.assertTrue(target.exists(), output)
+        self.assertEqual(target.read_bytes(), b"my notes, the forum paste removed")
+        self.assertIn("changed after it was scanned", output)
 
     def test_export_all_actually_writes_the_bytes(self):
         from avguard.scanner import SELFTEST_MARKER

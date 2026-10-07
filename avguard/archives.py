@@ -27,7 +27,7 @@ import logging
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Iterator
 
 log = logging.getLogger(__name__)
 

@@ -38,7 +38,7 @@ from . import shellext
 from .instance import InstanceLock
 from .protection import SelfProtection
 from .quarantine import QuarantineError, QuarantineStore, RestoreIncomplete
-from .scanner import Level, ScanCache, Scanner, Verdict, findings_to_dicts
+from .scanner import Level, Scanner, Verdict, findings_to_dicts
 from .watcher import RealtimeMonitor
 
 log = logging.getLogger("avguard.gui")
@@ -122,6 +122,10 @@ class AVGuardApp(tb.Window):
         # the quarantine index from its own stale snapshot.
         self.lock = InstanceLock()
         self.has_lock = self.lock.acquire()
+        if self.has_lock:
+            # Only the lock holder finishes or undoes a move a killed process
+            # left half done; a window without the lock leaves it alone.
+            self.quarantine.reconcile()
 
         # The paste guard reads the clipboard only while cfg.paste_guard_enabled
         # is set; the tick checks that before touching the source.
@@ -175,6 +179,8 @@ class AVGuardApp(tb.Window):
                 # An existing install: offered once, never switched on behind
                 # the user's back.
                 self.after(600, self._offer_paste_guard)
+            else:
+                self.after(600, self._offer_quarantine_review)
 
     # ------------------------------------------------------------- widgets
 
@@ -671,7 +677,8 @@ class AVGuardApp(tb.Window):
         failure = ""
         if self.cfg.auto_quarantine:
             try:
-                record = self.quarantine.quarantine(verdict.path, verdict.reasons, evidence=detail)
+                record = self.quarantine.quarantine(verdict.path, verdict.reasons, evidence=detail,
+                                                    expected_sha256=verdict.sha256)
             except QuarantineError as exc:
                 log.error("could not quarantine %s: %s", verdict.path, exc)
                 failure = str(exc)
@@ -897,7 +904,21 @@ class AVGuardApp(tb.Window):
         if entry_id is not None:
             self._restore_entry(entry_id)
 
+    def _without_the_lock(self, what: str) -> bool:
+        """True, after saying so, when another AVGuard holds the lock. Two
+        processes writing the quarantine store is what the lock prevents, and
+        Restore and Delete in a second window did exactly that."""
+        if self.has_lock:
+            return False
+        Messagebox.show_info(
+            f"Another AVGuard is running (pid {self.lock.owner_pid or 0}) and holds the quarantine. "
+            f"{what} in that window, so two programs never change the store at once.",
+            "AVGuard", parent=self)
+        return True
+
     def _restore_entry(self, entry_id: str) -> None:
+        if self._without_the_lock("Restore the file"):
+            return
         record = self.quarantine.get(entry_id)
         if record is None:
             Messagebox.show_info("That entry is already gone.", "AVGuard", parent=self)
@@ -916,6 +937,7 @@ class AVGuardApp(tb.Window):
             target = self.quarantine.restore(entry_id)
         except RestoreIncomplete as exc:
             # The file is back; the exception for it is not. Say exactly that.
+            self._record_restore(record, exc.target)
             Messagebox.show_warning(str(exc), "Restored, with a warning", parent=self)
             self._allowlist_changed()
             self._refresh_quarantine()
@@ -926,15 +948,27 @@ class AVGuardApp(tb.Window):
         else:
             # restore() recorded an exception for these bytes. Re-key rather
             # than invalidate one path: every copy anywhere is judged afresh.
+            self._record_restore(record, target)
             self._allowlist_changed()
             log.info("restored %s", target)
         self._refresh_quarantine()
 
+    def _record_restore(self, record, target: Path) -> None:
+        """History, and the forwarder when one is set: the README has said a
+        restore is POSTed since forwarding shipped, and nothing recorded one.
+        The path, the verdict and the digest, which the consent names."""
+        self.events.record(Event(kind="restored", path=str(target), reasons=list(record.reasons),
+                                 detail={"sha256": record.sha256, "from": "quarantine"}))
+
     def _delete_selected(self) -> None:
         entry_id = self._selected_id()
-        if entry_id is None:
+        if entry_id is None or self._without_the_lock("Delete it"):
             return
         record = self.quarantine.get(entry_id)
+        if record is None:
+            Messagebox.show_info("That entry is already gone.", "AVGuard", parent=self)
+            self._refresh_quarantine()
+            return
         confirm = Messagebox.yesno(
             f"Permanently delete '{record.original_name}'? This cannot be undone.",
             "Delete permanently?", parent=self,
@@ -945,6 +979,10 @@ class AVGuardApp(tb.Window):
             self.quarantine.delete(entry_id)
         except QuarantineError as exc:
             Messagebox.show_error(str(exc), "Delete failed", parent=self)
+        else:
+            self.events.record(Event(kind="deleted", path=record.original_path,
+                                     reasons=list(record.reasons),
+                                     detail={"sha256": record.sha256, "from": "quarantine"}))
         self._refresh_quarantine()
 
     def _export_selected(self) -> None:
@@ -1051,11 +1089,19 @@ class AVGuardApp(tb.Window):
         destination = filedialog.askdirectory(title="Write every quarantined file here")
         if not destination:
             return
-        written = self.quarantine.export_all(destination)
-        Messagebox.show_info(
-            f"Wrote {len(written)} file(s) to:" + chr(10) + f"{destination}" + chr(10) + chr(10)
-            + "These are the original, unmodified files. Handle them carefully.",
-            "Exported", parent=self)
+        report = self.quarantine.export_all(destination)
+        nl = chr(10)
+        held = len(report.written) + len(report.failed)
+        text = f"Wrote {len(report.written)} of {held} file(s) to:{nl}{destination}"
+        if report.written:
+            text += f"{nl}{nl}These are the original, unmodified files (each checked against its digest). Handle them carefully."
+        if report.failed:
+            text += f"{nl}{nl}Not written:" + "".join(f"{nl}  {name}: {why}" for name, why in report.failed[:10])
+            if len(report.failed) > 10:
+                text += f"{nl}  and {len(report.failed) - 10} more (see the log)"
+            Messagebox.show_warning(text, "Exported, with failures", parent=self)
+        else:
+            Messagebox.show_info(text, "Exported", parent=self)
 
     def _reload_rules(self) -> None:
         if self.scanner.reload_rules():
@@ -1374,6 +1420,41 @@ class AVGuardApp(tb.Window):
         store = self._fim_store()
         return not store.exists() or store.verify_integrity() == fim_module.INTEGRITY_OK
 
+    def _held_for_review(self) -> list:
+        try:
+            return self.quarantine.stale(self.cfg.quarantine_review_days)
+        except (TypeError, ValueError):
+            return []
+
+    def _describe_quarantine_review(self) -> str:
+        """The retention review the README promised: offered, never acted on.
+        Nothing is deleted after any number of days; the store holds the
+        only copy of everything in it."""
+        days = self.cfg.quarantine_review_days
+        if not isinstance(days, int) or days <= 0:
+            return "off (quarantine_review_days is 0)"
+        old = self._held_for_review()
+        if not old:
+            return f"nothing held longer than {days} days"
+        return (f"{len(old)} file(s) held longer than {days} days: restore, export or delete "
+                "them on the Quarantine tab. Nothing is deleted automatically.")
+
+    def _offer_quarantine_review(self) -> None:
+        """Once per start, quietly, and never over a louder banner."""
+        if self._banner_is_loud() or not self._held_for_review():
+            return
+        self._banner(self._describe_quarantine_review(), "inverse-secondary")
+
+    def _describe_quarantine_integrity(self) -> tuple[bool, str]:
+        problem = self.quarantine.index_problem
+        orphans = self.quarantine.orphaned_payloads()
+        if problem:
+            return False, problem + "; see the log"
+        if orphans:
+            return False, (f"{len(orphans)} stored file(s) have no record and cannot be decoded; "
+                           "see the log")
+        return True, "every stored file has a record"
+
     def _describe_fim(self) -> str:
         store = self._fim_store()
         _ok, text = fimpanel.summarize(store)
@@ -1421,11 +1502,8 @@ class AVGuardApp(tb.Window):
             ("Right-click scan", True,
              "installed for this user" if shellext.installed() else "not installed"),
             ("Scan cache", True, f"{len(self.cache)} remembered verdict(s)"),
-            ("Quarantine integrity", not self.quarantine.orphaned_payloads(),
-             "every stored file has a record"
-             if not self.quarantine.orphaned_payloads()
-             else f"{len(self.quarantine.orphaned_payloads())} stored file(s) have no "
-                  "record and cannot be decoded; see the log"),
+            ("Quarantine integrity", *self._describe_quarantine_integrity()),
+            ("Quarantine review", True, self._describe_quarantine_review()),
             ("Publisher trust", self.scanner.signatures.available,
              "Authenticode checking is available" if self.scanner.signatures.available
              else "unavailable on this system"),

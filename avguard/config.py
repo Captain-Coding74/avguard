@@ -96,6 +96,102 @@ def atomic_write_text(path: Path, text: str) -> None:
         raise
 
 
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    """atomic_write_text for bytes, and durable: the data is flushed to the
+    disk before the rename, and the rename itself where the platform allows.
+
+    For a file that becomes the only copy of something once a later step
+    runs (a quarantined payload before its original is unlinked, a restored
+    file before its payload is). The journal makes the rename and the unlink
+    durable, not the data, so without the fsync a power cut after the unlink
+    could leave a payload of zeros and no original.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # A short name: the file it stands in for may already be at the 255
+    # character limit, and its name plus a suffix would be over it.
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".avg-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    _fsync_directory(path.parent)
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Make a rename in `directory` durable. POSIX only: Windows cannot open
+    a directory for flushing, and NTFS journals the rename itself."""
+    if os.name != "posix":
+        return
+    try:
+        fd = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+class UnreadableJSON(ValueError):
+    """A settings or store file that exists but is not one JSON object."""
+
+
+def read_json_object(path: Path) -> dict | None:
+    """The JSON object in `path`, or None when there is no such file.
+
+    A byte-order mark is accepted: Notepad's old "UTF-8" and PowerShell 5.1's
+    Set-Content -Encoding UTF8 both write one, and the file is otherwise
+    intact. Anything else that is not one JSON object raises UnreadableJSON,
+    so a caller never mistakes a file it cannot read for an empty one and
+    then saves over it: that is how index.json lost every nonce it held.
+    Other OSErrors (a locked file) propagate as they are.
+    """
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return None
+    except UnicodeDecodeError as exc:
+        raise UnreadableJSON(f"{path.name} is not UTF-8 text (byte {exc.start})") from exc
+    try:
+        raw = json.loads(text)
+    except ValueError as exc:
+        raise UnreadableJSON(f"{path.name} is not valid JSON ({exc})") from exc
+    if not isinstance(raw, dict):
+        raise UnreadableJSON(f"{path.name} holds a JSON {type(raw).__name__}, not an object")
+    return raw
+
+
+def set_aside_if_unreadable(path: Path) -> Path | None:
+    """Before `path` is written: if what is there now cannot be read, rename
+    it to <name>.unreadable-<UTC time> and return the new path, so bytes that
+    were not understood are kept for the user instead of written over.
+    Raises OSError if it cannot be moved, which stops the write."""
+    try:
+        read_json_object(path)
+        return None
+    except UnreadableJSON:
+        pass
+    except OSError:
+        return None             # the write that follows will say what is wrong
+    from datetime import datetime, timezone
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    aside = path.with_name(f"{path.name}.unreadable-{stamp}")
+    os.replace(path, aside)
+    logging.getLogger(__name__).error(
+        "%s could not be read and was kept as %s; a new one is being started", path, aside.name)
+    return aside
+
+
 @dataclass
 class Config:
     """User-tunable settings, persisted to data/config.json."""
@@ -194,15 +290,22 @@ class Config:
 
     @classmethod
     def load(cls, path: Path = CONFIG_PATH) -> "Config":
-        """Read config.json, falling back to defaults for anything missing."""
+        """Read config.json, falling back to defaults for anything missing.
+
+        A file that cannot be read gives the defaults and is logged; save()
+        sets it aside before writing, so the user's settings are never
+        silently replaced by the defaults (a byte-order mark used to do it).
+        """
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            raw = read_json_object(path) or {}
+        except (OSError, UnreadableJSON) as exc:
+            logging.getLogger(__name__).error("could not read %s (%s); using the defaults", path, exc)
             return cls()
         known = {f for f in cls().__dict__}
         return cls(**{k: v for k, v in raw.items() if k in known})
 
     def save(self, path: Path = CONFIG_PATH) -> None:
+        set_aside_if_unreadable(path)
         atomic_write_text(path, json.dumps(asdict(self), indent=2))
 
     @property

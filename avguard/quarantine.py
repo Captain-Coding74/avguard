@@ -21,7 +21,6 @@ import hashlib
 import json
 import logging
 import os
-import shutil
 import threading
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -51,6 +50,45 @@ class RestoreIncomplete(RuntimeError):
 
 class QuarantineError(RuntimeError):
     """Raised when a quarantine or restore cannot be completed safely."""
+
+
+@dataclass
+class ExportReport:
+    """What export_all wrote, and what it could not, with the reason."""
+    written: list[Path] = field(default_factory=list)
+    failed: list[tuple[str, str]] = field(default_factory=list)     # (original name, reason)
+
+
+def _export_name(record: "QuarantineRecord") -> str:
+    """A safe file name for an exported copy: the id's first eight
+    characters, then the original basename reduced to letters, digits and
+    "._- ", cut to fit 255 bytes with its extension kept. The name went in
+    whole before, and a held file whose name was near the limit could not be
+    exported at all."""
+    prefix = f"{record.entry_id[:8]}_"
+    safe = "".join(c for c in record.original_name if c.isalnum() or c in "._- ").strip(" .") or "recovered"
+    stem, dot, extension = safe.rpartition(".")
+    if not dot or not stem or len(extension) > 16:
+        stem, extension = safe, ""
+    else:
+        extension = "." + extension
+    while stem and len((prefix + stem + extension).encode("utf-8")) > 255:
+        stem = stem[:-1]
+    return prefix + (stem or "recovered") + extension
+
+
+def _holds(path: Path, sha256: str) -> bool:
+    """Whether `path` is a regular file whose bytes hash to `sha256`."""
+    try:
+        if not path.is_file():
+            return False
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(config.CHUNK_SIZE), b""):
+                digest.update(chunk)
+        return digest.hexdigest() == sha256
+    except OSError:
+        return False
 
 
 def _keystream(nonce: bytes, length: int) -> bytes:
@@ -114,57 +152,97 @@ class QuarantineStore:
         self.directory.mkdir(parents=True, exist_ok=True)
         self._records: dict[str, QuarantineRecord] = {}
         self._deleted: set[str] = set()
+        # The ids the index held when this process last read or wrote it: an
+        # id that was there and is gone now was removed by another process,
+        # and must not be written back from memory.
+        self._seen_on_disk: set[str] = set()
+        # Why the index could not be read, for Health; "" when it could.
+        self.index_problem = ""
         self._load()
 
     # --------------------------------------------------------------- index
 
-    def _load(self) -> None:
+    def _read_index(self) -> tuple[dict[str, QuarantineRecord], bool]:
+        """The records on disk, and whether the index could be understood.
+        An unreadable index is reported (index_problem) and read as no
+        records, and _save sets it aside before writing: the nonces in it
+        exist nowhere else. A read that fails for another reason (a locked
+        file) raises OSError."""
         try:
-            raw = json.loads(self.index_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            self._records = {}
-            return
+            raw = config.read_json_object(self.index_path) or {}
+        except config.UnreadableJSON as exc:
+            if not self.index_problem:
+                log.error("the quarantine index cannot be read: %s", exc)
+            self.index_problem = f"the quarantine index cannot be read ({exc})"
+            return {}, False
         records: dict[str, QuarantineRecord] = {}
-        for entry_id, data in (raw or {}).items():
+        for entry_id, data in raw.items():
             try:
+                if not isinstance(data, dict):
+                    raise TypeError("not an object")
                 records[entry_id] = QuarantineRecord(**data)
             except TypeError:
                 log.warning("dropping malformed quarantine record %s", entry_id)
-        self._records = records
-        self._reconcile()
+        return records, True
 
-    def _reconcile(self) -> None:
-        """Finish or undo any move that was interrupted last time.
-
-        A pending record means the payload was written but we cannot be sure
-        the original was removed. If the original is still there, the move
-        never completed: drop our copy and leave the user's file alone. If it
-        is gone, the move did complete and only the flag was never cleared.
-        """
-        changed = False
-        for entry_id, record in list(self._records.items()):
-            if not record.pending:
-                continue
-            changed = True
-            try:
-                original_still_there = Path(record.original_path).exists()
-            except OSError:
-                original_still_there = False
-
-            if original_still_there:
-                log.warning("undoing an interrupted quarantine of %s; your file was "
-                            "never removed", record.original_path)
-                self._payload_path(entry_id).unlink(missing_ok=True)
-                del self._records[entry_id]
-            else:
-                log.info("completing an interrupted quarantine of %s", record.original_name)
-                record.pending = False
-        if not changed:
-            return          # a settled index is read, not rewritten: --list-quarantine holds no lock
+    def _load(self) -> None:
+        # Construction never reconciles and never writes: read-only commands,
+        # a right-click scan and a second window all build a store, and none
+        # of them holds the lock (see reconcile()).
         try:
-            self._save()
-        except QuarantineError as exc:
-            log.error("could not write the reconciled index: %s", exc)
+            self._records, readable = self._read_index()
+        except OSError as exc:
+            log.error("could not read the quarantine index: %s", exc)
+            self._records, readable = {}, False
+        self._seen_on_disk = set(self._records) if readable else set()
+
+    def reconcile(self) -> None:
+        """Finish or undo a move a killed process left half done. Only the
+        holder of the instance lock may call this.
+
+        A pending record means the payload was written and the original may
+        or may not have been removed. It is also the normal state of the lock
+        holder's own quarantine in progress, which is why construction no
+        longer does this: a right-click scan building a store in that moment
+        deleted the payload, and the holder then unlinked the original.
+
+        If the file at the old path is the one that was taken (same digest),
+        the move never completed: drop our copy and leave the user's file
+        alone. Otherwise the move completed, and whatever sits at that path
+        now (the same name downloaded again, a new draft) is a different file
+        and is left alone too; only the flag is cleared.
+        """
+        with self._lock:
+            try:
+                self._reload_and_merge()
+            except QuarantineError as exc:
+                log.error("could not reconcile the quarantine index: %s", exc)
+                return
+            changed = False
+            for entry_id, record in list(self._records.items()):
+                if not record.pending:
+                    continue
+                changed = True
+                original = Path(record.original_path)
+                if _holds(original, record.sha256):
+                    log.warning("undoing an interrupted quarantine of %s; your file was "
+                                "never removed", record.original_path)
+                    self._payload_path(entry_id).unlink(missing_ok=True)
+                    del self._records[entry_id]
+                    self._deleted.add(entry_id)
+                else:
+                    if original.exists():
+                        log.warning("completing an interrupted quarantine of %s; a different file "
+                                    "now at that path was left alone", record.original_name)
+                    else:
+                        log.info("completing an interrupted quarantine of %s", record.original_name)
+                    record.pending = False
+            if not changed:
+                return
+            try:
+                self._save()
+            except QuarantineError as exc:
+                log.error("could not write the reconciled index: %s", exc)
 
     def orphaned_payloads(self) -> list[Path]:
         """Stored payloads with no record, which nothing can decode.
@@ -186,20 +264,26 @@ class QuarantineStore:
         stored payloads. `InstanceLock` normally prevents the race; this makes
         losing it survivable.
         """
-        on_disk: dict[str, QuarantineRecord] = {}
         try:
-            raw = json.loads(self.index_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            raw = {}
-        for entry_id, data in (raw or {}).items():
-            try:
-                on_disk[entry_id] = QuarantineRecord(**data)
-            except TypeError:
-                log.warning("dropping malformed quarantine record %s", entry_id)
+            on_disk, readable = self._read_index()
+        except OSError as exc:
+            # Treating this as an empty index meant the save that follows
+            # wrote this process's snapshot over everyone else's records.
+            raise QuarantineError(f"could not read the quarantine index: {exc}") from exc
 
         # Anything on disk we have not seen is another process's work: keep it.
         for entry_id, record in on_disk.items():
             self._records.setdefault(entry_id, record)
+
+        # Anything that was on disk at our last read and is gone now, another
+        # process restored or deleted: writing it back from memory listed a
+        # held file whose payload no longer existed. (Not when the index
+        # could not be read: then memory is the best copy there is.)
+        if readable:
+            for entry_id in list(self._records):
+                if entry_id in self._seen_on_disk and entry_id not in on_disk:
+                    del self._records[entry_id]
+            self._seen_on_disk = set(on_disk)
 
         # Anything we deleted this session stays deleted; `_deleted` records
         # that so a merge cannot resurrect it.
@@ -216,9 +300,14 @@ class QuarantineStore:
         """
         payload = {k: asdict(v) for k, v in self._records.items()}
         try:
+            aside = config.set_aside_if_unreadable(self.index_path)
             config.atomic_write_text(self.index_path, json.dumps(payload, indent=2))
         except OSError as exc:
             raise QuarantineError(f"could not write the quarantine index: {exc}") from exc
+        if aside is not None:
+            self.index_problem = (f"the quarantine index could not be read and was kept as {aside.name}; "
+                                  "files held before then are not listed")
+        self._seen_on_disk = set(self._records)
 
     def _payload_path(self, entry_id: str) -> Path:
         # The id is a UUID4 hex string, so this name can never contain a path
@@ -289,7 +378,7 @@ class QuarantineStore:
     # ---------------------------------------------------------- quarantine
 
     def quarantine(self, path: Path | str, reasons: list[str] | None = None,
-                   evidence: dict | None = None) -> QuarantineRecord:
+                   evidence: dict | None = None, expected_sha256: str | None = None) -> QuarantineRecord:
         """Move `path` into the store, masked, and record how to undo it.
 
         `evidence` is what explain.evidence_detail() produced for the verdict
@@ -298,6 +387,10 @@ class QuarantineStore:
         older AVGuard reading an index row with a field it does not know
         drops that row (see _reload_and_merge) and would then save the index
         without it.
+
+        `expected_sha256` is the digest the verdict was reached on. A file
+        that no longer has it changed after it was judged (a long scan, a
+        save in between), and is not moved on a verdict about other bytes.
         """
         source = Path(path).resolve()
 
@@ -308,8 +401,13 @@ class QuarantineStore:
 
         with self._lock:
             self._reload_and_merge()
-            data = source.read_bytes()
+            try:
+                data = source.read_bytes()
+            except OSError as exc:
+                raise QuarantineError(f"could not read {source}: {exc}") from exc
             digest = hashlib.sha256(data).hexdigest()
+            if expected_sha256 and digest != expected_sha256:
+                raise QuarantineError(f"{source.name} changed after it was scanned; it was not moved")
 
             entry_id = uuid.uuid4().hex
             nonce = os.urandom(16)
@@ -317,12 +415,11 @@ class QuarantineStore:
 
             # Write the masked copy first and only unlink the original once it
             # is safely on disk, so a crash cannot lose the file entirely.
-            tmp = payload.with_suffix(".quar.tmp")
+            # "On disk" means flushed: the rename and the unlink are journalled,
+            # the data is not, and a power cut could leave zeros.
             try:
-                tmp.write_bytes(_mask(data, nonce))
-                os.replace(tmp, payload)
+                config.atomic_write_bytes(payload, _mask(data, nonce))
             except OSError as exc:
-                tmp.unlink(missing_ok=True)
                 raise QuarantineError(f"could not write quarantine payload: {exc}") from exc
 
             record = QuarantineRecord(
@@ -401,13 +498,15 @@ class QuarantineStore:
         if raw.startswith("\\\\") or raw.startswith("//"):
             raise QuarantineError("refusing to restore to a UNC network path")
 
+        # Before resolve(), which makes every path absolute against the
+        # working directory: checked after it, this never fired.
+        if not Path(destination).is_absolute():
+            raise QuarantineError("refusing to restore to a relative path")
+
         try:
             resolved = Path(destination).resolve()
         except (OSError, ValueError) as exc:
             raise QuarantineError(f"unusable destination path: {exc}") from exc
-
-        if not resolved.is_absolute():
-            raise QuarantineError("refusing to restore to a relative path")
 
         # path_within, not is_relative_to: the destination does not exist yet
         # while the quarantine directory does, and on Windows `resolve()`
@@ -452,15 +551,24 @@ class QuarantineStore:
                 )
 
             try:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                tmp = target.with_name(target.name + ".restoring")
-                tmp.write_bytes(data)
-                os.replace(tmp, target)
+                # Flushed before the payload goes: until then the payload is
+                # the only durable copy. Written through a short temporary
+                # name; the file's own name plus ".restoring" was over the
+                # 255-character limit for a name near it.
+                config.atomic_write_bytes(target, data)
             except OSError as exc:
                 raise QuarantineError(f"could not write {target}: {exc}") from exc
             self._remark(entry_id, target)
 
-            payload.unlink(missing_ok=True)
+            try:
+                payload.unlink(missing_ok=True)
+            except OSError as exc:
+                # The file is back and verified. A payload another program
+                # holds open stays behind as an orphan (Health lists those);
+                # escaping here left the record listed and the decision to
+                # keep the file unrecorded, so it was taken again.
+                log.warning("restored %s, but its stored copy could not be removed: %s",
+                            record.original_name, exc)
             del self._records[entry_id]
             self._deleted.add(entry_id)
             self._save()
@@ -496,7 +604,7 @@ class QuarantineStore:
         log.info("deleted quarantined file %s", record.original_name)
         return record.original_name
 
-    def export_all(self, destination: Path | str) -> list[Path]:
+    def export_all(self, destination: Path | str) -> ExportReport:
         """Write every held file out, unmasked, into one folder.
 
         The store holds the only copy of everything in it. Without this,
@@ -506,18 +614,17 @@ class QuarantineStore:
         """
         target = Path(destination)
         target.mkdir(parents=True, exist_ok=True)
-        written: list[Path] = []
+        report = ExportReport()
         for record in self.records():
             # The stored name is a UUID, so rebuild a safe filename from the
             # original basename rather than trusting it wholesale.
-            safe = "".join(c for c in record.original_name
-                           if c.isalnum() or c in "._- ") or "recovered"
-            out = target / f"{record.entry_id[:8]}_{safe}"
+            out = target / _export_name(record)
             try:
-                written.append(self.export(record.entry_id, out))
+                report.written.append(self.export(record.entry_id, out))
             except (QuarantineError, OSError) as exc:
                 log.error("could not export %s: %s", record.original_name, exc)
-        return written
+                report.failed.append((record.original_name, str(exc)))
+        return report
 
     def stale(self, older_than_days: int) -> list[QuarantineRecord]:
         """Records held longer than `older_than_days`."""
@@ -544,14 +651,21 @@ class QuarantineStore:
 
         The Quarantine tab's "known sample" reads a file this way to seed the
         similarity match. Nothing is written anywhere and the record is not
-        touched.
+        touched. Verified against the recorded digest, as restore is: export
+        wrote a damaged payload out as "the original, unmodified file".
         """
         with self._lock:
             record = self._records.get(entry_id)
             if record is None:
                 raise QuarantineError(f"no quarantine record with id {entry_id}")
-            payload = self._payload_path(entry_id)
-            return _mask(payload.read_bytes(), bytes.fromhex(record.nonce))
+            try:
+                data = _mask(self._payload_path(entry_id).read_bytes(), bytes.fromhex(record.nonce))
+            except (OSError, ValueError) as exc:
+                raise QuarantineError(f"could not read the stored copy of '{record.original_name}': {exc}") from exc
+            if hashlib.sha256(data).hexdigest() != record.sha256:
+                raise QuarantineError(f"integrity check failed for '{record.original_name}'; "
+                                      "the stored copy has been altered")
+            return data
 
     def export(self, entry_id: str, destination: Path | str) -> Path:
         """Write the original bytes out for analysis, without touching the record.
@@ -561,8 +675,7 @@ class QuarantineStore:
         """
         data = self.payload(entry_id)
         target = Path(destination)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
+        config.atomic_write_bytes(target, data)
         self._remark(entry_id, target)
         return target
 
